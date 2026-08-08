@@ -6,10 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.types import MenuButtonCommands
 from sqlalchemy import select
 
 from services.backend.client_bots.handlers import TenantOwnerMiddleware
-from services.backend.client_bots.runtime import ClientBotRuntimeManager
+from services.backend.client_bots.runtime import AiogramPollingRuntime, ClientBotRuntimeManager
 from services.backend.models import BotInstance, EncryptedSecret, ProductEvent
 from services.backend.schemas import BotCreate
 from services.backend.services.encryption import EncryptionService
@@ -41,6 +42,24 @@ class FakeFactory:
         runtime = FakeRuntime(self.fail)
         self.runtimes.append(runtime)
         return runtime
+
+
+@pytest.mark.asyncio
+async def test_runtime_synchronizes_web_app_menu_button() -> None:
+    runtime = object.__new__(AiogramPollingRuntime)
+    runtime.tenant_id = "tenant-1"
+    runtime.mini_app_url = "https://ventrix.example.app"
+    runtime.bot = SimpleNamespace(
+        get_chat_menu_button=AsyncMock(return_value=MenuButtonCommands()),
+        set_chat_menu_button=AsyncMock(),
+    )
+
+    await runtime.sync_menu_button()
+
+    runtime.bot.set_chat_menu_button.assert_awaited_once()
+    configured = runtime.bot.set_chat_menu_button.await_args.kwargs["menu_button"]
+    assert configured.text == "Ventrix AI"
+    assert configured.web_app.url == runtime.mini_app_url
 
 
 async def add_bots(session_factory, make_service, tenant_payload, encryption_key, count: int):

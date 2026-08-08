@@ -187,12 +187,45 @@ async def test_owner_api_endpoints(
         )
         assert mini_app_auth.json()["permissions"] == ["*"]
         assert "dashboard_summary" in mini_app_auth.json()
+        assert mini_app_auth.json()["project_context"]["onboarding"] == {
+            "step": "welcome",
+            "completed": False,
+            "completed_at": None,
+            "steps": [
+                "welcome",
+                "telegram_connection",
+                "scope_selection",
+                "employees_review",
+                "completed",
+            ],
+        }
+        for onboarding_step in (
+            "telegram_connection",
+            "scope_selection",
+            "employees_review",
+            "completed",
+        ):
+            onboarding = await client.patch(
+                "/api/v1/client/onboarding",
+                headers={"Authorization": f"tma {init_data}"},
+                json={"step": onboarding_step},
+            )
+            assert onboarding.status_code == 200, onboarding.text
+            assert onboarding.json()["step"] == onboarding_step
+        assert onboarding.json()["completed"] is True
+
         client_menu = await client.get(
             "/api/v1/client/menu", headers={"Authorization": f"tma {init_data}"}
         )
         assert client_menu.status_code == 200, client_menu.text
         assert client_menu.json()["tenant"]["id"] == tenant_id
         assert client_menu.json()["permissions"] == ["*"]
+        client_bootstrap = await client.get(
+            "/api/v1/client/bootstrap", headers={"Authorization": f"tma {init_data}"}
+        )
+        assert client_bootstrap.status_code == 200
+        assert client_bootstrap.json()["onboarding"]["completed"] is True
+        assert client_bootstrap.json()["onboarding"]["step"] == "completed"
 
         employee = await client.post(
             "/api/v1/client/employees",

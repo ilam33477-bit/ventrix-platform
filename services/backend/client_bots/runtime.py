@@ -10,7 +10,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonWebApp,
+    WebAppInfo,
+)
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -64,6 +69,7 @@ class AiogramPollingRuntime:
         )
         self.session_factory = session_factory
         self.tenant_id = tenant_id
+        self.mini_app_url = mini_app_url
         self._progress_task: asyncio.Task[None] | None = None
         self.dispatcher = Dispatcher(storage=SQLiteFSMStorage(session_factory, ttl=fsm_ttl))
         router = build_client_router(
@@ -83,6 +89,7 @@ class AiogramPollingRuntime:
 
     async def run(self) -> None:
         await self.bot.get_me()
+        await self.sync_menu_button()
         self._progress_task = asyncio.create_task(
             self._progress_loop(), name=f"telegram-progress:{self.tenant_id}"
         )
@@ -92,6 +99,32 @@ class AiogramPollingRuntime:
             if self._progress_task:
                 self._progress_task.cancel()
                 await asyncio.gather(self._progress_task, return_exceptions=True)
+
+    async def sync_menu_button(self) -> None:
+        if not self.mini_app_url:
+            return
+        try:
+            current = await self.bot.get_chat_menu_button()
+            current_url = getattr(getattr(current, "web_app", None), "url", None)
+            current_text = getattr(current, "text", None)
+            if (
+                current_url
+                and current_url.rstrip("/") == self.mini_app_url.rstrip("/")
+                and current_text == "Ventrix AI"
+            ):
+                return
+            await self.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Ventrix AI",
+                    web_app=WebAppInfo(url=self.mini_app_url),
+                )
+            )
+        except TelegramBadRequest as exc:
+            logger.warning(
+                "Could not synchronize Mini App menu button for tenant %s (%s)",
+                self.tenant_id,
+                type(exc).__name__,
+            )
 
     async def _progress_loop(self) -> None:
         last_snapshot: tuple[object, ...] | None = None

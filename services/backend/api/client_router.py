@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as clock_time
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -115,6 +115,28 @@ class TelegramConnectionScope(BaseModel):
     folder_ids: list[int] = Field(min_length=1, max_length=20)
     history_days: int = Field(default=7)
     personal_dialogs_consent: bool = False
+
+
+ClientOnboardingStep = Literal[
+    "welcome",
+    "telegram_connection",
+    "scope_selection",
+    "employees_review",
+    "completed",
+]
+
+
+class ClientOnboardingPatch(BaseModel):
+    step: ClientOnboardingStep
+
+
+CLIENT_ONBOARDING_STEPS: tuple[ClientOnboardingStep, ...] = (
+    "welcome",
+    "telegram_connection",
+    "scope_selection",
+    "employees_review",
+    "completed",
+)
 
 
 def get_client_connection_service(
@@ -359,6 +381,19 @@ async def mini_app_dashboard_summary(
     return counts
 
 
+def client_onboarding_payload(settings: TenantSettings | None) -> dict[str, Any]:
+    completed = bool(settings and settings.client_onboarding_completed_at)
+    step = "completed" if completed else (settings.client_onboarding_step if settings else "welcome")
+    if step not in CLIENT_ONBOARDING_STEPS:
+        step = "welcome"
+    return {
+        "step": step,
+        "completed": completed,
+        "completed_at": settings.client_onboarding_completed_at if settings else None,
+        "steps": list(CLIENT_ONBOARDING_STEPS),
+    }
+
+
 @router.post("/mini-app/auth")
 async def mini_app_auth(
     context: ClientContext,
@@ -385,9 +420,43 @@ async def mini_app_auth(
             "timezone": settings.timezone if settings else None,
             "client_bot": {"id": context.bot.id, "username": context.bot.username},
             "onboarding_state": onboarding_state(connection),
+            "onboarding": client_onboarding_payload(settings),
         },
         "dashboard_summary": await mini_app_dashboard_summary(session, context),
     }
+
+
+@router.patch("/onboarding")
+async def update_client_onboarding(
+    payload: ClientOnboardingPatch,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    settings = await session.scalar(
+        select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
+    )
+    if settings is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tenant settings are not configured",
+        )
+    if settings.client_onboarding_completed_at is not None:
+        return client_onboarding_payload(settings)
+    current = (
+        settings.client_onboarding_step
+        if settings.client_onboarding_step in CLIENT_ONBOARDING_STEPS
+        else "welcome"
+    )
+    if CLIENT_ONBOARDING_STEPS.index(payload.step) < CLIENT_ONBOARDING_STEPS.index(current):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Onboarding cannot move backwards",
+        )
+    settings.client_onboarding_step = payload.step
+    if payload.step == "completed":
+        settings.client_onboarding_completed_at = datetime.now(UTC)
+    await session.commit()
+    return client_onboarding_payload(settings)
 
 
 def onboarding_state(connection: TelegramConnection | None) -> str:
@@ -459,9 +528,9 @@ async def client_bootstrap(
     )
     state = onboarding_state(connection)
     menus = {
-        "not_connected": ["Подключить Telegram", "Как это работает", "Безопасность"],
-        "connecting": ["Подключение", "Как это работает", "Безопасность"],
-        "folder_selection": ["Выбор папки", "Подключения", "Безопасность"],
+        "not_connected": ["Подключить Telegram"],
+        "connecting": ["Продолжить подключение"],
+        "folder_selection": ["Выбрать папку"],
         "chat_selection": ["Выбор чатов", "Подключения", "Настройки анализа"],
         "synchronization": ["Прогресс", "Найденные данные", "Остановить анализ"],
         "ready": [
@@ -480,6 +549,7 @@ async def client_bootstrap(
         "role": context.membership.role,
         "permissions": sorted(context.permissions),
         "onboarding_state": state,
+        "onboarding": client_onboarding_payload(tenant.settings),
         "menu": menus[state],
         "connection": None
         if connection is None

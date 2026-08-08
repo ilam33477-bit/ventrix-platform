@@ -133,6 +133,12 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
     group_reminders_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
     )
+    client_onboarding_step: Mapped[str] = mapped_column(
+        String(32), default="welcome", server_default="welcome", nullable=False
+    )
+    client_onboarding_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     @validates("timezone")
     def validate_timezone(self, _key: str, value: str) -> str:
