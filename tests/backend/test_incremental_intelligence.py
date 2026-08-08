@@ -1,0 +1,437 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from pydantic import ValidationError
+from sqlalchemy import func, select
+
+from services.backend.intelligence.ai_triage import AITriageService
+from services.backend.intelligence.local_signals import LocalSignalEngine
+from services.backend.intelligence.notifications import NotificationOrchestrator
+from services.backend.intelligence.reconciliation import ReconciliationService
+from services.backend.intelligence.triage import parse_triage_result
+from services.backend.jobs.queue import JOB_PRIORITY, SQLiteJobQueue
+from services.backend.models import (
+    AIUsageCall,
+    BackgroundJob,
+    Commitment,
+    Employee,
+    GroupIntegration,
+    NotificationLog,
+    OperationalProblem,
+    Signal,
+    TelegramDialog,
+    TelegramIncrementalCursor,
+    TelegramMessage,
+    TenantSettings,
+)
+from services.backend.services.encryption import EncryptionService
+from services.backend.telegram_sessions.gateway import (
+    LoginChallenge,
+    LoginResult,
+    MessageBatch,
+    RemoteDialog,
+    RemoteFolder,
+    RemoteMessage,
+)
+from services.backend.telegram_sessions.incremental import IncrementalTelegramIngestion
+from services.backend.telegram_sessions.service import TelegramConnectionService
+
+
+class IncrementalGateway:
+    def __init__(self) -> None:
+        self.phone_by_session: dict[str, str] = {}
+        self.messages: dict[int, list[RemoteMessage]] = {}
+        self.fetch_after_ids: list[int] = []
+
+    async def begin_login(self, phone: str) -> LoginChallenge:
+        pending = f"pending:{phone}"
+        self.phone_by_session[pending] = phone
+        return LoginChallenge(pending, f"hash:{phone}")
+
+    async def complete_login(
+        self,
+        session_string: str,
+        phone: str,
+        phone_code_hash: str,
+        *,
+        code: str | None = None,
+        password: str | None = None,
+    ) -> LoginResult:
+        suffix = int(phone[-2:])
+        return LoginResult(
+            "connected", f"authorized:{phone}", 800_000 + suffix, f"employee_{suffix}", phone
+        )
+
+    async def list_folders(self, session_string: str) -> list[RemoteFolder]:
+        return [RemoteFolder(10, "Работа")]
+
+    async def list_dialogs(self, session_string: str) -> list[RemoteDialog]:
+        return [RemoteDialog(1001, "Client Group", "client_group", "group", 10)]
+
+    async def fetch_new_messages(
+        self,
+        session_string: str,
+        dialog_id: int,
+        *,
+        after_id: int,
+        limit: int,
+    ) -> MessageBatch:
+        self.fetch_after_ids.append(after_id)
+        available = [item for item in self.messages.get(dialog_id, []) if item.id > after_id]
+        page = available[:limit]
+        next_id = page[-1].id if page else after_id
+        return MessageBatch(page, next_id, len(available) > len(page))
+
+    async def terminate_session(self, session_string: str) -> None:
+        return None
+
+
+class FakeTriageProvider:
+    def __init__(self, criticality: int = 92) -> None:
+        self.calls = 0
+        self.criticality = criticality
+
+    async def generate_json(self, **kwargs):
+        self.calls += 1
+        return (
+            json.dumps(
+                {
+                    "criticality": self.criticality,
+                    "category": "contract_question",
+                    "requires_immediate_attention": True,
+                    "requires_employee_notification": True,
+                    "requires_manager_notification": True,
+                    "reason": "Клиент готов начать и запросил договор.",
+                    "recommended_action": "Ответить клиенту и отправить договор.",
+                    "recommended_deadline_minutes": 15,
+                    "needs_deep_analysis": False,
+                }
+            ),
+            {"input_tokens": 120, "output_tokens": 40},
+        )
+
+
+async def _tenant(session_factory, make_service, tenant_payload):
+    async with session_factory() as session:
+        return await make_service(session).create_tenant(tenant_payload)
+
+
+async def _connection_with_dialog(
+    session_factory, make_service, tenant_payload, encryption_key, gateway
+):
+    tenant = await _tenant(session_factory, make_service, tenant_payload)
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    connection = await service.begin_login(tenant.id, "+79990000011")
+    connection = await service.complete_login(tenant.id, connection_id=connection.id, code="12345")
+    await service.refresh_catalog(tenant.id, connection.id)
+    await service.select_scope(
+        tenant.id,
+        10,
+        personal_dialogs_consent=False,
+        connection_id=connection.id,
+    )
+    async with session_factory() as session:
+        dialog = await session.scalar(
+            select(TelegramDialog).where(TelegramDialog.connection_id == connection.id)
+        )
+    return tenant, connection, dialog, service
+
+
+@pytest.mark.asyncio
+async def test_tenant_supports_multiple_independent_telegram_connections(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    tenant = await _tenant(session_factory, make_service, tenant_payload)
+    gateway = IncrementalGateway()
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    first = await service.begin_login(tenant.id, "+79990000011")
+    first = await service.complete_login(tenant.id, connection_id=first.id, code="11111")
+    second = await service.begin_login(tenant.id, "+79990000022")
+    second = await service.complete_login(tenant.id, connection_id=second.id, code="22222")
+
+    connections = await service.get_all(tenant.id)
+    assert {item.id for item in connections} == {first.id, second.id}
+    assert {item.telegram_user_id for item in connections} == {800_011, 800_022}
+
+
+@pytest.mark.asyncio
+async def test_incremental_ingestion_is_idempotent_and_recovers_cursor_after_restart(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    gateway.messages[1001] = [
+        RemoteMessage(1, 91, "client", now, None, False, "ок", []),
+        RemoteMessage(
+            2,
+            91,
+            "client",
+            now + timedelta(seconds=1),
+            None,
+            False,
+            "Готовы начинать, пришлите договор и реквизиты?",
+            [],
+        ),
+    ]
+    queue = SQLiteJobQueue(session_factory)
+    ingestion = IncrementalTelegramIngestion(
+        session_factory,
+        EncryptionService(encryption_key),
+        gateway,
+        queue,
+        batch_size=10,
+    )
+    job_id = await queue.enqueue(
+        "telegram.fetch_updates",
+        {},
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+    )
+    lease = await queue.claim_next("incremental-test")
+    assert lease is not None and lease.id == job_id
+    first = await ingestion.fetch_updates(lease)
+    await queue.complete(lease, first)
+
+    restarted = IncrementalTelegramIngestion(
+        session_factory,
+        EncryptionService(encryption_key),
+        gateway,
+        queue,
+        batch_size=10,
+    )
+    second = await restarted.fetch_updates(lease)
+
+    async with session_factory() as session:
+        message_count = await session.scalar(select(func.count(TelegramMessage.id)))
+        signal_count = await session.scalar(select(func.count(Signal.id)))
+        cursor = await session.scalar(
+            select(TelegramIncrementalCursor).where(
+                TelegramIncrementalCursor.dialog_id == dialog.id
+            )
+        )
+        queued_triage = await session.scalar(
+            select(func.count(BackgroundJob.id)).where(BackgroundJob.job_type == "signal.ai_triage")
+        )
+    assert first["messages"] == 2 and second["messages"] == 0
+    assert message_count == 2 and signal_count >= 2
+    assert cursor.last_message_id == 2
+    assert gateway.fetch_after_ids == [0, 2]
+    assert queued_triage == signal_count
+
+
+def test_local_signal_engine_filters_low_value_and_scores_commercial_context() -> None:
+    now = datetime.now(UTC)
+    engine = LocalSignalEngine()
+    low = TelegramMessage(
+        telegram_message_id=1,
+        sent_at=now,
+        outgoing=False,
+        body_text="спасибо",
+        attachments_json=[],
+    )
+    important = TelegramMessage(
+        telegram_message_id=2,
+        sent_at=now,
+        outgoing=False,
+        body_text="Сколько стоит? Пришлите договор и реквизиты.",
+        attachments_json=[],
+    )
+    assert engine.scan(low, []) == []
+    candidates = engine.scan(important, [])
+    assert {item.signal_type for item in candidates} >= {
+        "commercial_question",
+        "contract_question",
+        "payment_question",
+    }
+    assert min(item.score for item in candidates) >= 65
+
+
+def test_triage_json_is_strict_and_supports_one_controlled_repair() -> None:
+    raw = """```json
+    {"criticality":72,"category":"contract_question",
+    "requires_immediate_attention":false,"requires_employee_notification":false,
+    "requires_manager_notification":true,"reason":"Нужен договор",
+    "recommended_action":"Ответить","recommended_deadline_minutes":30,
+    "needs_deep_analysis":false,}
+    ```"""
+    result, repaired = parse_triage_result(raw)
+    assert repaired is True and result.criticality == 72
+    with pytest.raises(ValidationError):
+        parse_triage_result("AI says this is probably important")
+
+
+@pytest.mark.asyncio
+async def test_critical_triage_records_usage_problem_and_privacy_safe_notifications(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    queue = SQLiteJobQueue(session_factory)
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        employee = Employee(
+            tenant_id=tenant.id,
+            display_name="Менеджер",
+            telegram_user_id=700001,
+            criticality_threshold=85,
+        )
+        group = GroupIntegration(
+            tenant_id=tenant.id,
+            telegram_chat_id=dialog.telegram_dialog_id,
+            title="Продажи",
+            status="active",
+            notifications_enabled=True,
+            minimum_criticality=85,
+        )
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=10,
+            sender_id=99,
+            sent_at=now,
+            outgoing=False,
+            body_text="Секретные условия клиента: пришлите договор",
+            attachments_json=[],
+        )
+        session.add_all([employee, group, message])
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        settings.group_reminders_enabled = True
+        await session.flush()
+        signal = Signal(
+            tenant_id=tenant.id,
+            telegram_connection_id=connection.id,
+            dialog_id=dialog.id,
+            source_message_id=message.id,
+            employee_id=employee.id,
+            fingerprint="critical-triage",
+            signal_type="contract_question",
+            local_score=90,
+            criticality=90,
+            status="candidate",
+            reason="local candidate",
+            detected_at=now,
+            metadata_json={"features": {"contract": True}},
+        )
+        session.add(signal)
+        await session.commit()
+        signal_id = signal.id
+    job_id = await queue.enqueue(
+        "signal.ai_triage",
+        {"signal_id": signal_id},
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+        dialog_id=dialog.id,
+        priority=JOB_PRIORITY["P0"],
+    )
+    lease = await queue.claim_next("triage-test")
+    assert lease is not None and lease.id == job_id
+    provider = FakeTriageProvider()
+    result = await AITriageService(session_factory, queue, provider, model="deepseek-test").triage(
+        lease
+    )
+    await queue.complete(lease, result)
+
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 1
+        usage = await session.scalar(select(AIUsageCall))
+        logs = list(await session.scalars(select(NotificationLog)))
+    assert provider.calls == 1
+    assert usage.input_tokens == 120 and usage.output_tokens == 40
+    assert {item.destination_type for item in logs} == {"employee", "manager", "group"}
+    group_payload = next(item.payload_json for item in logs if item.destination_type == "group")
+    assert group_payload["privacy_safe"] is True
+    assert "Секретные условия" not in group_payload["text"]
+
+    duplicate = await NotificationOrchestrator(session_factory, queue).plan_for_signal(
+        signal_id, result["problem_id"]
+    )
+    assert duplicate == []
+
+
+@pytest.mark.asyncio
+async def test_hourly_reconciliation_creates_overdue_problem_once_and_then_resolves(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        source = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=20,
+            sender_id=connection.telegram_user_id,
+            sent_at=now - timedelta(hours=2),
+            outgoing=True,
+            body_text="Отправлю договор в течение часа",
+            attachments_json=[],
+        )
+        session.add(source)
+        await session.flush()
+        commitment = Commitment(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            source_message_id=source.id,
+            fingerprint="overdue-commitment",
+            commitment_type="employee_promise",
+            expected_action="Отправить договор",
+            deadline_at=now - timedelta(hours=1),
+            status="open",
+            confidence=0.9,
+            metadata_json={},
+        )
+        session.add(commitment)
+        await session.commit()
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue("analysis.hourly", {}, tenant_id=tenant.id)
+    lease = await queue.claim_next("reconcile-test")
+    assert lease is not None and lease.id == job_id
+    reconciliation = ReconciliationService(session_factory, queue)
+    first = await reconciliation.reconcile(lease)
+    second = await reconciliation.reconcile(lease)
+    assert first["overdue_created"] == 1 and second["overdue_created"] == 0
+
+    async with session_factory() as session:
+        completion = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=21,
+            sender_id=connection.telegram_user_id,
+            sent_at=now,
+            outgoing=True,
+            body_text="Готово, отправил договор",
+            attachments_json=[],
+        )
+        session.add(completion)
+        await session.commit()
+    completed = await reconciliation.reconcile(lease)
+    async with session_factory() as session:
+        stored_commitment = await session.scalar(select(Commitment))
+        problem = await session.scalar(select(OperationalProblem))
+    assert completed["commitments_completed"] == 1
+    assert stored_commitment.status == "completed" and problem.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_queue_claims_critical_triage_before_scheduled_report(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    report = await queue.enqueue("report.company", {}, priority=JOB_PRIORITY["P4"])
+    critical = await queue.enqueue("signal.ai_triage", {}, priority=JOB_PRIORITY["P0"])
+    lease = await queue.claim_next("priority-test")
+    assert lease is not None and lease.id == critical and lease.id != report

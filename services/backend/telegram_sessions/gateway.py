@@ -1,0 +1,327 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+from telethon import TelegramClient, errors, functions
+from telethon.sessions import StringSession
+
+
+class TelegramFloodWait(RuntimeError):
+    def __init__(self, seconds: int) -> None:
+        super().__init__("Telegram requested a temporary flood wait")
+        self.retry_after_seconds = max(1, seconds)
+
+
+class TelegramSessionRevoked(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class LoginChallenge:
+    session_string: str
+    phone_code_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoginResult:
+    status: str
+    session_string: str
+    telegram_user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteFolder:
+    id: int
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteDialog:
+    id: int
+    title: str
+    username: str | None
+    dialog_type: str
+    folder_id: int | None
+    participants_count: int | None = None
+    last_message_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteMessage:
+    id: int
+    sender_id: int | None
+    sender_username: str | None
+    sent_at: datetime
+    edited_at: datetime | None
+    outgoing: bool
+    text: str | None
+    attachments: list[dict[str, str | int | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageBatch:
+    messages: list[RemoteMessage]
+    next_offset_id: int
+    has_more: bool
+
+
+class TelegramUserGateway(Protocol):
+    async def begin_login(self, phone: str) -> LoginChallenge: ...
+    async def complete_login(
+        self,
+        session_string: str,
+        phone: str,
+        phone_code_hash: str,
+        *,
+        code: str | None = None,
+        password: str | None = None,
+    ) -> LoginResult: ...
+    async def list_folders(self, session_string: str) -> list[RemoteFolder]: ...
+    async def list_dialogs(self, session_string: str) -> list[RemoteDialog]: ...
+    async def fetch_messages(
+        self,
+        session_string: str,
+        dialog_id: int,
+        *,
+        offset_id: int,
+        limit: int,
+    ) -> MessageBatch: ...
+    async def fetch_new_messages(
+        self,
+        session_string: str,
+        dialog_id: int,
+        *,
+        after_id: int,
+        limit: int,
+    ) -> MessageBatch: ...
+    async def terminate_session(self, session_string: str) -> None: ...
+    async def check_session(self, session_string: str) -> LoginResult: ...
+
+
+class TelethonGateway:
+    def __init__(self, api_id: int, api_hash: str) -> None:
+        self.api_id = api_id
+        self.api_hash = api_hash
+
+    def client(self, session: str | None = None) -> TelegramClient:
+        return TelegramClient(
+            StringSession(session or ""),
+            self.api_id,
+            self.api_hash,
+            receive_updates=False,
+            flood_sleep_threshold=0,
+            request_retries=2,
+        )
+
+    async def begin_login(self, phone: str) -> LoginChallenge:
+        client = self.client()
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            return LoginChallenge(StringSession.save(client.session), sent.phone_code_hash)
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    async def complete_login(
+        self,
+        session_string: str,
+        phone: str,
+        phone_code_hash: str,
+        *,
+        code: str | None = None,
+        password: str | None = None,
+    ) -> LoginResult:
+        client = self.client(session_string)
+        try:
+            await client.connect()
+            try:
+                if password is not None:
+                    await client.sign_in(password=password)
+                else:
+                    await client.sign_in(phone, code=code, phone_code_hash=phone_code_hash)
+            except errors.SessionPasswordNeededError:
+                return LoginResult("awaiting_2fa", StringSession.save(client.session))
+            me = await client.get_me()
+            display_name = " ".join(part for part in (me.first_name, me.last_name) if part)
+            return LoginResult(
+                "connected",
+                StringSession.save(client.session),
+                int(me.id),
+                me.username,
+                display_name or None,
+            )
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    async def list_folders(self, session_string: str) -> list[RemoteFolder]:
+        client = self.client(session_string)
+        try:
+            await client.connect()
+            filters = await client(functions.messages.GetDialogFiltersRequest())
+            return [
+                RemoteFolder(int(item.id), str(getattr(item, "title", "Рабочая папка")))
+                for item in filters
+                if getattr(item, "id", 0)
+            ]
+        finally:
+            await client.disconnect()
+
+    async def list_dialogs(self, session_string: str) -> list[RemoteDialog]:
+        client = self.client(session_string)
+        result: list[RemoteDialog] = []
+        try:
+            await client.connect()
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                if dialog.is_user:
+                    kind = "personal"
+                elif dialog.is_channel and getattr(entity, "broadcast", False):
+                    kind = "channel"
+                else:
+                    kind = "group"
+                raw = getattr(dialog, "dialog", None)
+                result.append(
+                    RemoteDialog(
+                        int(dialog.id),
+                        str(dialog.name or "Без названия"),
+                        getattr(entity, "username", None),
+                        kind,
+                        getattr(raw, "folder_id", None),
+                        getattr(entity, "participants_count", None),
+                        getattr(dialog.message, "date", None),
+                    )
+                )
+            return result
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    async def fetch_messages(
+        self,
+        session_string: str,
+        dialog_id: int,
+        *,
+        offset_id: int,
+        limit: int,
+    ) -> MessageBatch:
+        client = self.client(session_string)
+        messages: list[RemoteMessage] = []
+        try:
+            await client.connect()
+            async for item in client.iter_messages(dialog_id, limit=limit, offset_id=offset_id):
+                sender = await item.get_sender() if item.sender_id else None
+                attachments: list[dict[str, str | int | None]] = []
+                if item.media:
+                    file = getattr(item, "file", None)
+                    attachments.append(
+                        {
+                            "kind": type(item.media).__name__,
+                            "name": getattr(file, "name", None),
+                            "size": getattr(file, "size", None),
+                            "mime_type": getattr(file, "mime_type", None),
+                        }
+                    )
+                messages.append(
+                    RemoteMessage(
+                        int(item.id),
+                        int(item.sender_id) if item.sender_id else None,
+                        getattr(sender, "username", None),
+                        item.date,
+                        item.edit_date,
+                        bool(item.out),
+                        item.message or None,
+                        attachments,
+                    )
+                )
+            next_offset = min((item.id for item in messages), default=offset_id)
+            return MessageBatch(messages, next_offset, len(messages) == limit)
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    async def fetch_new_messages(
+        self,
+        session_string: str,
+        dialog_id: int,
+        *,
+        after_id: int,
+        limit: int,
+    ) -> MessageBatch:
+        client = self.client(session_string)
+        messages: list[RemoteMessage] = []
+        try:
+            await client.connect()
+            async for item in client.iter_messages(
+                dialog_id,
+                min_id=after_id,
+                reverse=True,
+                limit=limit,
+            ):
+                sender = await item.get_sender() if item.sender_id else None
+                attachments: list[dict[str, str | int | None]] = []
+                if item.media:
+                    file = getattr(item, "file", None)
+                    attachments.append(
+                        {
+                            "kind": type(item.media).__name__,
+                            "name": getattr(file, "name", None),
+                            "size": getattr(file, "size", None),
+                            "mime_type": getattr(file, "mime_type", None),
+                        }
+                    )
+                messages.append(
+                    RemoteMessage(
+                        int(item.id),
+                        int(item.sender_id) if item.sender_id else None,
+                        getattr(sender, "username", None),
+                        item.date,
+                        item.edit_date,
+                        bool(item.out),
+                        item.message or None,
+                        attachments,
+                    )
+                )
+            newest = max((item.id for item in messages), default=after_id)
+            return MessageBatch(messages, newest, len(messages) == limit)
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    async def terminate_session(self, session_string: str) -> None:
+        client = self.client(session_string)
+        try:
+            await client.connect()
+            await client.log_out()
+        finally:
+            await client.disconnect()
+
+    async def check_session(self, session_string: str) -> LoginResult:
+        client = self.client(session_string)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise TelegramSessionRevoked("Telegram session is no longer authorized")
+            me = await client.get_me()
+            display_name = " ".join(part for part in (me.first_name, me.last_name) if part)
+            return LoginResult(
+                "connected",
+                StringSession.save(client.session),
+                int(me.id),
+                me.username,
+                display_name or None,
+            )
+        except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError):
+            raise TelegramSessionRevoked("Telegram session was revoked") from None
+        finally:
+            await client.disconnect()

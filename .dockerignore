@@ -1,0 +1,13 @@
+.git
+.env
+.venv
+node_modules
+.next
+.vinext
+dist
+__pycache__
+*.pyc
+data
+backups
+public
+app

@@ -1,0 +1,4 @@
+# The canonical Compose file is at the repository root so that
+# `docker compose up --build` works without extra flags.
+include:
+  - ../docker-compose.yml

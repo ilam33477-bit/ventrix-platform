@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-operations-intelligence"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.21,<4",
+  "alembic>=1.16,<2",
+  "aiosqlite>=0.21,<1",
+  "cryptography>=45,<47",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "sqlalchemy[asyncio]>=2.0.41,<3",
+  "telethon>=1.44,<2",
+  "tzdata>=2025.2,<2027",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.12,<1",
+  "mypy>=1.17,<2",
+]
+
+[project.scripts]
+opera-owner-bot = "services.backend.bot.main:main"
+opera-worker = "services.backend.jobs.worker:main"
+opera-client-bots = "services.backend.client_bots.main:main"
+opera-backup = "services.backend.scripts.backup_sqlite:main"
+
+[tool.setuptools.packages.find]
+include = ["services*", "packages*"]
+exclude = ["tests*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

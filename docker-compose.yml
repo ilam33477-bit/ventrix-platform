@@ -1,0 +1,64 @@
+services:
+  backend:
+    build: .
+    env_file: .env
+    command: ["api"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  owner-bot:
+    build: .
+    env_file: .env
+    command: ["bot"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  background-worker:
+    build: .
+    env_file: .env
+    command: ["worker"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    env_file: .env
+    command: ["scheduler"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  client-bots:
+    build: .
+    env_file: .env
+    command: ["client-bots"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

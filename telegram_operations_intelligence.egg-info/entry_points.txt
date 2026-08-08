@@ -1,0 +1,4 @@
+[console_scripts]
+opera-backup = services.backend.scripts.backup_sqlite:main
+opera-owner-bot = services.backend.bot.main:main
+opera-worker = services.backend.jobs.worker:main
