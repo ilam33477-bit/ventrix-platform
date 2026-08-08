@@ -155,11 +155,38 @@ async def test_owner_api_endpoints(
         assert bot.json()["telegram_url"] == "https://t.me/axiom_ops_bot"
         assert "token" not in bot.json()
 
+        second_payload = tenant_payload.model_copy(
+            update={
+                "name": "Foreign Tenant",
+                "owner_telegram_username": "foreign_owner",
+                "owner_telegram_user_id": 999_000_111,
+            }
+        )
+        second_tenant = await client.post(
+            "/api/v1/owner/tenants",
+            headers=headers,
+            json=second_payload.model_dump(mode="json"),
+        )
+        assert second_tenant.status_code == 201
+        second_tenant_id = second_tenant.json()["id"]
+
         init_data = signed_init_data(
             "mock-telegram-token-must-remain-secret",
             tenant_payload.owner_telegram_user_id,
             int(time.time()),
         )
+        mini_app_auth = await client.post(
+            f"/api/v1/client/mini-app/auth?tenant_id={second_tenant_id}",
+            headers={"Authorization": f"tma {init_data}"},
+        )
+        assert mini_app_auth.status_code == 200, mini_app_auth.text
+        assert mini_app_auth.json()["tenant_id"] == tenant_id
+        assert mini_app_auth.json()["tenant_id"] != second_tenant_id
+        assert mini_app_auth.json()["user"]["telegram_user_id"] == (
+            tenant_payload.owner_telegram_user_id
+        )
+        assert mini_app_auth.json()["permissions"] == ["*"]
+        assert "dashboard_summary" in mini_app_auth.json()
         client_menu = await client.get(
             "/api/v1/client/menu", headers={"Authorization": f"tma {init_data}"}
         )

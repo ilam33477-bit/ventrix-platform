@@ -30,6 +30,7 @@ from ..models import (
     OperationalProblem,
     Permission,
     ProductEvent,
+    Report,
     ReportMetric,
     ReportProblem,
     ReportSection,
@@ -207,6 +208,7 @@ class ClientAuthContext:
     bot: BotInstance
     membership: TenantMembership
     permissions: frozenset[str]
+    telegram_user: dict[str, Any]
 
     def allows(self, permission: str) -> bool:
         return self.membership.role == "owner" or permission in self.permissions
@@ -261,13 +263,131 @@ async def require_client_context(
                 )
             )
         )
-        return ClientAuthContext(tenant, bot, membership, permissions)
+        return ClientAuthContext(tenant, bot, membership, permissions, validated["user"])
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Mini App authentication"
     )
 
 
 ClientContext = Annotated[ClientAuthContext, Depends(require_client_context)]
+
+
+async def mini_app_dashboard_summary(
+    session: AsyncSession, context: ClientAuthContext
+) -> dict[str, Any]:
+    tenant_id = context.tenant.id
+    settings = await session.scalar(
+        select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)
+    )
+    critical_threshold = settings.signal_immediate_threshold if settings else 85
+    counts: dict[str, Any] = {
+        "problems": int(
+            await session.scalar(
+                select(func.count(OperationalProblem.id)).where(
+                    OperationalProblem.tenant_id == tenant_id,
+                    OperationalProblem.status.not_in(("resolved", "false_positive")),
+                )
+            )
+            or 0
+        ),
+        "signals": int(
+            await session.scalar(
+                select(func.count(Signal.id)).where(
+                    Signal.tenant_id == tenant_id,
+                    Signal.criticality >= critical_threshold,
+                )
+            )
+            or 0
+        ),
+        "commitments": int(
+            await session.scalar(
+                select(func.count(Commitment.id)).where(
+                    Commitment.tenant_id == tenant_id,
+                    Commitment.status == "open",
+                )
+            )
+            or 0
+        ),
+        "reports": int(
+            await session.scalar(select(func.count(Report.id)).where(Report.tenant_id == tenant_id))
+            or 0
+        ),
+        "employees": int(
+            await session.scalar(
+                select(func.count(Employee.id)).where(
+                    Employee.tenant_id == tenant_id,
+                    Employee.status == "active",
+                )
+            )
+            or 0
+        ),
+        "connections": int(
+            await session.scalar(
+                select(func.count(TelegramConnection.id)).where(
+                    TelegramConnection.tenant_id == tenant_id,
+                    TelegramConnection.deleted_at.is_(None),
+                )
+            )
+            or 0
+        ),
+        "groups": int(
+            await session.scalar(
+                select(func.count(GroupIntegration.id)).where(
+                    GroupIntegration.tenant_id == tenant_id
+                )
+            )
+            or 0
+        ),
+    }
+    day_start = datetime.combine(datetime.now(UTC).date(), datetime.min.time(), UTC)
+    input_tokens, output_tokens, calls = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(AIUsageCall.input_tokens), 0),
+                func.coalesce(func.sum(AIUsageCall.output_tokens), 0),
+                func.count(AIUsageCall.id),
+            ).where(
+                AIUsageCall.tenant_id == tenant_id,
+                AIUsageCall.occurred_at >= day_start,
+            )
+        )
+    ).one()
+    counts["ai_usage"] = {
+        "tokens_today": int(input_tokens or 0) + int(output_tokens or 0),
+        "calls_today": int(calls or 0),
+    }
+    return counts
+
+
+@router.post("/mini-app/auth")
+async def mini_app_auth(
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    settings = await session.scalar(
+        select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
+    )
+    connection = await TenantClientRepository(session, context.tenant.id).current_connection()
+    permissions = ["*"] if context.membership.role == "owner" else sorted(context.permissions)
+    return {
+        "tenant_id": context.tenant.id,
+        "tenant_name": context.tenant.name,
+        "user": {
+            "telegram_user_id": context.membership.telegram_user_id,
+            "first_name": context.telegram_user.get("first_name"),
+            "last_name": context.telegram_user.get("last_name"),
+            "username": context.telegram_user.get("username"),
+            "role": context.membership.role,
+        },
+        "permissions": permissions,
+        "project_context": {
+            "status": context.tenant.status,
+            "timezone": settings.timezone if settings else None,
+            "client_bot": {"id": context.bot.id, "username": context.bot.username},
+            "onboarding_state": onboarding_state(connection),
+        },
+        "dashboard_summary": await mini_app_dashboard_summary(session, context),
+    }
 
 
 def onboarding_state(connection: TelegramConnection | None) -> str:

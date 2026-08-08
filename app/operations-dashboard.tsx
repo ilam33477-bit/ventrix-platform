@@ -25,10 +25,30 @@ type Bootstrap = {
   problems: Array<{ id: string; type: string; priority: "critical" | "high" | "medium"; confidence: number; evidence: string; explanation: string; recommended_action: string; occurred_at: string }>;
 };
 
+type MiniAppAuth = {
+  tenant_id: string;
+  tenant_name: string;
+  user: { telegram_user_id: number; first_name: string | null; last_name: string | null; username: string | null; role: string };
+  permissions: string[];
+  project_context: { status: string; timezone: string | null; client_bot: { id: string; username: string }; onboarding_state: Bootstrap["onboarding_state"] };
+  dashboard_summary: {
+    problems: number;
+    signals: number;
+    commitments: number;
+    reports: number;
+    employees: number;
+    connections: number;
+    groups: number;
+    ai_usage: { tokens_today: number; calls_today: number };
+  };
+};
+
 const nav = ["Сводка", "Важное", "Диалоги", "Сотрудники", "Отчёты", "Подключения", "Настройки"];
 
 export function OperationsDashboard() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
+  const [auth, setAuth] = useState<MiniAppAuth | null>(null);
+  const [launchState, setLaunchState] = useState<"checking" | "outside_telegram" | "authenticating" | "authenticated" | "denied">("checking");
   const [loadError, setLoadError] = useState(false);
   const [active, setActive] = useState("Сводка");
   const [priority, setPriority] = useState("Все");
@@ -41,21 +61,31 @@ export function OperationsDashboard() {
     telegram?.ready?.();
     telegram?.expand?.();
     const initData = telegram?.initData;
-    if (!initData) {
-      const previewTimer = window.setTimeout(() => {
-        setBootstrap({ tenant: { id: "preview", name: "Ваш проект" }, onboarding_state: "not_connected", menu: ["Подключить Telegram", "Как это работает", "Безопасность"], connection: null, connections: [], progress: null, problems: [] });
-      }, 0);
-      return () => window.clearTimeout(previewTimer);
-    }
-    const authTimer = window.setTimeout(() => setInitData(initData), 0);
-    fetch(`${apiBase}/api/v1/client/bootstrap`, { headers: { Authorization: `tma ${initData}` } })
-      .then((response) => {
-        if (!response.ok) throw new Error("bootstrap failed");
-        return response.json() as Promise<Bootstrap>;
-      })
-      .then(setBootstrap)
-      .catch(() => setLoadError(true));
-    return () => window.clearTimeout(authTimer);
+    const launchTimer = window.setTimeout(() => {
+      if (!initData) {
+        setLaunchState("outside_telegram");
+        return;
+      }
+      setInitData(initData);
+      setLaunchState("authenticating");
+      const headers = { Authorization: `tma ${initData}` };
+      fetch(`${apiBase}/api/v1/client/mini-app/auth`, { method: "POST", headers })
+        .then(async (response) => {
+          if (response.status === 401 || response.status === 403) {
+            setLaunchState("denied");
+            return;
+          }
+          if (!response.ok) throw new Error("auth failed");
+          const authenticated = await response.json() as MiniAppAuth;
+          const bootstrapResponse = await fetch(`${apiBase}/api/v1/client/bootstrap`, { headers });
+          if (!bootstrapResponse.ok) throw new Error("bootstrap failed");
+          setAuth(authenticated);
+          setBootstrap(await bootstrapResponse.json() as Bootstrap);
+          setLaunchState("authenticated");
+        })
+        .catch(() => setLoadError(true));
+    }, 0);
+    return () => window.clearTimeout(launchTimer);
   }, [apiBase]);
   const liveProblems = useMemo<Problem[]>(() => (bootstrap?.problems ?? []).map((item) => ({
     id: item.id,
@@ -77,8 +107,14 @@ export function OperationsDashboard() {
   if (loadError) {
     return <main className="state-shell"><section className="state-card"><p className="eyebrow">ОШИБКА ПОДКЛЮЧЕНИЯ</p><h1>Не удалось открыть проект</h1><p>Вернитесь в клиентский бот и откройте панель снова. Если Telegram-сессия истекла, бот предложит повторную авторизацию.</p><button onClick={() => location.reload()}>Повторить</button></section></main>;
   }
+  if (launchState === "outside_telegram") {
+    return <main className="state-shell"><section className="state-card"><p className="eyebrow">VENTRIX MINI APP</p><h1>Откройте Ventrix через вашего Telegram-бота</h1><p>Эта панель работает внутри Telegram и безопасно определяет ваш проект по подписанным данным запуска. Откройте клиентского бота и нажмите «Открыть панель».</p><div className="launch-hint"><span>1</span><p>Откройте бот вашего проекта</p><span>2</span><p>Нажмите «Открыть панель»</p></div></section></main>;
+  }
+  if (launchState === "denied") {
+    return <main className="state-shell"><section className="state-card"><p className="eyebrow">ДОСТУП НЕ ПОДТВЕРЖДЁН</p><h1>У вас нет доступа к этому проекту</h1><p>Вернитесь в клиентский бот, к которому вы добавлены, и откройте Ventrix повторно.</p></section></main>;
+  }
   if (!bootstrap) {
-    return <main className="state-shell"><section className="state-card"><p className="eyebrow">ОПЕРА</p><h1>Загружаем состояние проекта…</h1><div className="state-progress"><i /></div></section></main>;
+    return <main className="state-shell"><section className="state-card"><p className="eyebrow">VENTRIX</p><h1>{launchState === "authenticating" ? "Проверяем доступ к проекту…" : "Открываем Mini App…"}</h1><div className="state-progress"><i /></div></section></main>;
   }
   if (bootstrap.onboarding_state !== "ready" && active !== "Сотрудники") {
     const progress = bootstrap.progress;
@@ -93,11 +129,16 @@ export function OperationsDashboard() {
     return <main className="state-shell"><section className="state-card wide"><p className="eyebrow">{bootstrap.tenant.name}</p><h1>{copy[0]}</h1><p>{copy[1]}</p>{progress && <><div className="state-progress"><i style={{ width: `${progress.percent}%` }} /></div><strong>{progress.percent}% · {progress.messages_loaded.toLocaleString("ru-RU")} сообщений</strong><small>{progress.dialogs_completed} из {progress.dialogs_total} диалогов · ошибок отдельных чатов: {progress.failed_dialogs}</small></>}<nav><button onClick={() => setActive("Сотрудники")}>Подключить рабочий аккаунт</button>{bootstrap.menu.slice(1).map((item) => <button key={item}>{item}</button>)}</nav><p className="security-note">Сессия хранится в зашифрованном виде. Код и пароль 2FA не сохраняются.</p></section></main>;
   }
   const readyMetrics = bootstrap.progress?.metrics ?? {};
+  const summary = auth?.dashboard_summary;
   const liveMetrics = [
-    [String(readyMetrics.potential_deals ?? 0), "Потенциальных сделок", "первичный анализ"],
-    [String(readyMetrics.clients_without_answer ?? 0), "Без ответа", "нужно проверить"],
-    [String(readyMetrics.overdue_commitments ?? 0), "Обязательств просрочено", "по выбранной истории"],
-    [String(readyMetrics.complaints ?? 0), "Жалоб", "нужно вмешательство"],
+    [String(summary?.problems ?? 0), "Открытые проблемы", "операционный фокус"],
+    [String(summary?.signals ?? 0), "Критичные сигналы", "требуют проверки"],
+    [String(summary?.commitments ?? 0), "Обязательства", "открытые"],
+    [String(summary?.reports ?? 0), "Отчёты", "доступные"],
+    [String(summary?.employees ?? 0), "Сотрудники", "активные"],
+    [String(summary?.connections ?? 0), "Telegram connections", "подключения"],
+    [String(summary?.groups ?? 0), "Рабочие группы", "интеграции"],
+    [String(summary?.ai_usage.tokens_today ?? 0), "AI usage", `${summary?.ai_usage.calls_today ?? 0} запросов сегодня`],
   ];
   const criticalCount = liveProblems.filter((item) => item.priority === "critical").length;
   const highCount = liveProblems.filter((item) => item.priority === "high").length;
@@ -106,7 +147,7 @@ export function OperationsDashboard() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">O</span><span>Опера</span></div>
+        <div className="brand"><span className="brand-mark">V</span><span>Ventrix</span></div>
         <p className="tenant-label">КОМПАНИЯ</p>
         <button className="tenant-switch">{bootstrap.tenant.name} <span>⌄</span></button>
         <nav aria-label="Основная навигация">
@@ -119,7 +160,7 @@ export function OperationsDashboard() {
         </nav>
         <div className="sidebar-bottom">
           <button className="nav-item"><span className="nav-icon">⚙</span>Настройки</button>
-          <div className="profile"><span>ВЛ</span><div><strong>Владелец проекта</strong><small>{bootstrap.connection?.account ?? "Telegram"}</small></div><button aria-label="Открыть профиль">•••</button></div>
+          <div className="profile"><span>{(auth?.user.first_name ?? "V").slice(0, 2).toUpperCase()}</span><div><strong>{[auth?.user.first_name, auth?.user.last_name].filter(Boolean).join(" ") || "Пользователь проекта"}</strong><small>{auth?.user.username ? `@${auth.user.username}` : auth?.user.role}</small></div><button aria-label="Открыть профиль">•••</button></div>
         </div>
       </aside>
 
@@ -140,7 +181,7 @@ export function OperationsDashboard() {
         </section>
 
         <section className="metrics" aria-label="Ключевые показатели">
-          {liveMetrics.map(([value, label, note], index) => <article key={label}><div className="metric-head"><span className={`metric-icon metric-${index}`}>{["↗", "↩", "⌛", "◇"][index]}</span><small>{note}</small></div><strong>{value}</strong><p>{label}</p></article>)}
+          {liveMetrics.map(([value, label, note], index) => <article key={label}><div className="metric-head"><span className={`metric-icon metric-${index % 4}`}>{["!", "⌁", "✓", "▤", "◎", "↔", "◫", "AI"][index]}</span><small>{note}</small></div><strong>{value}</strong><p>{label}</p></article>)}
         </section>
 
         <section className="workspace" id="problems">
