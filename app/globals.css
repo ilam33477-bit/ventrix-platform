@@ -2,7 +2,7 @@
 
 :root { --ink:#17201d; --muted:#71807a; --line:#e5eae7; --paper:#f4f6f3; --card:#fff; --green:#125b45; --green2:#dcece5; --amber:#c77b22; --red:#c5483d; }
 * { box-sizing:border-box; }
-html { scroll-behavior:smooth; }
+html { scroll-behavior:smooth; color-scheme:light; background:var(--paper); }
 body { margin:0; background:var(--paper); color:var(--ink); font-family:Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 button { color:inherit; font:inherit; }
 .state-shell{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0,#e2eee8 0,transparent 44%),var(--paper)}
@@ -44,7 +44,7 @@ button { color:inherit; font:inherit; }
   --tg-content-safe-top:0px;--tg-content-safe-bottom:0px;
   --mini-radius:16px;--mini-shadow:0 14px 36px #143d3010;
 }
-body{background:var(--tg-theme-bg,var(--paper));color:var(--tg-theme-text,var(--ink))}
+body{background:var(--paper);color:var(--ink)}
 .motion-surface{transform:translateZ(0);will-change:auto}
 .ui-card{background:var(--card);border:1px solid var(--line);border-radius:var(--mini-radius);padding:16px;box-shadow:var(--mini-shadow)}
 .mini-app-shell{min-height:var(--tg-viewport-stable-height);padding:calc(var(--tg-safe-top) + var(--tg-content-safe-top)) var(--tg-safe-right) calc(74px + var(--tg-safe-bottom) + var(--tg-content-safe-bottom)) var(--tg-safe-left);background:var(--paper)}
@@ -89,3 +89,12 @@ body{background:var(--tg-theme-bg,var(--paper));color:var(--tg-theme-text,var(--
 .onboarding_connection .managed-connections{display:none}.onboarding_groups .connection-layout{grid-template-columns:1fr!important}.onboarding_groups .managed-sources{margin:0}.managed-sources>p,.managed-sources>label{font-size:11px;line-height:1.5}.managed-sources input{width:100%;min-height:44px;border:1px solid #d5ded9;border-radius:9px;padding:0 11px}.managed-sources>.primary-action{width:100%;margin-top:9px}
 @media(max-width:420px){.onboarding-shell{padding-left:max(12px,var(--tg-safe-left));padding-right:max(12px,var(--tg-safe-right))}.onboarding-header h1{font-size:clamp(26px,8vw,31px)}.onboarding-hero{padding:18px}.choice-grid{grid-template-columns:1fr}.secondary-actions{grid-template-columns:1fr}.status-badge{max-width:100%}.connection-row{align-items:flex-start;flex-wrap:wrap}.connection-row>div{min-width:calc(100% - 48px)}.connection-row>.status-badge{margin-left:43px}.card-title{gap:8px}.card-title h3{font-size:17px}}
 @media(prefers-reduced-motion:reduce){.onboarding-step-enter,.success-check{animation:none}.sync-progress i{transition:none}}
+
+/* The product UI intentionally uses a light Ventrix surface. Telegram iOS can
+   expose dark theme params (white text/buttons) while this surface stays light,
+   so theme colors must not be used as foregrounds on branded cards. */
+.primary-action{background:var(--green);color:#fff}
+.onboarding-shell,.onboarding-shell .ui-card{color:var(--ink)}
+.onboarding-header>div:first-child>strong,.onboarding-header h1,
+.connection-wizard h3{color:var(--ink)}
+.connection-wizard input,.connection-wizard select{color:var(--ink);background:#fff}

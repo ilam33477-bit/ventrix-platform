@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { VentrixClientApi } from "../../api/client";
 import type { Employee, OnboardingStep, TelegramConnection, TelegramSource, TelegramSourcePreview } from "../../types";
@@ -45,6 +45,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const [previewJobId, setPreviewJobId] = useState("");
   const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
   const [sources, setSources] = useState<TelegramSource[]>([]);
+  const onboardingRecoveryStarted = useRef(false);
   useEffect(() => {
     let cancelled = false;
     Promise.all([api.employees(), api.connections()]).then(([employeeRows, connectionRows]) => {
@@ -58,6 +59,24 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
       cancelled = true;
     };
   }, [api]);
+
+  useEffect(() => {
+    if (
+      mode !== "onboarding_connection"
+      || onboardingStep !== "telegram_connection"
+      || !onOnboardingStep
+      || onboardingRecoveryStarted.current
+    ) return;
+    const connected = connections.find((item) =>
+      ["connected", "syncing", "ready"].includes(item.status),
+    );
+    if (!connected) return;
+    onboardingRecoveryStarted.current = true;
+    void onOnboardingStep("monitoring_started").catch((reason: unknown) => {
+      onboardingRecoveryStarted.current = false;
+      setError(reason instanceof Error ? reason.message : "Не удалось продолжить настройку");
+    });
+  }, [connections, mode, onOnboardingStep, onboardingStep]);
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true); setError("");

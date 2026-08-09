@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from services.backend.api.app import create_app
 from services.backend.api.client_router import (
     get_client_connection_service,
+    reconcile_connected_onboarding,
     validate_webapp_init_data,
 )
 from services.backend.api.dependencies import get_foundation_service
@@ -39,6 +40,31 @@ def test_webapp_init_data_signature_and_age_are_checked() -> None:
     assert validate_webapp_init_data(payload, token, now=1_700_000_100)["user_id"] == 777
     assert validate_webapp_init_data(payload, "wrong-token", now=1_700_000_100) is None
     assert validate_webapp_init_data(payload, token, now=1_700_200_000) is None
+
+
+@pytest.mark.asyncio
+async def test_connected_telegram_session_recovers_stranded_onboarding() -> None:
+    class Session:
+        commits = 0
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    session = Session()
+    settings = SimpleNamespace(
+        client_onboarding_completed_at=None,
+        client_onboarding_step="telegram_connection",
+        client_onboarding_json={"welcome": "completed"},
+    )
+    connection = SimpleNamespace(status="syncing")
+
+    assert await reconcile_connected_onboarding(session, settings, connection) is True
+    assert settings.client_onboarding_step == "monitoring_started"
+    assert settings.client_onboarding_json["telegram_connection"] == "completed"
+    assert session.commits == 1
+
+    assert await reconcile_connected_onboarding(session, settings, connection) is False
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio

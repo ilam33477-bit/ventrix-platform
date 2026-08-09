@@ -651,6 +651,34 @@ def client_onboarding_payload(settings: TenantSettings | None) -> dict[str, Any]
     }
 
 
+async def reconcile_connected_onboarding(
+    session: AsyncSession,
+    settings: TenantSettings | None,
+    connection: TelegramConnection | None,
+) -> bool:
+    """Recover onboarding when Telegram login finished before the UI advanced.
+
+    A Mini App can be closed or suspended by iOS immediately after Telegram
+    accepts the code/2FA. The connection is already durable at that point, so a
+    persisted ``telegram_connection`` step must resume at monitoring instead of
+    showing an endless local syncing state.
+    """
+    if (
+        settings is None
+        or settings.client_onboarding_completed_at is not None
+        or settings.client_onboarding_step != "telegram_connection"
+        or connection is None
+        or connection.status not in {"connected", "syncing", "ready"}
+    ):
+        return False
+    states = dict(settings.client_onboarding_json or {})
+    states["telegram_connection"] = "completed"
+    settings.client_onboarding_json = states
+    settings.client_onboarding_step = "monitoring_started"
+    await session.commit()
+    return True
+
+
 @router.post("/mini-app/auth")
 async def mini_app_auth(
     context: ClientContext,
@@ -660,6 +688,7 @@ async def mini_app_auth(
         select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
     )
     connection = await TenantClientRepository(session, context.tenant.id).current_connection()
+    await reconcile_connected_onboarding(session, settings, connection)
     permissions = ["*"] if context.membership.role == "owner" else sorted(context.permissions)
     return {
         "tenant_id": context.tenant.id,
@@ -1301,6 +1330,7 @@ async def complete_connection_login(
                 context.tenant.id, connection_id=connection.id
             )
             analysis_run_id = run.id
+            await reconcile_connected_onboarding(session, tenant_settings, connection)
     except TelegramFloodWait as exc:
         raise HTTPException(
             status_code=429,

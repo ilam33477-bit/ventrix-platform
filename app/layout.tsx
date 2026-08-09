@@ -1,10 +1,16 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import Script from "next/script";
 import "./globals.css";
 
 const title = "Опера — Telegram Operations Intelligence";
 const description = "Операционная прозрачность и контроль исполнения договорённостей в Telegram.";
+
+export const viewport: Viewport = {
+  colorScheme: "light",
+  themeColor: "#f4f6f3",
+  viewportFit: "cover",
+};
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
