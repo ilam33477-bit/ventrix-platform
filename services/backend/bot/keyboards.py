@@ -26,6 +26,56 @@ def back_to_owner_menu() -> InlineKeyboardMarkup:
     )
 
 
+def system_settings_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Telegram API ID", callback_data="owner:secret:telegram_api_id"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Telegram API Hash", callback_data="owner:secret:telegram_api_hash"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="DeepSeek API key", callback_data="owner:secret:deepseek_api_key"
+                )
+            ],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="owner:menu")],
+        ]
+    )
+
+
+def system_secret_actions(name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Показать полностью", callback_data=f"owner:secret_reveal:{name}"
+                )
+            ],
+            [InlineKeyboardButton(text="Изменить", callback_data=f"owner:secret_change:{name}")],
+            [InlineKeyboardButton(text="← Настройки системы", callback_data="owner:settings")],
+        ]
+    )
+
+
+def system_secret_confirmation(name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✓ Подтвердить замену", callback_data=f"owner:secret_confirm:{name}"
+                )
+            ],
+            [InlineKeyboardButton(text="✕ Отмена", callback_data="owner:settings")],
+        ]
+    )
+
+
 def cancel_flow() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -56,11 +106,24 @@ def tenant_create_mode() -> InlineKeyboardMarkup:
 def ai_draft_confirmation() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✓ Создать клиента", callback_data="flow:ai_draft:confirm")],
-            [InlineKeyboardButton(text="☷ Изменить поле", callback_data="flow:ai_draft:fields")],
+            [InlineKeyboardButton(text="✓ Подтвердить", callback_data="flow:ai_draft:confirm")],
+            [InlineKeyboardButton(text="☷ Изменить", callback_data="flow:ai_draft:fields")],
             [
                 InlineKeyboardButton(
-                    text="✎ Исправить текстом", callback_data="flow:ai_draft:correct"
+                    text="✨ Дополнить через AI", callback_data="flow:ai_draft:correct"
+                )
+            ],
+            [InlineKeyboardButton(text="✕ Отменить", callback_data="flow:cancel")],
+        ]
+    )
+
+
+def ai_draft_start() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✨ Настроить через AI", callback_data="flow:ai_draft:describe"
                 )
             ],
             [InlineKeyboardButton(text="✕ Отменить", callback_data="flow:cancel")],
@@ -224,6 +287,11 @@ def tenant_actions(tenant_id: str, *, suspended: bool = False) -> InlineKeyboard
             ],
             [
                 InlineKeyboardButton(
+                    text="🕘 История анализа", callback_data=f"tenant:history:{tenant_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="▶ Проверить сейчас", callback_data=f"tenant:analysis_now:{tenant_id}"
                 ),
                 InlineKeyboardButton(
@@ -236,6 +304,12 @@ def tenant_actions(tenant_id: str, *, suspended: bool = False) -> InlineKeyboard
                 )
             ],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"tenant:delete:{tenant_id}")],
+            [
+                InlineKeyboardButton(
+                    text="↺ Сбросить тестовую настройку",
+                    callback_data=f"tenant:test_reset:{tenant_id}",
+                )
+            ],
             [InlineKeyboardButton(text="← Клиенты", callback_data="owner:clients")],
         ]
     )
@@ -275,6 +349,32 @@ def delete_confirmation(tenant_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="Удалить безвозвратно", callback_data=f"tenant:delete_confirm:{tenant_id}"
+                )
+            ],
+            [InlineKeyboardButton(text="Отмена", callback_data=f"tenant:view:{tenant_id}")],
+        ]
+    )
+
+
+def test_reset_menu(tenant_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Только onboarding",
+                    callback_data=f"tenant:test_reset_confirm:onboarding:{tenant_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Connection + onboarding",
+                    callback_data=f"tenant:test_reset_confirm:connection:{tenant_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Full test reset",
+                    callback_data=f"tenant:test_reset_confirm:full:{tenant_id}",
                 )
             ],
             [InlineKeyboardButton(text="Отмена", callback_data=f"tenant:view:{tenant_id}")],
@@ -335,17 +435,14 @@ def client_main_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
 
 def client_welcome_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
     panel = (
-        InlineKeyboardButton(text="↗ Открыть панель", web_app=WebAppInfo(url=mini_app_url))
+        InlineKeyboardButton(text="Ventrix AI", web_app=WebAppInfo(url=mini_app_url))
         if mini_app_url
-        else InlineKeyboardButton(text="↗ Открыть панель", callback_data="client:panel")
+        else InlineKeyboardButton(text="Ventrix AI", callback_data="client:panel")
     )
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✓ Настроить проект", callback_data="client:onboarding")],
-            [InlineKeyboardButton(text="🔗 Подключить Telegram", callback_data="client:connect")],
             [panel],
-            [InlineKeyboardButton(text="Как это работает", callback_data="client:how")],
-            [InlineKeyboardButton(text="Перейти в главное меню", callback_data="client:menu")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="client:menu")],
         ]
     )
 

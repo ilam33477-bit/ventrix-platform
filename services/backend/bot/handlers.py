@@ -7,7 +7,7 @@ from html import escape
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -18,7 +18,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.api.deepseek import DeepSeekProvider
@@ -26,15 +26,22 @@ from services.api.deepseek import DeepSeekProvider
 from ..config import Settings
 from ..jobs.queue import SQLiteJobQueue
 from ..models import (
+    AIUsageCall,
     AIUsageMetric,
     BackgroundJob,
+    Employee,
+    GroupIntegration,
+    NotificationLog,
     OperationalProblem,
     OwnerClientDraft,
     ProductEvent,
     Report,
     TelegramConnection,
+    TelegramDialog,
     TelegramMessage,
+    Tenant,
     TenantAnalysisSchedule,
+    TenantSettings,
 )
 from ..scheduler.service import TenantAnalysisScheduler
 from ..schemas import AIProfileUpdate, BotCreate, TenantCreate, TenantUpdate
@@ -42,11 +49,15 @@ from ..services.client_drafts import ClientDraftData, OwnerClientDraftService
 from ..services.encryption import EncryptionService
 from ..services.foundation import BotAlreadyExistsError, FoundationService
 from ..services.product_events import ProductEventService
+from ..services.system_secrets import SystemSecretService, mask_secret
 from ..services.telegram import BotTokenVerificationError, TelegramBotVerifier
+from ..telegram_sessions.gateway import TelethonGateway
+from ..telegram_sessions.service import TelegramConnectionService
 from .keyboards import (
     access_actions,
     ai_draft_confirmation,
     ai_draft_field_selector,
+    ai_draft_start,
     ai_profile_actions,
     ai_recommendation_choice,
     back_to_owner_menu,
@@ -59,20 +70,25 @@ from .keyboards import (
     optional_access_end,
     optional_username,
     owner_main_menu,
+    system_secret_actions,
+    system_secret_confirmation,
+    system_settings_menu,
     tenant_actions,
     tenant_bot_missing,
-    tenant_create_mode,
     tenant_edit_selector,
     tenant_selector,
+    test_reset_menu,
 )
 from .states import (
     AIProfileStates,
     BotCreateStates,
     BotRotateStates,
+    SystemSecretStates,
     TenantAccessStates,
     TenantAICreateStates,
     TenantCreateStates,
     TenantEditStates,
+    TenantHistoryStates,
 )
 
 router = Router(name="owner-admin-inline")
@@ -419,18 +435,19 @@ async def restart_flow(query: CallbackQuery, state: FSMContext) -> None:
         return
     screen = {key: data[key] for key in ("screen_chat_id", "screen_message_id") if key in data}
     await state.clear()
-    await state.set_state(TenantCreateStates.name)
-    await state.update_data(flow_kind="tenant_create", **screen)
-    await render(query, "<b>Новый клиент · 1/7</b>\n\nВведите название компании.", cancel_flow())
+    await state.set_state(TenantAICreateStates.owner_name)
+    await state.update_data(flow_kind="tenant_create_ai", **screen)
+    await render(query, "<b>Новый клиент · 1/4</b>\n\nВведите имя клиента.", cancel_flow())
 
 
 @router.callback_query(F.data == "owner:tenant_create")
 async def tenant_create_start(query: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await render(
+    await begin_flow(
         query,
-        "<b>Новый клиент</b>\n\nОпишите компанию одним сообщением — Ventrix соберёт проверяемый черновик. Или используйте ручную форму.",
-        tenant_create_mode(),
+        state,
+        TenantAICreateStates.owner_name,
+        "tenant_create_ai",
+        "<b>Новый клиент · 1/4</b>\n\nВведите имя клиента.\n\nНапример: <code>Вадим</code>",
     )
 
 
@@ -450,9 +467,88 @@ async def tenant_create_ai(query: CallbackQuery, state: FSMContext) -> None:
     await begin_flow(
         query,
         state,
-        TenantAICreateStates.prompt,
+        TenantAICreateStates.owner_name,
         "tenant_create_ai",
-        "<b>Создание клиента с AI</b>\n\nОдним сообщением укажите компанию, Telegram user ID владельца, нишу, продукты, аудиторию, график и важные риски. Секреты и bot token сюда не отправляйте.",
+        "<b>Новый клиент · 1/4</b>\n\nВведите имя клиента.",
+    )
+
+
+@router.message(TenantAICreateStates.owner_name)
+async def tenant_ai_owner_name(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if len(value) < 2 or len(value) > 200:
+        await update_flow_screen(message, state, "Введите имя длиной от 2 до 200 символов.")
+        return
+    await state.update_data(owner_name=value)
+    await state.set_state(TenantAICreateStates.owner_user_id)
+    await update_flow_screen(
+        message,
+        state,
+        "<b>Новый клиент · 2/4</b>\n\nВведите числовой Telegram user ID клиента.\n\n"
+        "Username указывать не нужно.",
+    )
+
+
+@router.message(TenantAICreateStates.owner_user_id)
+async def tenant_ai_owner_id(message: Message, state: FSMContext, bot: Bot) -> None:
+    try:
+        user_id = parse_user_id(message.text or "")
+    except ValueError:
+        await update_flow_screen(message, state, "Введите Telegram ID только цифрами.")
+        return
+    username = None
+    try:
+        chat = await bot.get_chat(user_id)
+        username = chat.username
+    except TelegramAPIError:
+        # A Telegram user may not have opened the owner bot. Username remains optional.
+        pass
+    await state.update_data(
+        owner_telegram_user_id=user_id,
+        owner_telegram_username=username,
+    )
+    await state.set_state(TenantAICreateStates.company_name)
+    await update_flow_screen(
+        message,
+        state,
+        "<b>Новый клиент · 3/4</b>\n\nВведите название компании или проекта.",
+    )
+
+
+@router.message(TenantAICreateStates.company_name)
+async def tenant_ai_company(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if len(value) < 2 or len(value) > 200:
+        await update_flow_screen(message, state, "Введите название длиной от 2 до 200 символов.")
+        return
+    await state.update_data(name=value)
+    await state.set_state(TenantAICreateStates.ai_choice)
+    await update_flow_screen(
+        message,
+        state,
+        "<b>Основные данные готовы</b>\n\n"
+        "Теперь можно описать бизнес свободным текстом. Ventrix заполнит остальные настройки "
+        "и сначала покажет черновик.",
+        ai_draft_start(),
+    )
+
+
+@router.callback_query(TenantAICreateStates.ai_choice, F.data == "flow:ai_draft:describe")
+async def tenant_ai_description_start(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TenantAICreateStates.prompt)
+    await render(
+        query,
+        "<b>Опишите клиента одним сообщением</b>\n\n"
+        "Можно написать в свободной форме. Ventrix разберёт описание и покажет черновик.\n\n"
+        "<pre>Компания занимается AI-рассылками в Telegram.\n\n"
+        "Ниша:\nB2B автоматизация продаж.\n\n"
+        "Целевая аудитория:\nмалый и средний бизнес, руководители отделов продаж.\n\n"
+        "Основные риски:\nклиенты без ответа, просроченные обещания, счета, жалобы.\n\n"
+        "SLA:\n60 минут.\n\n"
+        "Регулярный отчёт:\nпо будням в 19:00 по Москве.\n\n"
+        "История анализа:\nактивные диалоги за последние 30 дней, сообщения внутри них за 14 дней.</pre>\n\n"
+        "Не отправляйте сюда пароли, API-ключи и bot token.",
+        cancel_flow(),
     )
 
 
@@ -500,9 +596,16 @@ async def tenant_ai_prompt(
         await update_flow_screen(message, state, "Опишите клиента подробнее — минимум 20 символов.")
         return
     try:
+        flow_data = await state.get_data()
+        identity = {
+            "owner_name": flow_data["owner_name"],
+            "owner_telegram_user_id": flow_data["owner_telegram_user_id"],
+            "owner_telegram_username": flow_data.get("owner_telegram_username"),
+            "name": flow_data["name"],
+        }
         async with session_factory() as session:
             draft = await ai_draft_service(session, settings).create(
-                settings.platform_owner_telegram_id, prompt
+                settings.platform_owner_telegram_id, prompt, identity=identity
             )
     except Exception as exc:
         logger.exception("Owner AI client draft failed")
@@ -917,6 +1020,100 @@ async def tenant_view(
     )
 
 
+@router.callback_query(F.data.startswith("tenant:test_reset:"))
+async def tenant_test_reset(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = query.data.rsplit(":", 1)[1]
+    async with session_factory() as session:
+        tenant = await session.get(Tenant, tenant_id)
+    if tenant is None or not tenant.name.upper().startswith("TEST"):
+        await query.answer("Reset доступен только проектам с префиксом TEST", show_alert=True)
+        return
+    await render(
+        query,
+        "<b>Сброс тестового клиента</b>\n\n"
+        "Onboarding: сохраняет Telegram и business data.\n"
+        "Connection + onboarding: безопасно отзывает только сессию Ventrix.\n"
+        "Full test reset: также удаляет импортированные данные этого TEST tenant.\n\n"
+        "Выберите режим. Действие начнётся только после этой явной команды.",
+        test_reset_menu(tenant_id),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:test_reset_confirm:"))
+async def tenant_test_reset_confirm(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    _, _, _, mode, tenant_id = query.data.split(":", 4)
+    async with session_factory() as session:
+        tenant = await session.get(Tenant, tenant_id)
+        if tenant is None or not tenant.name.upper().startswith("TEST"):
+            await query.answer("Reset разрешён только TEST tenant", show_alert=True)
+            return
+        connections = list(
+            await session.scalars(
+                select(TelegramConnection).where(
+                    TelegramConnection.tenant_id == tenant_id,
+                    TelegramConnection.deleted_at.is_(None),
+                )
+            )
+        )
+    if mode in {"connection", "full"}:
+        if not settings.telegram_api_id or not settings.telegram_api_hash:
+            await query.answer("Telegram runtime не настроен", show_alert=True)
+            return
+        connection_service = TelegramConnectionService(
+            session_factory,
+            EncryptionService(settings.app_encryption_key.get_secret_value()),
+            TelethonGateway(
+                settings.telegram_api_id,
+                settings.telegram_api_hash.get_secret_value(),
+            ),
+        )
+        for connection in connections:
+            await connection_service.disconnect(tenant_id, connection.id)
+            if mode == "full":
+                await connection_service.clear_data(tenant_id, connection.id)
+
+    async with session_factory() as session:
+        tenant_settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)
+        )
+        tenant_settings.client_onboarding_step = "welcome"
+        tenant_settings.client_onboarding_completed_at = None
+        tenant_settings.client_onboarding_json = {}
+        if mode in {"connection", "full"}:
+            await session.execute(
+                update(BackgroundJob)
+                .where(
+                    BackgroundJob.tenant_id == tenant_id,
+                    BackgroundJob.status.in_(
+                        ("pending", "scheduled", "waiting", "retry", "retry_scheduled")
+                    ),
+                    BackgroundJob.job_type.in_(
+                        (
+                            "telegram.sync_chat",
+                            "signal.scan_batch",
+                            "signal.ai_triage",
+                            "notification.initial_summary",
+                        )
+                    ),
+                )
+                .values(status="cancelled", finished_at=datetime.now(UTC))
+            )
+        await session.commit()
+    await render(
+        query,
+        f"TEST tenant сброшен в режиме <b>{escape(mode)}</b>.\n\n"
+        "Следующий /start и открытие Mini App начнут onboarding заново.",
+        tenant_actions(tenant_id),
+    )
+
+
 @router.callback_query(F.data.startswith("tenant:edit:"))
 async def tenant_edit(query: CallbackQuery) -> None:
     tenant_id = query.data.rsplit(":", 1)[1]
@@ -1090,6 +1287,101 @@ async def ai_edit_finish(
 @router.callback_query(F.data.startswith("tenant:access:"))
 async def tenant_access(query: CallbackQuery) -> None:
     await render(query, "Продлить доступ к проекту:", access_actions(query.data.rsplit(":", 1)[1]))
+
+
+@router.callback_query(F.data.startswith("tenant:history:"))
+async def tenant_history(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = query.data.rsplit(":", 1)[1]
+    async with session_factory() as session:
+        settings_row = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)
+        )
+    if settings_row is None:
+        await query.answer("Настройки клиента не найдены", show_alert=True)
+        return
+    await render(
+        query,
+        "<b>История первого анализа</b>\n\n"
+        f"Активные диалоги: <b>{settings_row.active_dialog_days} дней</b>\n"
+        "Ventrix возьмёт диалоги, где была активность за этот период.\n\n"
+        f"Глубина сообщений: <b>{settings_row.message_history_days} дней</b>\n"
+        "В каждом актуальном диалоге сообщения анализируются не глубже этого периода.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Изменить активные диалоги",
+                        callback_data=f"tenant:history_edit:active:{tenant_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Изменить глубину сообщений",
+                        callback_data=f"tenant:history_edit:messages:{tenant_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="← Карточка", callback_data=f"tenant:view:{tenant_id}")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:history_edit:"))
+async def tenant_history_edit(query: CallbackQuery, state: FSMContext) -> None:
+    _, _, field, tenant_id = query.data.split(":", 3)
+    await begin_flow(
+        query,
+        state,
+        TenantHistoryStates.value,
+        "tenant_history",
+        "Введите число от 0 до 180.\n\n"
+        "0 означает: не загружать старую историю, анализировать только новые события после подключения.",
+    )
+    await state.update_data(tenant_id=tenant_id, history_field=field)
+
+
+@router.message(TenantHistoryStates.value)
+async def tenant_history_save(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    try:
+        value = int((message.text or "").strip())
+        if not 0 <= value <= 180:
+            raise ValueError
+    except ValueError:
+        await update_flow_screen(message, state, "Введите целое число от 0 до 180.")
+        return
+    data = await state.get_data()
+    async with session_factory() as session:
+        settings_row = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == data["tenant_id"])
+        )
+        if settings_row is None:
+            raise LookupError("Tenant settings not found")
+        attribute = (
+            "active_dialog_days" if data["history_field"] == "active" else "message_history_days"
+        )
+        setattr(settings_row, attribute, value)
+        await session.commit()
+    tenant_id = str(data["tenant_id"])
+    await state.clear()
+    await message.answer(
+        "Настройки истории сохранены.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="← История анализа", callback_data=f"tenant:history:{tenant_id}"
+                    )
+                ]
+            ]
+        ),
+    )
 
 
 @router.callback_query(F.data.startswith("tenant:extend:"))
@@ -1450,14 +1742,93 @@ async def owner_activity(
     query: CallbackQuery, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     async with session_factory() as session:
-        total = await session.scalar(select(func.count(ProductEvent.id)))
-        last = await session.scalar(
-            select(ProductEvent).order_by(ProductEvent.occurred_at.desc()).limit(1)
+        clients = int(await session.scalar(select(func.count(Tenant.id))) or 0)
+        connections = int(
+            await session.scalar(
+                select(func.count(TelegramConnection.id)).where(
+                    TelegramConnection.status.in_(("connected", "ready", "syncing")),
+                    TelegramConnection.deleted_at.is_(None),
+                )
+            )
+            or 0
+        )
+        employees = int(await session.scalar(select(func.count(Employee.id))) or 0)
+        dialogs = int(
+            await session.scalar(
+                select(func.count(TelegramDialog.id)).where(TelegramDialog.selected.is_(True))
+            )
+            or 0
+        )
+        groups = int(await session.scalar(select(func.count(GroupIntegration.id))) or 0)
+        messages = int(await session.scalar(select(func.count(TelegramMessage.id))) or 0)
+        queue_size = int(
+            await session.scalar(
+                select(func.count(BackgroundJob.id)).where(
+                    BackgroundJob.status.in_(
+                        ("pending", "scheduled", "waiting", "retry_scheduled", "running")
+                    )
+                )
+            )
+            or 0
+        )
+        fast_calls = int(
+            await session.scalar(
+                select(func.count(AIUsageCall.id)).where(AIUsageCall.job_type == "signal.ai_triage")
+            )
+            or 0
+        )
+        deep_calls = int(
+            await session.scalar(
+                select(func.count(AIUsageCall.id)).where(
+                    AIUsageCall.job_type == "ai_batch_analysis"
+                )
+            )
+            or 0
+        )
+        notifications = int(await session.scalar(select(func.count(NotificationLog.id))) or 0)
+        notification_errors = int(
+            await session.scalar(
+                select(func.count(NotificationLog.id)).where(NotificationLog.status == "failed")
+            )
+            or 0
+        )
+        tokens, cost = (
+            await session.execute(
+                select(
+                    func.coalesce(
+                        func.sum(AIUsageCall.input_tokens + AIUsageCall.output_tokens), 0
+                    ),
+                    func.coalesce(func.sum(AIUsageCall.estimated_cost), 0.0),
+                )
+            )
+        ).one()
+        reconnects = int(
+            await session.scalar(
+                select(func.count(ProductEvent.id)).where(
+                    ProductEvent.event_name.in_(
+                        ("telegram_reconnected", "telegram_connection_completed")
+                    )
+                )
+            )
+            or 0
         )
     await render(
         query,
-        f"<b>Активность</b>\n\nВсего событий: {total or 0}\n"
-        f"Последнее: {escape(last.event_name) if last else '—'}",
+        "<b>Статистика Ventrix</b>\n\n"
+        f"Клиенты: <b>{clients}</b>\n"
+        f"Активные Telegram connections: <b>{connections}</b>\n"
+        f"Сотрудники: <b>{employees}</b>\n"
+        f"Отслеживаемые диалоги: <b>{dialogs}</b>\n"
+        f"Рабочие группы: <b>{groups}</b>\n"
+        f"Сообщения обработаны: <b>{messages}</b>\n"
+        f"Очередь: <b>{queue_size}</b>\n\n"
+        f"AI fast calls: <b>{fast_calls}</b>\n"
+        f"AI deep calls: <b>{deep_calls}</b>\n"
+        f"Tokens: <b>{int(tokens or 0)}</b>\n"
+        f"Оценочная стоимость: <b>{float(cost or 0):.4f}</b>\n\n"
+        f"Уведомления: <b>{notifications}</b>\n"
+        f"Ошибки доставки: <b>{notification_errors}</b>\n"
+        f"Reconnects: <b>{reconnects}</b>",
         back_to_owner_menu(),
     )
 
@@ -1484,14 +1855,136 @@ async def system_status(
     )
 
 
+def system_secret_label(name: str) -> str:
+    return {
+        "telegram_api_id": "Telegram API ID",
+        "telegram_api_hash": "Telegram API Hash",
+        "deepseek_api_key": "DeepSeek API key",
+    }[name]
+
+
+def configured_secret(settings: Settings, name: str) -> str | None:
+    if name == "telegram_api_id":
+        return str(settings.telegram_api_id) if settings.telegram_api_id else None
+    value = settings.telegram_api_hash if name == "telegram_api_hash" else settings.deepseek_api_key
+    return value.get_secret_value() if value else None
+
+
 @router.callback_query(F.data == "owner:settings")
 async def owner_settings(query: CallbackQuery) -> None:
     await render(
         query,
-        "<b>Настройки</b>\n\nИнтерфейс: inline-first\n"
-        "Новые сценарии блокируются до завершения активного действия.\n"
-        "Секреты никогда не отображаются в интерфейсе.",
-        back_to_owner_menu(),
+        "<b>Настройки системы</b>\n\n"
+        "Секреты показываются в маскированном виде. Новое значение применяется после "
+        "явного подтверждения и перезапуска сервисов Ventrix.",
+        system_settings_menu(),
+    )
+
+
+@router.callback_query(F.data.startswith("owner:secret:"))
+async def owner_secret_view(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    name = query.data.rsplit(":", 1)[1]
+    async with session_factory() as session:
+        service = SystemSecretService(
+            session, EncryptionService(settings.app_encryption_key.get_secret_value())
+        )
+        value = await service.get(name) or configured_secret(settings, name)
+    await render(
+        query,
+        f"<b>{system_secret_label(name)}</b>\n\nТекущее значение: <code>{escape(mask_secret(value))}</code>",
+        system_secret_actions(name),
+    )
+
+
+@router.callback_query(F.data.startswith("owner:secret_reveal:"))
+async def owner_secret_reveal(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    name = query.data.rsplit(":", 1)[1]
+    async with session_factory() as session:
+        service = SystemSecretService(
+            session, EncryptionService(settings.app_encryption_key.get_secret_value())
+        )
+        value = await service.get(name) or configured_secret(settings, name)
+    await query.answer(value or "Значение не настроено", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("owner:secret_change:"))
+async def owner_secret_change(query: CallbackQuery, state: FSMContext) -> None:
+    name = query.data.rsplit(":", 1)[1]
+    await begin_flow(
+        query,
+        state,
+        SystemSecretStates.value,
+        "system_secret",
+        f"<b>Изменить {system_secret_label(name)}</b>\n\n"
+        "Отправьте новое значение. Сообщение будет удалено сразу после обработки.",
+    )
+    await state.update_data(secret_name=name)
+
+
+@router.message(SystemSecretStates.value)
+async def owner_secret_value(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    value = message.text or ""
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+    data = await state.get_data()
+    try:
+        async with session_factory() as session:
+            service = SystemSecretService(
+                session, EncryptionService(settings.app_encryption_key.get_secret_value())
+            )
+            staged = await service.stage(str(data["secret_name"]), value)
+            masked = mask_secret(value.strip())
+    except ValueError as exc:
+        value = ""
+        await update_flow_screen(message, state, f"Значение не принято: {escape(str(exc))}")
+        return
+    finally:
+        value = ""
+    await state.update_data(staged_secret_id=staged.id)
+    await state.set_state(SystemSecretStates.confirm)
+    await update_flow_screen(
+        message,
+        state,
+        f"Заменить {system_secret_label(str(data['secret_name']))}?\n\n"
+        f"Новое значение: <code>{escape(masked)}</code>",
+        system_secret_confirmation(str(data["secret_name"])),
+    )
+
+
+@router.callback_query(SystemSecretStates.confirm, F.data.startswith("owner:secret_confirm:"))
+async def owner_secret_confirm(
+    query: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    name = query.data.rsplit(":", 1)[1]
+    data = await state.get_data()
+    async with session_factory() as session:
+        await SystemSecretService(
+            session, EncryptionService(settings.app_encryption_key.get_secret_value())
+        ).confirm(name, str(data["staged_secret_id"]))
+    await state.clear()
+    await render(
+        query,
+        f"{system_secret_label(name)} сохранён в зашифрованном виде.\n\n"
+        "Значение будет использовано после перезапуска сервисов Ventrix.",
+        system_settings_menu(),
     )
 
 

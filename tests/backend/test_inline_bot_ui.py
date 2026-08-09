@@ -36,7 +36,7 @@ def test_owner_and_client_navigation_is_inline_only() -> None:
     assert isinstance(welcome, InlineKeyboardMarkup)
     assert "👥 Клиенты" in button_texts(owner)
     assert "⚠️ Важное" in button_texts(client)
-    assert "🔗 Подключить Telegram" in button_texts(welcome)
+    assert button_texts(welcome) == ["Ventrix AI", "Главное меню"]
 
 
 def test_client_interface_hides_platform_owner_support_and_commercial_terms() -> None:
@@ -135,9 +135,7 @@ async def test_owner_fsm_access_date_completes_tenant_creation(
 
     saved_data = await state.get_data()
     assert saved_data["subscription_expires_at"] == expires_at.isoformat()
-    await handlers.tenant_create_confirm(
-        AsyncMock(), state, session_factory, settings, verifier
-    )
+    await handlers.tenant_create_confirm(AsyncMock(), state, session_factory, settings, verifier)
 
     async with session_factory() as session:
         tenant = await session.scalar(select(Tenant).where(Tenant.name == "FSM Client"))

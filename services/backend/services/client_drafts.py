@@ -37,6 +37,8 @@ class ClientDraftData(BaseModel):
     response_sla_minutes: int = Field(default=60, gt=0, le=43_200)
     critical_problem_criteria: str = Field(min_length=2, max_length=10_000)
     daily_report_time: str = "09:00"
+    active_dialog_days: int = Field(default=30, ge=0, le=180)
+    message_history_days: int = Field(default=14, ge=0, le=180)
     plan: str = "trial"
     additional_ai_instructions: str = ""
 
@@ -61,7 +63,8 @@ class ClientDraftData(BaseModel):
 CLIENT_DRAFT_SYSTEM_PROMPT = """
 Ты product operations assistant Ventrix. Преобразуй свободное описание нового клиента
 в один JSON-объект строго по переданной schema. Не выдумывай Telegram user ID: если его
-нет, верни 0. Формируй практичные defaults для SLA, рабочего времени, критериев критичных
+нет, верни 0. Поля confirmed_identity уже проверены владельцем: перенеси их без изменений.
+Формируй практичные defaults для SLA, рабочего времени, критериев критичных
 проблем и AI-инструкций. timezone всегда IANA. Не включай токены ботов, пароли и секреты.
 При correction сохрани подтверждённые поля и измени только то, что просит владелец.
 """.strip()
@@ -86,10 +89,25 @@ class OwnerClientDraftService:
         self.encryption = encryption
         self.model = model
 
-    async def create(self, owner_telegram_id: int, prompt: str) -> OwnerClientDraft:
+    async def create(
+        self,
+        owner_telegram_id: int,
+        prompt: str,
+        *,
+        identity: dict[str, Any] | None = None,
+    ) -> OwnerClientDraft:
         self._reject_secrets(prompt)
         owner = await self._owner(owner_telegram_id)
-        data, latency_ms = await self._generate(prompt=prompt)
+        data, latency_ms = await self._generate(prompt=prompt, identity=identity)
+        if identity:
+            data = data.model_copy(
+                update={
+                    "owner_name": str(identity["owner_name"]),
+                    "owner_telegram_user_id": int(identity["owner_telegram_user_id"]),
+                    "owner_telegram_username": identity.get("owner_telegram_username"),
+                    "name": str(identity["name"]),
+                }
+            )
         draft = OwnerClientDraft(
             owner_id=owner.id,
             raw_prompt_ciphertext=self.encryption.encrypt(prompt),
@@ -113,6 +131,17 @@ class OwnerClientDraftService:
         draft = await self._draft(owner_telegram_id, draft_id)
         before = dict(draft.draft_json)
         data, latency_ms = await self._generate(correction=correction, current=before)
+        data = data.model_copy(
+            update={
+                key: before.get(key)
+                for key in (
+                    "name",
+                    "owner_name",
+                    "owner_telegram_user_id",
+                    "owner_telegram_username",
+                )
+            }
+        )
         draft.draft_json = data.model_dump(mode="json")
         changed = {
             key: {"from": before.get(key), "to": value}
@@ -139,6 +168,7 @@ class OwnerClientDraftService:
         prompt: str | None = None,
         correction: str | None = None,
         current: dict[str, Any] | None = None,
+        identity: dict[str, Any] | None = None,
     ) -> tuple[ClientDraftData, int]:
         started = monotonic_time.perf_counter()
         content, _usage = await self.provider.generate_json(
@@ -147,6 +177,7 @@ class OwnerClientDraftService:
             payload={
                 "schema": ClientDraftData.model_json_schema(),
                 "description": prompt,
+                "confirmed_identity": identity,
                 "current_draft": current,
                 "correction": correction,
             },

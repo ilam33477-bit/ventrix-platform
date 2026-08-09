@@ -16,6 +16,11 @@ from services.backend.models import (
 )
 from services.backend.services.client_drafts import OwnerClientDraftService
 from services.backend.services.encryption import EncryptionService
+from services.backend.services.system_secrets import (
+    SystemSecretService,
+    load_runtime_secret_overrides,
+    mask_secret,
+)
 from services.backend.telegram_sessions.event_ingestion import TelegramEventIngestion
 
 
@@ -156,6 +161,35 @@ async def test_owner_ai_draft_is_persistent_versioned_and_validated(
 
 
 @pytest.mark.asyncio
+async def test_owner_ai_draft_preserves_confirmed_identity_without_username(
+    session_factory, settings, encryption_key
+) -> None:
+    identity = {
+        "name": "TEST Project",
+        "owner_name": "Вадим",
+        "owner_telegram_user_id": 835691584,
+        "owner_telegram_username": None,
+    }
+    async with session_factory() as session:
+        service = OwnerClientDraftService(
+            session,
+            FakeDraftProvider(),  # type: ignore[arg-type]
+            EncryptionService(encryption_key),
+            "test-model",
+        )
+        draft = await service.create(
+            settings.platform_owner_telegram_id,
+            "Компания занимается автоматизацией продаж",
+            identity=identity,
+        )
+        assert {key: draft.draft_json[key] for key in identity} == identity
+        corrected = await service.correct(
+            settings.platform_owner_telegram_id, draft.id, "Поставь SLA 30 минут"
+        )
+        assert {key: corrected.draft_json[key] for key in identity} == identity
+
+
+@pytest.mark.asyncio
 async def test_owner_ai_draft_rejects_secrets_before_provider_call(
     session_factory, settings, encryption_key
 ) -> None:
@@ -172,3 +206,19 @@ async def test_owner_ai_draft_rejects_secrets_before_provider_call(
                 settings.platform_owner_telegram_id,
                 "token " + "1234567890:" + "a" * 30,
             )
+
+
+@pytest.mark.asyncio
+async def test_owner_system_secret_is_encrypted_masked_and_loaded_after_restart(
+    session_factory, settings, encryption_key
+) -> None:
+    plaintext = "sk-new-production-value-123456"
+    async with session_factory() as session:
+        service = SystemSecretService(session, EncryptionService(encryption_key))
+        staged = await service.stage("deepseek_api_key", plaintext)
+        assert plaintext.encode() not in staged.ciphertext
+        await service.confirm("deepseek_api_key", staged.id)
+        assert await service.get("deepseek_api_key") == plaintext
+    resolved = await load_runtime_secret_overrides(session_factory, settings)
+    assert resolved.deepseek_api_key.get_secret_value() == plaintext
+    assert plaintext not in mask_secret(plaintext)

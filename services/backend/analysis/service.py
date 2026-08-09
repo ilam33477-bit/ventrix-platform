@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -13,6 +14,7 @@ from ..database import SQLiteTransactionManager
 from ..intelligence.problem_lifecycle import initialize_problem_lifecycle
 from ..jobs.queue import JobDeferred, JobLease, SQLiteJobQueue
 from ..models import (
+    AIUsageCall,
     AIUsageMetric,
     AnalysisBatch,
     AnalysisRun,
@@ -37,6 +39,7 @@ from ..models import (
 from ..services.encryption import EncryptionService
 from ..services.product_events import add_system_event
 from ..telegram_sessions.service import TelegramConnectionService
+from .budget import ConservativeTokenEstimator, ModelInputBudget
 from .preprocessing import AnalysisBatchBuilder
 from .schema import AnalysisResponse, parse_analysis_response
 
@@ -54,10 +57,11 @@ class JSONAIProvider(Protocol):
     ) -> tuple[str, dict[str, int]]: ...
 
 
-SYSTEM_PROMPT = """Analyze one Telegram business dialog. Return json only.
+SYSTEM_PROMPT = """Analyze each Telegram business dialog in the supplied dialogs array independently. Return json only.
 Use schema_version 1.0 and exactly this structure:
 {"schema_version":"1.0","tenant_id":"...","batch_id":"...","dialog_results":[{"chat_id":"...","dialog_type":"...","summary":"...","participants":[],"detected_patterns":[],"problems":[{"event_type":"...","is_problem":true,"priority":"medium","confidence":0.8,"requires_review":false,"source_message_ids":[],"evidence":[],"summary":"...","recommended_action":"..."}]}],"usage":{"input_tokens":0,"output_tokens":0}}.
 Never invent source message IDs or facts. Use the tenant profile and local features supplied.
+Never transfer facts, participants, message IDs, evidence, or conclusions between dialogs. Return one dialog_result for every supplied dialog id.
 """
 
 
@@ -73,6 +77,7 @@ class AnalysisPipelineService:
         token_budget: int = 50_000,
         fast_model: str = "deepseek-v4-flash",
         deep_model: str = "deepseek-v4-pro",
+        model_budget: ModelInputBudget | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.encryption = encryption
@@ -80,8 +85,14 @@ class AnalysisPipelineService:
         self.provider = provider
         self.queue = queue or SQLiteJobQueue(session_factory)
         self.transactions = SQLiteTransactionManager(session_factory)
+        self.model_budget = model_budget or ModelInputBudget()
+        self.estimator = ConservativeTokenEstimator()
         self.builder = AnalysisBatchBuilder(
-            session_factory, fast_model=fast_model, deep_model=deep_model
+            session_factory,
+            fast_model=fast_model,
+            deep_model=deep_model,
+            model_budget=self.model_budget,
+            system_prompt=SYSTEM_PROMPT,
         )
         self.token_budget = token_budget
 
@@ -189,12 +200,18 @@ class AnalysisPipelineService:
             payload["batch_id"] = batch.id
             model = batch.model or "deepseek-v4-flash"
             deep = batch.route_name in {RouteName.DEEP.value, RouteName.CRITICAL.value}
+            input_budget = self.model_budget.usable_input_tokens(self.estimator.text(SYSTEM_PROMPT))
+            actual_estimate = self.estimator.payload(payload)
+            if actual_estimate > input_budget:
+                raise RuntimeError("AI batch exceeds configured model input budget")
+        call_started = time.perf_counter()
         raw, usage = await self.provider.generate_json(
             model=model,
             system_prompt=SYSTEM_PROMPT,
             payload=payload,
             thinking=deep,
             reasoning_effort="high" if deep else None,
+            max_tokens=self.model_budget.max_output_tokens,
         )
         repaired = False
         try:
@@ -208,10 +225,19 @@ class AnalysisPipelineService:
                 payload=payload,
                 thinking=deep,
                 reasoning_effort="high" if deep else None,
+                max_tokens=self.model_budget.max_output_tokens,
             )
             parsed, repaired = parse_analysis_response(raw)
             self._validate_identity(parsed, batch)
-        await self._store_batch_result(batch_id, parsed, raw, usage, repaired)
+        await self._store_batch_result(
+            batch_id,
+            parsed,
+            raw,
+            usage,
+            repaired,
+            job_id=job.id,
+            duration_ms=int((time.perf_counter() - call_started) * 1000),
+        )
         return {"batch_id": batch_id, "problems": await self._create_problems(batch_id, parsed)}
 
     async def generate_report(self, job: JobLease) -> dict[str, Any]:
@@ -310,12 +336,7 @@ class AnalysisPipelineService:
             current.output_tokens = sum(item.output_tokens or 0 for item in batches)
             current.metrics_json = {
                 **(current.metrics_json or {}),
-                "processed_dialog_versions": {
-                    batch.dialog_id: int(
-                        (batch.payload_json or {}).get("dialog", {}).get("state_version", 0)
-                    )
-                    for batch in batches
-                },
+                "processed_dialog_versions": self._processed_dialog_versions(batches),
             }
             for child in children:
                 stored = await session.get(AnalysisRun, child.id)
@@ -449,6 +470,10 @@ class AnalysisPipelineService:
     def _validate_identity(parsed: AnalysisResponse, batch: AnalysisBatch) -> None:
         if parsed.tenant_id != batch.tenant_id or parsed.batch_id != batch.id:
             raise ValueError("AI response identity mismatch")
+        expected = {str(item["id"]) for item in (batch.payload_json or {}).get("dialogs", [])}
+        returned = {str(item.chat_id) for item in parsed.dialog_results}
+        if returned != expected:
+            raise ValueError("AI response dialog identity mismatch")
 
     async def _store_batch_result(
         self,
@@ -457,6 +482,9 @@ class AnalysisPipelineService:
         raw: str,
         usage: dict[str, int],
         repaired: bool,
+        *,
+        job_id: str,
+        duration_ms: int,
     ) -> None:
         async def write(session: AsyncSession) -> None:
             batch = await session.get(AnalysisBatch, batch_id)
@@ -466,6 +494,18 @@ class AnalysisPipelineService:
             batch.input_tokens = usage.get("input_tokens", 0)
             batch.output_tokens = usage.get("output_tokens", 0)
             batch.repair_attempted = repaired
+            session.add(
+                AIUsageCall(
+                    tenant_id=batch.tenant_id,
+                    job_id=job_id,
+                    model=batch.model or "unknown",
+                    job_type="ai_batch_analysis",
+                    input_tokens=batch.input_tokens,
+                    output_tokens=batch.output_tokens,
+                    duration_ms=duration_ms,
+                    status="completed",
+                )
+            )
             run = await session.get(AnalysisRun, batch.run_id)
             run.completed_batches += 1
             run.input_tokens += batch.input_tokens
@@ -494,14 +534,26 @@ class AnalysisPipelineService:
     async def _create_problems(self, batch_id: str, parsed: AnalysisResponse) -> int:
         async with self.session_factory() as session:
             batch = await session.get(AnalysisBatch, batch_id)
-            dialog = await session.get(TelegramDialog, batch.dialog_id)
+            dialog_ids = {str(item["id"]) for item in (batch.payload_json or {}).get("dialogs", [])}
+            dialogs = {
+                item.id: item
+                for item in await session.scalars(
+                    select(TelegramDialog).where(
+                        TelegramDialog.tenant_id == batch.tenant_id,
+                        TelegramDialog.id.in_(dialog_ids),
+                    )
+                )
+            }
         created = 0
 
         async def write(session: AsyncSession) -> None:
             nonlocal created
-            connection = await session.get(TelegramConnection, dialog.connection_id)
-            dialog_connection_employee = connection.assigned_employee_id if connection else None
             for result in parsed.dialog_results:
+                dialog = dialogs.get(str(result.chat_id))
+                if dialog is None:
+                    continue
+                connection = await session.get(TelegramConnection, dialog.connection_id)
+                dialog_connection_employee = connection.assigned_employee_id if connection else None
                 for candidate in result.problems:
                     if not candidate.is_problem or not candidate.source_message_ids:
                         continue
@@ -509,7 +561,7 @@ class AnalysisPipelineService:
                     source = await session.scalar(
                         select(TelegramMessage).where(
                             TelegramMessage.tenant_id == batch.tenant_id,
-                            TelegramMessage.dialog_id == batch.dialog_id,
+                            TelegramMessage.dialog_id == dialog.id,
                             TelegramMessage.telegram_message_id == source_remote_id,
                         )
                     )
@@ -532,7 +584,7 @@ class AnalysisPipelineService:
                         signal = Signal(
                             tenant_id=batch.tenant_id,
                             telegram_connection_id=dialog.connection_id,
-                            dialog_id=batch.dialog_id,
+                            dialog_id=dialog.id,
                             source_message_id=source.id,
                             employee_id=dialog_connection_employee,
                             fingerprint=signal_fingerprint,
@@ -563,7 +615,7 @@ class AnalysisPipelineService:
                     problem = OperationalProblem(
                         tenant_id=batch.tenant_id,
                         connection_id=dialog.connection_id,
-                        dialog_id=batch.dialog_id,
+                        dialog_id=dialog.id,
                         source_message_id=source.id,
                         signal_id=signal.id,
                         responsible_employee_id=dialog_connection_employee,
@@ -751,14 +803,13 @@ class AnalysisPipelineService:
             current.metrics_json = metrics
             processed_versions = (run.metrics_json or {}).get("processed_dialog_versions", {})
             if not processed_versions:
-                processed_versions = {
-                    batch.dialog_id: int(
-                        (batch.payload_json or {}).get("dialog", {}).get("state_version", 0)
+                processed_versions = self._processed_dialog_versions(
+                    list(
+                        await session.scalars(
+                            select(AnalysisBatch).where(AnalysisBatch.run_id == current.id)
+                        )
                     )
-                    for batch in await session.scalars(
-                        select(AnalysisBatch).where(AnalysisBatch.run_id == current.id)
-                    )
-                }
+                )
             for dialog_id, version in processed_versions.items():
                 state = await session.scalar(
                     select(DialogState).where(DialogState.dialog_id == dialog_id)
@@ -899,6 +950,17 @@ class AnalysisPipelineService:
             return list(
                 await session.scalars(select(AnalysisBatch).where(AnalysisBatch.run_id == run_id))
             )
+
+    @staticmethod
+    def _processed_dialog_versions(batches: list[AnalysisBatch]) -> dict[str, int]:
+        versions: dict[str, int] = {}
+        for batch in batches:
+            for dialog in (batch.payload_json or {}).get("dialogs", []):
+                dialog_id = str(dialog["id"])
+                versions[dialog_id] = max(
+                    versions.get(dialog_id, 0), int(dialog.get("state_version", 0))
+                )
+        return versions
 
     async def _fail_run(self, run_id: str, reason: str) -> None:
         async def write(session: AsyncSession) -> None:

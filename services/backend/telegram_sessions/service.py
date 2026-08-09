@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,6 +20,7 @@ from ..models import (
     TelegramFolder,
     TelegramMessage,
     TelegramSyncCursor,
+    TenantSettings,
 )
 from ..services.encryption import EncryptionService
 from .gateway import LoginResult, TelegramSessionRevoked, TelegramUserGateway, TelethonGateway
@@ -368,8 +369,8 @@ class TelegramConnectionService:
         history_days: int = 7,
         connection_id: str | None = None,
     ) -> TelegramConnection:
-        if history_days not in {3, 7, 14, 30}:
-            raise ValueError("history_days must be 3, 7, 14 or 30")
+        if not 0 <= history_days <= 180:
+            raise ValueError("history_days must be between 0 and 180")
 
         async def write(session: AsyncSession) -> None:
             connection = await session.scalar(
@@ -388,6 +389,11 @@ class TelegramConnectionService:
             connection.selected_folder_title = None
             connection.progress_stage = "personal_sources_enabled"
             connection.progress_percent = 30
+            settings = await session.scalar(
+                select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)
+            )
+            active_days = settings.active_dialog_days if settings else 30
+            active_cutoff = datetime.now(UTC) - timedelta(days=active_days)
             dialogs = list(
                 await session.scalars(
                     select(TelegramDialog).where(TelegramDialog.connection_id == connection.id)
@@ -395,7 +401,10 @@ class TelegramConnectionService:
             )
             for dialog in dialogs:
                 if dialog.dialog_type == "personal":
-                    dialog.selected = True
+                    dialog.selected = bool(
+                        dialog.last_message_at is not None
+                        and dialog.last_message_at >= active_cutoff
+                    )
                     dialog.excluded = False
                     dialog.classification = "auto_personal"
                     dialog.requires_user_confirmation = False
@@ -432,8 +441,8 @@ class TelegramConnectionService:
         history_days: int = 7,
         connection_id: str | None = None,
     ) -> TelegramConnection:
-        if history_days not in {3, 7, 14, 30}:
-            raise ValueError("history_days must be 3, 7, 14 or 30")
+        if not 0 <= history_days <= 180:
+            raise ValueError("history_days must be between 0 and 180")
         folder_ids = [folder_id] if isinstance(folder_id, int) else list(dict.fromkeys(folder_id))
         if not folder_ids:
             raise ValueError("at least one working folder is required")

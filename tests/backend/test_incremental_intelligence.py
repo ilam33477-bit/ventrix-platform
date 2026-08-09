@@ -413,6 +413,7 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
             sent_at=now,
             outgoing=False,
             body_text="Секретные условия клиента: пришлите договор",
+            ingestion_source="live",
             attachments_json=[],
         )
         session.add_all([employee, group, message])
@@ -504,6 +505,7 @@ async def test_configured_fast_lane_is_provisional_and_ai_can_cancel_it(
             sent_at=now,
             outgoing=False,
             body_text="Требую возврат, направляю официальную претензию.",
+            ingestion_source="live",
             attachments_json=[],
         )
         session.add(message)
@@ -571,6 +573,7 @@ async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
                 sent_at=now + timedelta(seconds=index),
                 outgoing=False,
                 body_text=f"Событие {index}",
+                ingestion_source="live",
                 attachments_json=[],
             )
             session.add(message)

@@ -54,7 +54,8 @@ from ..models import (
 from ..repositories.client_data import TenantClientRepository
 from ..scheduler.service import TenantAnalysisScheduler, next_analysis_time
 from ..services.encryption import EncryptionService
-from ..telegram_sessions.gateway import TelethonGateway
+from ..services.system_secrets import load_runtime_secret_overrides
+from ..telegram_sessions.gateway import TelegramFloodWait, TelegramSessionRevoked, TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
 from ..timezones import normalize_timezone
 
@@ -219,7 +220,7 @@ class TelegramLoginComplete(BaseModel):
 
 class TelegramConnectionScope(BaseModel):
     folder_ids: list[int] = Field(min_length=1, max_length=20)
-    history_days: int = Field(default=7)
+    history_days: int = Field(default=14, ge=0, le=180)
     personal_dialogs_consent: bool = False
 
 
@@ -235,13 +236,13 @@ class TelegramSourceConfirm(BaseModel):
 
 ClientOnboardingStep = Literal[
     "welcome",
-    "mini_guide",
     "telegram_connection",
     "monitoring_started",
-    "employees",
-    "notifications",
     "reports",
     "groups",
+    "notifications",
+    "mini_guide",
+    "employees",
     "final_review",
     "completed",
 ]
@@ -254,28 +255,29 @@ class ClientOnboardingPatch(BaseModel):
 
 CLIENT_ONBOARDING_STEPS: tuple[ClientOnboardingStep, ...] = (
     "welcome",
-    "mini_guide",
     "telegram_connection",
     "monitoring_started",
-    "employees",
-    "notifications",
     "reports",
     "groups",
+    "notifications",
+    "mini_guide",
+    "employees",
     "final_review",
     "completed",
 )
 
 
-def get_client_connection_service(
+async def get_client_connection_service(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> TelegramConnectionService:
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    settings = await load_runtime_secret_overrides(factory, settings)
     if not settings.telegram_api_id or not settings.telegram_api_hash:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Telegram user-session integration is not configured",
         )
-    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
     return TelegramConnectionService(
         factory,
         EncryptionService(settings.app_encryption_key.get_secret_value()),
@@ -775,6 +777,24 @@ async def client_bootstrap(
             )
         ).all()
     )
+    employee_count = int(
+        await session.scalar(
+            select(func.count(Employee.id)).where(
+                Employee.tenant_id == tenant.id,
+                Employee.status == "active",
+            )
+        )
+        or 0
+    )
+    group_count = int(
+        await session.scalar(
+            select(func.count(GroupIntegration.id)).where(
+                GroupIntegration.tenant_id == tenant.id,
+                GroupIntegration.status == "active",
+            )
+        )
+        or 0
+    )
     problems = list(
         await session.scalars(
             select(OperationalProblem)
@@ -805,7 +825,16 @@ async def client_bootstrap(
         "reauthorization_required": ["Повторная авторизация", "Безопасность", "Поддержка"],
     }
     return {
-        "tenant": {"id": tenant.id, "name": tenant.name},
+        "tenant": {
+            "id": tenant.id,
+            "name": tenant.name,
+            "owner_name": tenant.owner_name,
+            "owner_username": tenant.owner_telegram_username,
+            "niche": tenant.niche,
+            "business_description": tenant.business_description,
+            "target_audience": tenant.target_audience,
+            "monitoring_priorities": list(tenant.ai_profile.critical_events or []),
+        },
         "role": context.membership.role,
         "permissions": sorted(context.permissions),
         "onboarding_state": state,
@@ -826,6 +855,7 @@ async def client_bootstrap(
                 "status": item.status,
                 "account": item.display_name or item.phone_masked,
                 "health_status": item.health_status,
+                "username": item.username,
                 "last_incremental_sync_at": item.last_incremental_sync_at,
             }
             for item in connections
@@ -843,6 +873,8 @@ async def client_bootstrap(
             "metrics": run.metrics_json,
         },
         "dialog_counts": dialog_counts,
+        "employee_count": employee_count,
+        "group_count": group_count,
         "problems": [
             {
                 "id": problem.id,
@@ -1215,8 +1247,17 @@ async def start_connection_login(
             payload.phone,
             assigned_employee_id=employee.id if employee else None,
         )
+    except TelegramFloodWait as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Telegram просит подождать {exc.retry_after_seconds} сек. перед новой попыткой.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Проверьте формат номера телефона.") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="Telegram login could not be started") from exc
+        raise HTTPException(
+            status_code=502, detail="Telegram временно не принял запрос. Попробуйте позже."
+        ) from exc
     return {
         "id": connection.id,
         "status": connection.status,
@@ -1230,6 +1271,7 @@ async def complete_connection_login(
     connection_id: str,
     payload: TelegramLoginComplete,
     context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
     connection_service: TelegramConnectionService = Depends(get_client_connection_service),  # noqa: B008
 ) -> dict[str, Any]:
     require_permission(context, "employees.manage")
@@ -1246,22 +1288,41 @@ async def complete_connection_login(
         )
         analysis_run_id = None
         if connection.status == "connected":
+            tenant_settings = await session.scalar(
+                select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
+            )
             connection = await connection_service.refresh_catalog(context.tenant.id, connection.id)
             connection = await connection_service.activate_default_scope(
                 context.tenant.id,
-                history_days=7,
+                history_days=tenant_settings.message_history_days if tenant_settings else 14,
                 connection_id=connection.id,
             )
             run = await connection_service.start_initial_sync(
                 context.tenant.id, connection_id=connection.id
             )
             analysis_run_id = run.id
-    except TelegramConnectionError as exc:
-        raise HTTPException(status_code=409, detail="Login session is no longer available") from exc
-    except Exception as exc:
+    except TelegramFloodWait as exc:
         raise HTTPException(
-            status_code=422, detail="Telegram rejected the code or 2FA password"
+            status_code=429,
+            detail=f"Telegram просит подождать {exc.retry_after_seconds} сек. перед новой попыткой.",
         ) from exc
+    except TelegramSessionRevoked as exc:
+        raise HTTPException(
+            status_code=409, detail="Сессия Telegram отозвана. Подключите аккаунт заново."
+        ) from exc
+    except TelegramConnectionError as exc:
+        raise HTTPException(
+            status_code=409, detail="Код истёк или сессия входа завершена. Запросите новый код."
+        ) from exc
+    except Exception as exc:
+        error_name = type(exc).__name__
+        detail = {
+            "PhoneCodeInvalidError": "Код не подошёл. Проверьте его и попробуйте ещё раз.",
+            "PhoneCodeExpiredError": "Код истёк. Запросите новый код.",
+            "PasswordHashInvalidError": "Пароль 2FA не подошёл. Попробуйте ещё раз.",
+            "PhoneNumberInvalidError": "Telegram не принял номер телефона.",
+        }.get(error_name, "Telegram не принял код или пароль 2FA. Попробуйте ещё раз.")
+        raise HTTPException(status_code=422, detail=detail) from exc
     finally:
         code = password = None
     return {

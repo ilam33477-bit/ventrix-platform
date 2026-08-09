@@ -15,9 +15,18 @@ class TenantCreateStates(StatesGroup):
 
 
 class TenantAICreateStates(StatesGroup):
+    owner_name = State()
+    owner_user_id = State()
+    company_name = State()
+    ai_choice = State()
     prompt = State()
     confirm = State()
     correction = State()
+
+
+class SystemSecretStates(StatesGroup):
+    value = State()
+    confirm = State()
 
 
 class TenantEditStates(StatesGroup):
@@ -27,6 +36,10 @@ class TenantEditStates(StatesGroup):
 
 class TenantAccessStates(StatesGroup):
     date = State()
+
+
+class TenantHistoryStates(StatesGroup):
+    value = State()
 
 
 class AIProfileStates(StatesGroup):

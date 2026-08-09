@@ -216,7 +216,7 @@ async def test_owner_authorization_tenant_isolation_events_and_stats(
     data = {"event_from_user": owner}
     assert await middleware(handler, object(), data) == "allowed"
     assert data["client_context"].tenant_id == tenant_id
-    assert data["client_context"].role == "tenant_owner"
+    assert data["client_context"].role == "owner"
 
     stranger_handler = AsyncMock()
     await middleware(stranger_handler, object(), {"event_from_user": SimpleNamespace(id=999999)})

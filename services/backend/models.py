@@ -116,6 +116,12 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
     history_window_days: Mapped[int] = mapped_column(
         Integer, default=7, server_default="7", nullable=False
     )
+    active_dialog_days: Mapped[int] = mapped_column(
+        Integer, default=30, server_default="30", nullable=False
+    )
+    message_history_days: Mapped[int] = mapped_column(
+        Integer, default=14, server_default="14", nullable=False
+    )
     signal_report_threshold: Mapped[int] = mapped_column(
         Integer, default=40, server_default="40", nullable=False
     )
@@ -173,6 +179,14 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "history_window_days IN (3,7,14,30)",
             name="ck_tenant_settings_history_window",
+        ),
+        CheckConstraint(
+            "active_dialog_days BETWEEN 0 AND 180",
+            name="ck_tenant_settings_active_dialog_days",
+        ),
+        CheckConstraint(
+            "message_history_days BETWEEN 0 AND 180",
+            name="ck_tenant_settings_message_history_days",
         ),
         CheckConstraint(
             "signal_report_threshold BETWEEN 0 AND 100 AND "
@@ -459,7 +473,9 @@ class TelegramConnection(StringPrimaryKeyMixin, TimestampMixin, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     __table_args__ = (
-        CheckConstraint("history_days IN (3,7,14,30)", name="ck_telegram_connections_history_days"),
+        CheckConstraint(
+            "history_days BETWEEN 0 AND 180", name="ck_telegram_connections_history_days"
+        ),
         CheckConstraint(
             "progress_percent BETWEEN 0 AND 100", name="ck_telegram_connections_progress"
         ),
@@ -1098,9 +1114,10 @@ class AnalysisBatch(StringPrimaryKeyMixin, TimestampMixin, Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("analysis_runs.id", ondelete="CASCADE"), index=True
     )
-    dialog_id: Mapped[str] = mapped_column(
+    dialog_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("telegram_dialogs.id", ondelete="CASCADE"), index=True
     )
+    batch_key: Mapped[str] = mapped_column(String(100), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(16), default="1.0", server_default="1.0")
     status: Mapped[str] = mapped_column(
         String(32), default="pending", server_default="pending", index=True
@@ -1113,9 +1130,15 @@ class AnalysisBatch(StringPrimaryKeyMixin, TimestampMixin, Base):
     raw_response_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    estimated_input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    input_budget: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    prompt_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    dialogs_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    messages_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    utilization_ratio: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
     repair_attempted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     last_error_code: Mapped[str | None] = mapped_column(String(100))
-    __table_args__ = (UniqueConstraint("run_id", "dialog_id", name="uq_analysis_batch_run_dialog"),)
+    __table_args__ = (UniqueConstraint("run_id", "batch_key", name="uq_analysis_batch_run_key"),)
 
 
 class Report(StringPrimaryKeyMixin, TimestampMixin, Base):

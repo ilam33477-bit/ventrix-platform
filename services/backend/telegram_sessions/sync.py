@@ -438,6 +438,18 @@ class TelegramSyncHandlers:
                 cost_class="light",
                 max_attempts=3,
             )
+        await self.queue.enqueue(
+            "notification.initial_summary",
+            {"run_id": run.id},
+            tenant_id=run.tenant_id,
+            telegram_account_id=run.connection_id,
+            priority=120,
+            idempotency_key=f"initial-summary:{run.id}",
+            correlation_id=run.id,
+            category="historical",
+            cost_class="light",
+            max_attempts=12,
+        )
 
         async def update_queued_count(session: AsyncSession) -> None:
             current = await session.get(InitialAnalysisRun, run_id)

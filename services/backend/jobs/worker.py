@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import Any
 
 from services.api.deepseek import DeepSeekProvider
+from services.backend.analysis.budget import ModelInputBudget
 
 from ..analysis.service import AnalysisPipelineService
 from ..bot.sqlite_storage import SQLiteFSMStorage
@@ -24,6 +25,7 @@ from ..intelligence.reconciliation import ReconciliationService
 from ..intelligence.signals import SignalService
 from ..observability import configure_structured_logging, log_event
 from ..services.encryption import EncryptionService
+from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.event_ingestion import TelegramEventIngestion
 from ..telegram_sessions.gateway import TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionService
@@ -144,6 +146,7 @@ async def run() -> None:
     logging.getLogger("telethon").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     session_factory = get_session_factory()
+    settings = await load_runtime_secret_overrides(session_factory, settings)
     queue = SQLiteJobQueue(
         session_factory,
         max_active_tenant_jobs=settings.max_active_tenant_jobs,
@@ -183,6 +186,13 @@ async def run() -> None:
         token_budget=settings.tenant_report_token_budget,
         fast_model=settings.deepseek_fast_model,
         deep_model=settings.deepseek_deep_model,
+        model_budget=ModelInputBudget(
+            context_window=settings.deepseek_context_window_tokens,
+            max_output_tokens=settings.deepseek_max_output_tokens,
+            safety_margin_tokens=settings.deepseek_safety_margin_tokens,
+            max_dialogs_per_request=settings.deepseek_max_dialogs_per_request,
+            overlap_tokens=settings.deepseek_dialog_overlap_tokens,
+        ),
     )
     maintenance = MaintenanceJobHandlers(
         session_factory,
@@ -246,6 +256,7 @@ async def run() -> None:
             "notification.employee": notification_dispatcher.dispatch,
             "notification.manager": notification_dispatcher.dispatch,
             "notification.group": notification_dispatcher.dispatch,
+            "notification.initial_summary": notification_dispatcher.initial_summary,
             "maintenance.session_health": maintenance.session_health_check,
         }
     )

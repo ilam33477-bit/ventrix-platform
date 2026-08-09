@@ -24,9 +24,11 @@ from ..models import (
     TelegramDialog,
     TelegramFolder,
     TelegramIncrementalCursor,
+    TenantSettings,
 )
 from ..observability import configure_structured_logging, log_event
 from ..services.encryption import EncryptionService
+from ..services.system_secrets import load_runtime_secret_overrides
 from .gateway import MessageBatch, RemoteMessage, TelegramFloodWait, TelethonGateway
 from .leases import RuntimeOwnership, TelegramRuntimeLeaseStore
 from .sync import TelegramSyncHandlers
@@ -293,6 +295,11 @@ class TelegramSessionActor:
                 )
 
         async def write(session: AsyncSession) -> None:
+            tenant_settings = await session.scalar(
+                select(TenantSettings).where(TenantSettings.tenant_id == self.connection.tenant_id)
+            )
+            active_days = tenant_settings.active_dialog_days if tenant_settings else 30
+            active_cutoff = datetime.now(UTC) - timedelta(days=active_days)
             await session.execute(
                 TelegramFolder.__table__.delete().where(
                     TelegramFolder.connection_id == self.connection.id
@@ -335,7 +342,10 @@ class TelegramSessionActor:
                     row.classification = "auto_personal"
                     row.confidence = 1.0
                     row.requires_user_confirmation = False
-                    row.selected = True
+                    row.selected = bool(
+                        remote["last_message_at"] is not None
+                        and remote["last_message_at"] >= active_cutoff
+                    )
                     row.excluded = False
             connection = await session.get(TelegramConnection, self.connection.id)
             connection.progress_stage = "catalog_ready"
@@ -866,10 +876,11 @@ class TelegramSessionRuntime:
 
 async def run() -> None:
     settings = get_settings()
+    session_factory = get_session_factory()
+    settings = await load_runtime_secret_overrides(session_factory, settings)
     configure_structured_logging(settings.log_level)
     if not settings.telegram_api_id or not settings.telegram_api_hash:
         raise RuntimeError("Telegram API credentials are required")
-    session_factory = get_session_factory()
     runtime = TelegramSessionRuntime(
         session_factory,
         EncryptionService(settings.app_encryption_key.get_secret_value()),

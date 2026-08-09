@@ -104,6 +104,8 @@ class FoundationService:
             response_sla_minutes=payload.response_sla_minutes,
             critical_problem_criteria=payload.critical_problem_criteria.strip(),
             daily_report_time=payload.daily_report_time,
+            active_dialog_days=payload.active_dialog_days,
+            message_history_days=payload.message_history_days,
         )
         tenant.ai_profile = TenantAIProfile(
             niche=payload.niche.strip(),

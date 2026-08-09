@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     deepseek_fast_model: str = "deepseek-v4-flash"
     deepseek_deep_model: str = "deepseek-v4-pro"
     tenant_report_token_budget: int = Field(default=50_000, ge=1_000, le=2_000_000)
+    deepseek_context_window_tokens: int = Field(default=64_000, ge=8_000, le=2_000_000)
+    deepseek_max_output_tokens: int = Field(default=4_000, ge=500, le=64_000)
+    deepseek_safety_margin_tokens: int = Field(default=8_000, ge=1_000, le=128_000)
+    deepseek_max_dialogs_per_request: int = Field(default=12, ge=1, le=100)
+    deepseek_dialog_overlap_tokens: int = Field(default=800, ge=0, le=8_000)
     telegram_sync_batch_size: int = Field(default=100, ge=10, le=500)
     telegram_sync_batch_pause_seconds: float = Field(default=1.0, ge=0.1, le=30)
     telegram_sync_max_messages_per_chat: int = Field(default=2000, ge=100, le=50_000)

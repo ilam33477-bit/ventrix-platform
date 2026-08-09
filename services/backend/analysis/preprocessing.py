@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -20,6 +22,7 @@ from ..models import (
     TenantAIProfile,
     TenantSettings,
 )
+from .budget import ConservativeTokenEstimator, ModelInputBudget, prompt_bytes
 
 SYSTEM_EVENT_PREFIXES = ("joined the group", "left the group", "закрепил", "создал группу")
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -49,7 +52,7 @@ def local_features(messages: list[TelegramMessage], now: datetime | None = None)
         "message_count": len(normalized),
         "participants": sorted(authors),
         "last_message_id": last.telegram_message_id if last else None,
-        "last_sender_outgoing": last.outgoing if last else None,
+        "last_sender_outgoing": last.outgoing if last is not None else None,
         "minutes_without_answer": int((current - last_at).total_seconds() // 60)
         if last_at and not last.outgoing
         else 0,
@@ -114,6 +117,47 @@ def compact_messages(
     ]
 
 
+@dataclass(slots=True)
+class PreparedDialog:
+    dialog: TelegramDialog
+    payload: dict[str, Any]
+    features: dict[str, Any]
+    route_name: str
+    model: str
+    estimated_tokens: int
+
+
+def pack_dialog_payloads(
+    dialogs: list[PreparedDialog],
+    *,
+    common_payload: dict[str, Any],
+    budget: ModelInputBudget,
+    estimator: ConservativeTokenEstimator,
+    system_prompt: str,
+) -> list[list[PreparedDialog]]:
+    """Greedily pack complete dialog segments without crossing the input budget."""
+
+    input_budget = budget.usable_input_tokens(estimator.text(system_prompt))
+    common_tokens = estimator.payload(common_payload)
+    packs: list[list[PreparedDialog]] = []
+    current: list[PreparedDialog] = []
+    current_tokens = common_tokens
+    for item in dialogs:
+        if item.estimated_tokens + common_tokens > input_budget:
+            raise ValueError(f"dialog segment {item.dialog.id} exceeds model input budget")
+        would_overflow = current_tokens + item.estimated_tokens > input_budget
+        would_exceed_count = len(current) >= budget.max_dialogs_per_request
+        if current and (would_overflow or would_exceed_count):
+            packs.append(current)
+            current = []
+            current_tokens = common_tokens
+        current.append(item)
+        current_tokens += item.estimated_tokens
+    if current:
+        packs.append(current)
+    return packs
+
+
 class AnalysisBatchBuilder:
     def __init__(
         self,
@@ -121,10 +165,15 @@ class AnalysisBatchBuilder:
         *,
         fast_model: str = "deepseek-v4-flash",
         deep_model: str = "deepseek-v4-pro",
+        model_budget: ModelInputBudget | None = None,
+        system_prompt: str = "",
     ) -> None:
         self.session_factory = session_factory
         self.transactions = SQLiteTransactionManager(session_factory)
         self.router = AIModelRouter(RouterPolicy(fast_model=fast_model, deep_model=deep_model))
+        self.model_budget = model_budget or ModelInputBudget()
+        self.system_prompt = system_prompt
+        self.estimator = ConservativeTokenEstimator()
 
     async def build(self, run_id: str, *, history_window_days: int = 30) -> list[str]:
         async with self.session_factory() as session:
@@ -142,6 +191,8 @@ class AnalysisBatchBuilder:
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == run.tenant_id)
             )
+            if profile is None or settings is None:
+                raise LookupError("tenant analysis profile/settings not found")
             dialogs = list(
                 await session.scalars(
                     select(TelegramDialog).where(
@@ -185,61 +236,139 @@ class AnalysisBatchBuilder:
                     )
                 )
 
+        common_payload = {
+            "schema_version": "1.0",
+            "tenant": {
+                "niche": profile.niche,
+                "business_description": profile.business_description,
+                "products": profile.products,
+                "target_audience": profile.target_audience,
+                "ai_instructions": profile.additional_instructions,
+                "working_hours": settings.working_hours,
+                "response_sla_minutes": settings.response_sla_minutes,
+            },
+        }
+        input_budget = self.model_budget.usable_input_tokens(
+            self.estimator.text(self.system_prompt)
+        )
+        common_tokens = self.estimator.payload(common_payload)
+        # A dialog is the atomic semantic unit. Reserve room for JSON structure
+        # and split only an individually oversized dialog, never by raw global message count.
+        per_dialog_budget = max(1_000, input_budget - common_tokens - 256)
+        dialog_segments: list[PreparedDialog] = []
+        for dialog, messages, historical_summary, state_version in prepared:
+            compact = compact_messages(messages, max_chars=per_dialog_budget * 2)
+            if not compact:
+                continue
+            features = local_features(messages)
+            route = self.router.choose(
+                AnalysisContext(
+                    task_type="chat_classification",
+                    message_count=len(compact),
+                    context_chars=sum(len(item["text"]) for item in compact),
+                    participants=len(features["participants"]),
+                    potential_amount=max(
+                        (int(value.replace(" ", "")) for value in features["amounts"]),
+                        default=None,
+                    ),
+                )
+            )
+            base = {
+                "id": dialog.id,
+                "type": dialog.classification or dialog.dialog_type,
+                "participants": features["participants"],
+                "historical_summary": historical_summary,
+                "local_features": features,
+                "state_version": state_version,
+            }
+            segments = self._split_dialog_messages(base, compact, per_dialog_budget)
+            for segment_index, segment in enumerate(segments):
+                segment["segment_index"] = segment_index
+                segment["segments_total"] = len(segments)
+                dialog_segments.append(
+                    PreparedDialog(
+                        dialog=dialog,
+                        payload=segment,
+                        features=features,
+                        route_name=route.name.value,
+                        model=route.model,
+                        estimated_tokens=self.estimator.payload(segment),
+                    )
+                )
+        packs = pack_dialog_payloads(
+            dialog_segments,
+            common_payload=common_payload,
+            budget=self.model_budget,
+            estimator=self.estimator,
+            system_prompt=self.system_prompt,
+        )
+
         async def write(session: AsyncSession) -> list[str]:
             batch_ids: list[str] = []
-            for dialog, messages, historical_summary, state_version in prepared:
-                compact = compact_messages(messages)
-                if not compact:
-                    continue
-                features = local_features(messages)
-                context_chars = sum(len(item["text"]) for item in compact)
-                route = self.router.choose(
-                    AnalysisContext(
-                        task_type="chat_classification",
-                        message_count=len(compact),
-                        context_chars=context_chars,
-                        participants=len(features["participants"]),
-                        potential_amount=max(
-                            (int(value.replace(" ", "")) for value in features["amounts"]),
-                            default=None,
-                        ),
-                    )
+            for pack_index, pack in enumerate(packs):
+                payload = {**common_payload, "dialogs": [item.payload for item in pack]}
+                unique_dialog_ids = list(dict.fromkeys(item.dialog.id for item in pack))
+                route_rank = {"fast": 0, "deep": 1, "critical": 2}
+                selected_route = max(pack, key=lambda item: route_rank.get(item.route_name, 0))
+                key_material = ":".join(
+                    f"{item.dialog.id}:{item.payload['state_version']}:{item.payload['segment_index']}"
+                    for item in pack
+                )
+                batch_key = (
+                    f"{pack_index:04d}-{hashlib.sha256(key_material.encode()).hexdigest()[:24]}"
                 )
                 batch = AnalysisBatch(
                     tenant_id=run.tenant_id,
                     run_id=run.id,
-                    dialog_id=dialog.id,
-                    route_name=route.name.value,
-                    model=route.model,
-                    local_features_json=features,
-                    payload_json={
-                        "schema_version": "1.0",
-                        "tenant": {
-                            "niche": profile.niche,
-                            "business_description": profile.business_description,
-                            "products": profile.products,
-                            "target_audience": profile.target_audience,
-                            "ai_instructions": profile.additional_instructions,
-                            "working_hours": settings.working_hours,
-                            "response_sla_minutes": settings.response_sla_minutes,
-                        },
-                        "dialog": {
-                            "id": dialog.id,
-                            "type": dialog.classification or dialog.dialog_type,
-                            "participants": features["participants"],
-                            "messages": compact,
-                            "historical_summary": historical_summary,
-                            "local_features": features,
-                            "state_version": state_version,
-                        },
-                    },
+                    dialog_id=unique_dialog_ids[0] if len(unique_dialog_ids) == 1 else None,
+                    batch_key=batch_key,
+                    route_name=selected_route.route_name,
+                    model=selected_route.model,
+                    local_features_json={item.dialog.id: item.features for item in pack},
+                    payload_json=payload,
+                    estimated_input_tokens=self.estimator.payload(payload),
+                    input_budget=input_budget,
+                    prompt_bytes=prompt_bytes(self.system_prompt, payload),
+                    dialogs_count=len(unique_dialog_ids),
+                    messages_count=sum(len(item.payload["messages"]) for item in pack),
+                    utilization_ratio=round(self.estimator.payload(payload) / input_budget, 4),
                 )
                 session.add(batch)
                 await session.flush()
                 batch_ids.append(batch.id)
             current = await session.get(AnalysisRun, run_id)
+            if current is None:
+                raise LookupError("analysis run disappeared while building batches")
             current.required_batches = len(batch_ids)
             current.stage = "ai_batch_analysis"
             return batch_ids
 
         return await self.transactions.run(write)
+
+    def _split_dialog_messages(
+        self,
+        base: dict[str, Any],
+        messages: list[dict[str, Any]],
+        token_budget: int,
+    ) -> list[dict[str, Any]]:
+        segments: list[dict[str, Any]] = []
+        current: list[dict[str, Any]] = []
+        overlap: list[dict[str, Any]] = []
+        for message in messages:
+            candidate = {**base, "messages": [*current, message]}
+            if current and self.estimator.payload(candidate) > token_budget:
+                segments.append({**base, "messages": current})
+                overlap = []
+                overlap_tokens = 0
+                for previous in reversed(current):
+                    cost = self.estimator.payload(previous)
+                    if overlap_tokens + cost > self.model_budget.overlap_tokens:
+                        break
+                    overlap.insert(0, previous)
+                    overlap_tokens += cost
+                current = [*overlap, message]
+            else:
+                current.append(message)
+        if current:
+            segments.append({**base, "messages": current})
+        return segments

@@ -21,21 +21,30 @@ from aiogram.types import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from packages.ops_core.problems import ProblemStatus
+
 from ..bot.keyboards import (
     back_to_client_menu,
     client_main_menu,
     client_welcome_menu,
 )
+from ..intelligence.problem_lifecycle import ProblemLifecycleService, TransitionRequest
 from ..models import (
     BotInstance,
     Employee,
     GroupIntegration,
     InitialAnalysisRun,
+    NotificationLog,
     OperationalProblem,
     Report,
     ReportMetric,
+    TelegramConnection,
+    TelegramDialog,
+    TelegramMessage,
     Tenant,
     TenantAnalysisSchedule,
+    TenantMembership,
+    TenantSettings,
 )
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
@@ -50,6 +59,7 @@ class ClientContext:
     telegram_user_id: int
     role: str
     tenant: Tenant
+    employee_id: str | None = None
 
 
 class TenantOwnerMiddleware(BaseMiddleware):
@@ -90,25 +100,42 @@ class TenantOwnerMiddleware(BaseMiddleware):
                     BotInstance.deleted_at.is_(None),
                 )
             )
-        if tenant is None or user_id is None or user_id != tenant.owner_telegram_user_id:
+            membership = None
+            if tenant is not None and user_id is not None:
+                membership = await session.scalar(
+                    select(TenantMembership).where(
+                        TenantMembership.tenant_id == tenant.id,
+                        TenantMembership.telegram_user_id == user_id,
+                        TenantMembership.status == "active",
+                    )
+                )
+        if tenant is None or user_id is None or membership is None:
             await self.events.record(
                 tenant_id=self.tenant_id,
                 bot_instance_id=self.bot_instance_id,
                 telegram_user_id=user_id,
                 event_name="unauthorized_access_attempt",
-                metadata={"reason": "owner_id_mismatch" if user_id else "missing_user_id"},
+                metadata={"reason": "membership_missing" if user_id else "missing_user_id"},
             )
             if isinstance(event, CallbackQuery):
                 await event.answer("У вас нет доступа к этому проекту.", show_alert=True)
             elif isinstance(event, Message):
                 await event.answer("У вас нет доступа к этому проекту.")
             return None
+        if (
+            membership.role not in {"owner", "manager"}
+            and isinstance(event, CallbackQuery)
+            and not (event.data or "").startswith("np:")
+        ):
+            await event.answer("Для этого действия недостаточно прав.", show_alert=True)
+            return None
         data["client_context"] = ClientContext(
             bot_instance_id=self.bot_instance_id,
             tenant_id=self.tenant_id,
             telegram_user_id=user_id,
-            role="tenant_owner",
+            role=membership.role,
             tenant=tenant,
+            employee_id=membership.employee_id,
         )
         return await handler(event, data)
 
@@ -203,9 +230,6 @@ def build_client_router(
         rows: list[list[InlineKeyboardButton]] = []
         if status in {"connected", "ready", "syncing"}:
             rows.append(
-                [InlineKeyboardButton(text="📂 Выбрать область", callback_data="client:tg:catalog")]
-            )
-            rows.append(
                 [InlineKeyboardButton(text="📊 Прогресс", callback_data="client:tg:progress")]
             )
             rows.append(
@@ -287,11 +311,31 @@ def build_client_router(
     async def start(message: Message, client_context: ClientContext) -> None:
         await record(client_context, "client_user_started_bot")
         await record(client_context, "client_menu_opened")
+        tenant = client_context.tenant
+        async with events.session_factory() as session:
+            connection = await session.scalar(
+                select(TelegramConnection)
+                .where(
+                    TelegramConnection.tenant_id == tenant.id,
+                    TelegramConnection.deleted_at.is_(None),
+                )
+                .order_by(TelegramConnection.created_at.desc())
+                .limit(1)
+            )
+        first_name = (tenant.owner_name or "").strip().split()[0] or "Здравствуйте"
+        warning = ""
+        if connection is None or connection.status not in {"connected", "syncing", "ready"}:
+            warning = (
+                "\n\n⚠️ <b>Рабочий Telegram пока не подключён.</b>\n"
+                "Ventrix пока нечего анализировать. Подключить первый аккаунт можно в Mini App."
+            )
         await message.answer(
-            "<b>Рабочие коммуникации под контролем</b>\n\n"
-            "Система помогает находить потерянные обращения, просроченные договорённости "
-            "и риски в рабочих Telegram-коммуникациях.\n\n"
-            "Для начала настройте проект и подключите рабочий аккаунт.",
+            f"<b>{escape(first_name)}, привет.</b>\n\n"
+            f"Ventrix настроен под работу команды <b>{escape(tenant.name)}</b>.\n\n"
+            "Мы будем следить за рабочими Telegram-переписками, обязательствами сотрудников, "
+            "клиентами без ответа и другими важными ситуациями.\n\n"
+            "Быстрая настройка займёт несколько минут."
+            f"{warning}",
             reply_markup=client_welcome_menu(mini_app_url),
         )
 
@@ -303,6 +347,242 @@ def build_client_router(
             f"<b>{escape(client_context.tenant.name)}</b>\n\nВыберите нужное действие.",
             main=True,
         )
+
+    @router.callback_query(F.data.startswith("np:open:"))
+    async def notification_problem_open(
+        query: CallbackQuery, client_context: ClientContext
+    ) -> None:
+        problem_id = query.data.rsplit(":", 1)[1]
+        async with events.session_factory() as session:
+            problem = await session.scalar(
+                select(OperationalProblem).where(
+                    OperationalProblem.id == problem_id,
+                    OperationalProblem.tenant_id == client_context.tenant_id,
+                )
+            )
+        if problem is None:
+            await query.answer("Ситуация не найдена", show_alert=True)
+            return
+        if (
+            client_context.role == "employee"
+            and problem.responsible_employee_id != client_context.employee_id
+        ):
+            await query.answer("Эта ситуация назначена другому сотруднику", show_alert=True)
+            return
+        await edit_screen(
+            query,
+            f"<b>{escape(problem.problem_type.replace('_', ' ').title())}</b>\n\n"
+            f"Статус: <b>{escape(problem.status)}</b>\n"
+            f"Причина: {escape(problem.explanation)}\n\n"
+            f"<blockquote>{escape(problem.evidence or 'Evidence появится после проверки')}</blockquote>\n\n"
+            f"Следующий шаг: {escape(problem.recommended_action)}",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Закрыть", callback_data=f"np:close:{problem.id}")],
+                    [InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")],
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("np:false:"))
+    async def notification_false_positive(
+        query: CallbackQuery, client_context: ClientContext
+    ) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await query.answer("Действие доступно владельцу или менеджеру", show_alert=True)
+            return
+        problem_id = query.data.rsplit(":", 1)[1]
+        try:
+            await ProblemLifecycleService(events.session_factory).transition(
+                client_context.tenant_id,
+                problem_id,
+                TransitionRequest(
+                    target=ProblemStatus.FALSE_POSITIVE,
+                    actor_type="tenant_owner",
+                    actor_id=str(client_context.telegram_user_id),
+                    reason="Владелец отметил уведомление как ложное срабатывание.",
+                ),
+            )
+        except ValueError:
+            await query.answer("Текущий статус уже нельзя отметить как ложный", show_alert=True)
+            return
+        await query.answer("Отмечено как не проблема", show_alert=True)
+
+    @router.callback_query(F.data.startswith("np:close:"))
+    async def notification_close(query: CallbackQuery, client_context: ClientContext) -> None:
+        problem_id = query.data.rsplit(":", 1)[1]
+        lifecycle = ProblemLifecycleService(events.session_factory)
+        async with events.session_factory() as session:
+            problem = await session.scalar(
+                select(OperationalProblem).where(
+                    OperationalProblem.id == problem_id,
+                    OperationalProblem.tenant_id == client_context.tenant_id,
+                )
+            )
+        if problem is None:
+            await query.answer("Ситуация не найдена", show_alert=True)
+            return
+        if (
+            client_context.role == "employee"
+            and problem.responsible_employee_id != client_context.employee_id
+        ):
+            await query.answer("Эта ситуация назначена другому сотруднику", show_alert=True)
+            return
+        try:
+            if problem.status == ProblemStatus.NEEDS_CONFIRMATION.value:
+                problem = await lifecycle.transition(
+                    client_context.tenant_id,
+                    problem.id,
+                    TransitionRequest(
+                        ProblemStatus.ACKNOWLEDGED,
+                        "tenant_owner",
+                        str(client_context.telegram_user_id),
+                        "Ситуация подтверждена владельцем.",
+                    ),
+                )
+            if problem.status == ProblemStatus.ASSIGNED.value:
+                problem = await lifecycle.transition(
+                    client_context.tenant_id,
+                    problem.id,
+                    TransitionRequest(
+                        ProblemStatus.IN_PROGRESS,
+                        "tenant_owner",
+                        str(client_context.telegram_user_id),
+                        "Владелец подтвердил выполнение действия.",
+                    ),
+                )
+            if problem.status not in {ProblemStatus.IN_PROGRESS.value, ProblemStatus.WAITING.value}:
+                await query.answer(
+                    "Сначала подтвердите и назначьте ответственного в карточке", show_alert=True
+                )
+                return
+            if problem.status == ProblemStatus.WAITING.value:
+                problem = await lifecycle.transition(
+                    client_context.tenant_id,
+                    problem.id,
+                    TransitionRequest(
+                        ProblemStatus.IN_PROGRESS,
+                        "tenant_owner",
+                        str(client_context.telegram_user_id),
+                        "Получено подтверждение владельца.",
+                    ),
+                )
+            await lifecycle.transition(
+                client_context.tenant_id,
+                problem.id,
+                TransitionRequest(
+                    ProblemStatus.RESOLVED,
+                    "tenant_owner",
+                    str(client_context.telegram_user_id),
+                    "Закрыто владельцем из Telegram-уведомления.",
+                ),
+            )
+        except ValueError:
+            await query.answer("Переход статуса недоступен", show_alert=True)
+            return
+        await query.answer("Ситуация закрыта", show_alert=True)
+
+    @router.callback_query(F.data.startswith("np:notify:"))
+    async def notification_employee(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await query.answer("Действие доступно владельцу или менеджеру", show_alert=True)
+            return
+        problem_id = query.data.rsplit(":", 1)[1]
+        async with events.session_factory() as session:
+            problem = await session.scalar(
+                select(OperationalProblem).where(
+                    OperationalProblem.id == problem_id,
+                    OperationalProblem.tenant_id == client_context.tenant_id,
+                )
+            )
+            employee = (
+                await session.get(Employee, problem.responsible_employee_id)
+                if problem and problem.responsible_employee_id
+                else None
+            )
+            source = (
+                await session.get(TelegramMessage, problem.source_message_id)
+                if problem and problem.source_message_id
+                else None
+            )
+            dialog = (
+                await session.get(TelegramDialog, problem.dialog_id)
+                if problem and problem.dialog_id
+                else None
+            )
+            dedup_key = (
+                f"manual-employee:{problem.id}:{problem.status}:{employee.id}"
+                if problem and employee
+                else ""
+            )
+            existing = (
+                await session.scalar(
+                    select(NotificationLog).where(NotificationLog.deduplication_key == dedup_key)
+                )
+                if dedup_key
+                else None
+            )
+        if not employee or not employee.telegram_user_id:
+            await query.answer("Ответственный сотрудник с Telegram ID не назначен", show_alert=True)
+            return
+        if existing is not None and existing.status in {"pending", "sent", "delivery_uncertain"}:
+            await query.answer("Сотрудник уже уведомлён по этой версии ситуации", show_alert=True)
+            return
+        async with events.session_factory() as session:
+            log = await session.get(NotificationLog, existing.id) if existing else None
+            if log is None:
+                log = NotificationLog(
+                    tenant_id=client_context.tenant_id,
+                    problem_id=problem.id,
+                    employee_id=employee.id,
+                    destination_type="employee",
+                    destination_id=str(employee.telegram_user_id),
+                    deduplication_key=dedup_key,
+                    criticality=0,
+                    payload_json={"manual": True, "problem_status": problem.status},
+                )
+                session.add(log)
+            else:
+                log.status = "pending"
+                log.last_error_code = None
+            await session.commit()
+            log_id = log.id
+        person = dialog.title if dialog else "клиентом"
+        try:
+            await query.bot.send_message(
+                employee.telegram_user_id,
+                f"⚠️ <b>В переписке с {escape(person)} требуется ваше внимание</b>\n\n"
+                f"{escape(problem.explanation)}\n\n"
+                f"<blockquote>{escape((source.body_text if source else None) or problem.evidence or 'Откройте карточку Ventrix')}</blockquote>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Открыть карточку", callback_data=f"np:open:{problem.id}"
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="Отметить выполненным",
+                                callback_data=f"np:close:{problem.id}",
+                            )
+                        ],
+                    ]
+                ),
+            )
+        except Exception as exc:
+            async with events.session_factory() as session:
+                stored_log = await session.get(NotificationLog, log_id)
+                stored_log.status = "failed"
+                stored_log.last_error_code = type(exc).__name__
+                await session.commit()
+            raise
+        async with events.session_factory() as session:
+            stored_log = await session.get(NotificationLog, log_id)
+            stored_log.status = "sent"
+            stored_log.sent_at = datetime.now(UTC)
+            await session.commit()
+        await query.answer("Сотрудник уведомлён", show_alert=True)
 
     @router.callback_query(F.data == "client:summary")
     async def summary(query: CallbackQuery, client_context: ClientContext) -> None:
@@ -410,15 +690,15 @@ def build_client_router(
         details = (
             f"Аккаунт: {escape(connection.display_name or connection.phone_masked or 'подключён')}\n"
             f"Состояние: {escape(status or 'не подключён')}\n"
-            f"Папка: {escape(connection.selected_folder_title or 'не выбрана')}\n"
-            f"Период: {connection.history_days} дней"
+            f"История первого анализа: {connection.history_days} дней\n"
+            "Личные рабочие диалоги: автоматически"
             if connection
             else "Рабочий аккаунт ещё не подключён."
         )
         await edit_screen(
             query,
             "<b>Подключение Telegram</b>\n\n"
-            f"{details}\n\nДо явного выбора папки и периода сообщения не анализируются.",
+            f"{details}\n\nРабочие группы подключаются отдельно по ссылке.",
             connection_actions(status),
         )
 
@@ -427,11 +707,11 @@ def build_client_router(
         await edit_screen(
             query,
             "<b>Безопасное подключение рабочего Telegram</b>\n\n"
-            "1. В Telegram создайте или выберите рабочую папку с клиентами и командами.\n"
-            "2. Мы запросим телефон, одноразовый код и, только если включена, 2FA.\n"
-            "3. Код и пароль сразу удаляются из чата и не сохраняются. Сессия хранится "
-            "только в зашифрованном виде.\n"
-            "4. Личные диалоги не включаются без отдельного согласия.\n\n"
+            "1. Отправьте номер рабочего Telegram-аккаунта.\n"
+            "2. Введите одноразовый код и, если включена, пароль 2FA.\n"
+            "3. Личные рабочие диалоги подключатся автоматически.\n\n"
+            "Код и пароль удаляются сразу после проверки и не сохраняются. Сессия хранится "
+            "в зашифрованном виде.\n\n"
             "Подключение можно остановить, а сохранённые данные — удалить.",
             InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -459,7 +739,7 @@ def build_client_router(
         )
         await edit_screen(
             query,
-            "<b>Шаг 1 из 5 · Телефон</b>\n\n"
+            "<b>Шаг 1 из 3 · Телефон</b>\n\n"
             "Отправьте номер рабочего Telegram-аккаунта в международном формате, например "
             "+79990000000. Сообщение будет удалено после обработки.",
             InlineKeyboardMarkup(
@@ -515,7 +795,7 @@ def build_client_router(
         await edit_saved_screen(
             state,
             message.bot,
-            "<b>Шаг 2 из 5 · Код Telegram</b>\n\n"
+            "<b>Шаг 2 из 3 · Код Telegram</b>\n\n"
             f"Код отправлен для {escape(connection.phone_masked or 'рабочего аккаунта')}. "
             "Отправьте его одним сообщением. Код будет немедленно удалён и не сохранится.",
             InlineKeyboardMarkup(
@@ -556,6 +836,48 @@ def build_client_router(
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
+    async def activate_connected_account(
+        state: FSMContext,
+        bot: Any,
+        context: ClientContext,
+    ) -> None:
+        if connection_service is None:
+            return
+        data = await state.get_data()
+        connection_id = str(data["connection_id"])
+        await connection_service.refresh_catalog(context.tenant_id, connection_id)
+        async with connection_service.session_factory() as session:
+            tenant_settings = await session.scalar(
+                select(TenantSettings).where(TenantSettings.tenant_id == context.tenant_id)
+            )
+        history_days = tenant_settings.message_history_days if tenant_settings else 14
+        connection = await connection_service.activate_default_scope(
+            context.tenant_id,
+            history_days=history_days,
+            connection_id=connection_id,
+        )
+        run = await connection_service.start_initial_sync(
+            context.tenant_id,
+            connection_id=connection.id,
+        )
+        await record(context, "telegram_connection_completed")
+        await record(context, "initial_sync_started", run_id=run.id)
+        await edit_saved_screen(
+            state,
+            bot,
+            "<b>Аккаунт подключён</b>\n\n"
+            f"{escape(connection.display_name or connection.phone_masked or 'Telegram')} готов.\n"
+            "Личные рабочие диалоги уже добавлены. Первичный анализ продолжится в фоне.\n\n"
+            "Рабочие группы можно подключить отдельно в Mini App.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📊 Прогресс", callback_data="client:tg:progress")],
+                    [InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")],
+                ]
+            ),
+        )
+        await state.clear()
+
     @router.message(TelegramConnectionStates.code)
     async def receive_code(
         message: Message, state: FSMContext, client_context: ClientContext
@@ -594,7 +916,7 @@ def build_client_router(
             await edit_saved_screen(
                 state,
                 message.bot,
-                "<b>Дополнительная защита · 2FA</b>\n\n"
+                "<b>Шаг 3 из 3 · Пароль 2FA</b>\n\n"
                 "Отправьте облачный пароль Telegram. Он будет немедленно удалён и не сохранится.",
                 InlineKeyboardMarkup(
                     inline_keyboard=[
@@ -603,8 +925,19 @@ def build_client_router(
                 ),
             )
             return
-        await record(client_context, "telegram_connection_completed")
-        await show_folders(state, message.bot, client_context.tenant_id)
+        try:
+            await activate_connected_account(state, message.bot, client_context)
+        except Exception as exc:  # noqa: BLE001 - catalog/sync can safely be retried
+            await record(
+                client_context, "telegram_activation_failed", error_type=type(exc).__name__
+            )
+            await edit_saved_screen(
+                state,
+                message.bot,
+                "<b>Аккаунт подключён</b>\n\n"
+                "Первичная синхронизация пока не запустилась. Нажмите «Прогресс» через минуту.",
+                connection_actions("connected"),
+            )
 
     @router.message(TelegramConnectionStates.password)
     async def receive_password(
@@ -639,8 +972,19 @@ def build_client_router(
             )
             return
         password = ""
-        await record(client_context, "telegram_connection_completed")
-        await show_folders(state, message.bot, client_context.tenant_id)
+        try:
+            await activate_connected_account(state, message.bot, client_context)
+        except Exception as exc:  # noqa: BLE001 - catalog/sync can safely be retried
+            await record(
+                client_context, "telegram_activation_failed", error_type=type(exc).__name__
+            )
+            await edit_saved_screen(
+                state,
+                message.bot,
+                "<b>Аккаунт подключён</b>\n\n"
+                "Первичная синхронизация пока не запустилась. Нажмите «Прогресс» через минуту.",
+                connection_actions("connected"),
+            )
 
     @router.callback_query(F.data == "client:tg:catalog")
     async def refresh_folders(

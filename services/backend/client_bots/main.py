@@ -8,6 +8,7 @@ from ..config import get_settings
 from ..database import get_session_factory
 from ..services.encryption import EncryptionService
 from ..services.product_events import ProductEventService
+from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.gateway import TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionService
 from .runtime import AiogramPollingRuntime, ClientBotRuntimeManager
@@ -15,11 +16,12 @@ from .runtime import AiogramPollingRuntime, ClientBotRuntimeManager
 
 async def run() -> None:
     settings = get_settings()
+    session_factory = get_session_factory()
+    settings = await load_runtime_secret_overrides(session_factory, settings)
     logging.basicConfig(level=settings.log_level)
     # Telegram embeds bot tokens in request URLs. Never allow HTTP client URL logs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    session_factory = get_session_factory()
     events = ProductEventService(session_factory)
     encryption = EncryptionService(settings.app_encryption_key.get_secret_value())
     connection_service = None

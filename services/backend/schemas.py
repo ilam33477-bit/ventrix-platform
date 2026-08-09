@@ -26,6 +26,8 @@ class TenantCreate(BaseModel):
     response_sla_minutes: int = Field(gt=0, le=43_200)
     critical_problem_criteria: str = Field(min_length=2, max_length=10_000)
     daily_report_time: time
+    active_dialog_days: int = Field(default=30, ge=0, le=180)
+    message_history_days: int = Field(default=14, ge=0, le=180)
     plan: str = Field(default="trial", min_length=2, max_length=64)
     subscription_expires_at: date | None = None
     additional_ai_instructions: str = Field(default="", max_length=20_000)
@@ -105,6 +107,8 @@ class SettingsRead(BaseModel):
     response_sla_minutes: int
     critical_problem_criteria: str
     daily_report_time: time
+    active_dialog_days: int
+    message_history_days: int
 
 
 class AIProfileRead(BaseModel):

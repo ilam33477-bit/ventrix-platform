@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
+from itertools import pairwise
 
 import pytest
 from sqlalchemy import func, select, update
 
-from services.backend.analysis.preprocessing import compact_messages, local_features
+from services.backend.analysis.budget import ConservativeTokenEstimator, ModelInputBudget
+from services.backend.analysis.preprocessing import (
+    AnalysisBatchBuilder,
+    PreparedDialog,
+    compact_messages,
+    local_features,
+    pack_dialog_payloads,
+)
 from services.backend.analysis.schema import parse_analysis_response
 from services.backend.analysis.service import AnalysisPipelineService
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
+    AnalysisBatch,
     AnalysisRun,
     BackgroundJob,
     EncryptedSecret,
@@ -212,6 +221,79 @@ def test_compaction_keeps_fresh_tail_and_relevant_historical_evidence() -> None:
     assert 1 in ids
 
 
+def test_model_budget_reserves_prompt_output_and_safety() -> None:
+    estimator = ConservativeTokenEstimator()
+    budget = ModelInputBudget(
+        context_window=20_000,
+        max_output_tokens=2_000,
+        safety_margin_tokens=3_000,
+    )
+    prompt_tokens = estimator.text("важная системная инструкция")
+    assert budget.usable_input_tokens(prompt_tokens) == 15_000 - prompt_tokens
+    assert estimator.text("данные") > 1
+
+
+def test_greedy_packing_keeps_dialog_boundaries_and_never_exceeds_budget() -> None:
+    estimator = ConservativeTokenEstimator()
+    budget = ModelInputBudget(
+        context_window=12_000,
+        max_output_tokens=1_000,
+        safety_margin_tokens=1_000,
+        max_dialogs_per_request=12,
+    )
+    common = {"schema_version": "1.0", "tenant": {"name": "test"}}
+    prepared = []
+    for dialog_id, count in (("dialog-a", 10), ("dialog-b", 12)):
+        dialog = TelegramDialog(id=dialog_id, title=dialog_id, dialog_type="personal")
+        payload = {
+            "id": dialog_id,
+            "messages": [
+                {"id": index, "sent_at": f"2026-08-09T10:{index:02d}:00+00:00", "text": "ok"}
+                for index in range(count)
+            ],
+            "state_version": 1,
+        }
+        prepared.append(
+            PreparedDialog(
+                dialog=dialog,
+                payload=payload,
+                features={},
+                route_name="fast",
+                model="deepseek-test",
+                estimated_tokens=estimator.payload(payload),
+            )
+        )
+    packs = pack_dialog_payloads(
+        prepared,
+        common_payload=common,
+        budget=budget,
+        estimator=estimator,
+        system_prompt="analyze dialogs independently",
+    )
+    assert len(packs) == 1
+    assert [item.dialog.id for item in packs[0]] == ["dialog-a", "dialog-b"]
+    payload = {**common, "dialogs": [item.payload for item in packs[0]]}
+    usable = budget.usable_input_tokens(estimator.text("analyze dialogs independently"))
+    assert estimator.payload(payload) <= usable
+
+
+def test_long_dialog_is_split_chronologically_with_bounded_overlap(session_factory) -> None:
+    budget = ModelInputBudget(overlap_tokens=120)
+    builder = AnalysisBatchBuilder(session_factory, model_budget=budget)
+    base = {"id": "dialog-a", "state_version": 7, "historical_summary": "old state"}
+    messages = [
+        {"id": index, "sent_at": f"2026-08-09T10:{index:02d}:00+00:00", "text": "я" * 100}
+        for index in range(30)
+    ]
+    segments = builder._split_dialog_messages(base, messages, token_budget=900)
+    assert len(segments) > 1
+    assert segments[0]["messages"][0]["id"] == 0
+    assert segments[-1]["messages"][-1]["id"] == 29
+    assert all(builder.estimator.payload(segment) <= 900 for segment in segments)
+    for previous, current in pairwise(segments):
+        assert previous["messages"][-1]["id"] <= current["messages"][0]["id"]
+
+
 @pytest.mark.asyncio
 async def test_multi_account_analysis_uses_one_tenant_aggregation_barrier(
     session_factory, make_service, tenant_payload, encryption_key
@@ -304,3 +386,73 @@ async def test_multi_account_analysis_uses_one_tenant_aggregation_barrier(
     assert sum(item.telegram_account_id is None for item in runs) == 1
     assert len(aggregate_jobs) == 1
     assert per_account_reports == 0
+
+
+@pytest.mark.asyncio
+async def test_builder_packs_short_dialogs_in_one_tenant_safe_request(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(
+            tenant_id=tenant.id,
+            telegram_user_id=9010,
+            status="ready",
+        )
+        session.add(connection)
+        await session.flush()
+        run = AnalysisRun(
+            tenant_id=tenant.id,
+            telegram_account_id=connection.id,
+            trigger="manual",
+            status="running",
+            correlation_id="batch-packing-test",
+        )
+        session.add(run)
+        await session.flush()
+        for dialog_index in range(2):
+            dialog = TelegramDialog(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                telegram_dialog_id=7100 + dialog_index,
+                title=f"Диалог {dialog_index}",
+                dialog_type="personal",
+                source="personal",
+                selected=True,
+            )
+            session.add(dialog)
+            await session.flush()
+            for message_index in range(5):
+                session.add(
+                    TelegramMessage(
+                        tenant_id=tenant.id,
+                        connection_id=connection.id,
+                        dialog_id=dialog.id,
+                        telegram_message_id=message_index + 1,
+                        sent_at=datetime.now(UTC) + timedelta(seconds=message_index),
+                        outgoing=bool(message_index % 2),
+                        body_text=f"Сообщение {message_index}",
+                        attachments_json=[],
+                    )
+                )
+        await session.commit()
+        run_id = run.id
+
+    batch_ids = await AnalysisBatchBuilder(
+        session_factory,
+        model_budget=ModelInputBudget(
+            context_window=16_000,
+            max_output_tokens=2_000,
+            safety_margin_tokens=2_000,
+        ),
+        system_prompt="independent dialogs",
+    ).build(run_id)
+    async with session_factory() as session:
+        batches = list(
+            await session.scalars(select(AnalysisBatch).where(AnalysisBatch.id.in_(batch_ids)))
+        )
+    assert len(batches) == 1
+    assert batches[0].tenant_id == tenant.id
+    assert batches[0].dialogs_count == 2
+    assert len(batches[0].payload_json["dialogs"]) == 2
+    assert batches[0].estimated_input_tokens <= batches[0].input_budget

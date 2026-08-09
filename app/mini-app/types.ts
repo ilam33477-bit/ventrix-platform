@@ -200,7 +200,16 @@ export type AnalysisProgress = {
 };
 
 export type Bootstrap = {
-  tenant: { id: string; name: string };
+  tenant: {
+    id: string;
+    name: string;
+    owner_name: string;
+    owner_username: string | null;
+    niche: string;
+    business_description: string;
+    target_audience: string;
+    monitoring_priorities: string[];
+  };
   role: string;
   permissions: string[];
   onboarding_state: ConnectionState;
@@ -216,6 +225,8 @@ export type Bootstrap = {
   connections: TelegramConnection[];
   progress: AnalysisProgress | null;
   dialog_counts: Record<string, number>;
+  employee_count: number;
+  group_count: number;
   problems: Problem[];
 };
 
