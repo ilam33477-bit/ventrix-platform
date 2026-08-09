@@ -262,7 +262,8 @@ class TelegramSessionActor:
 
     async def _refresh_catalog_job(self, _: JobLease) -> dict[str, int]:
         async with self.rpc_lock:
-            filters = await self.client(functions.messages.GetDialogFiltersRequest())
+            response = await self.client(functions.messages.GetDialogFiltersRequest())
+            filters = getattr(response, "filters", response)
             folders = [
                 (int(item.id), str(getattr(item, "title", "Рабочая папка")))
                 for item in filters

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from services.backend.telegram_sessions.gateway import TelethonGateway
@@ -22,6 +24,11 @@ class FakeClient:
         self.connected = False
         self.disconnects += 1
 
+    async def __call__(self, _request):
+        return SimpleNamespace(
+            filters=[SimpleNamespace(id=7, title="Работа")]
+        )
+
 
 @pytest.mark.asyncio
 async def test_gateway_reuses_and_closes_account_connection(monkeypatch) -> None:
@@ -38,3 +45,14 @@ async def test_gateway_reuses_and_closes_account_connection(monkeypatch) -> None
     assert client.disconnects == 0
     await gateway.close()
     assert client.disconnects == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_telethon_dialog_filters_container(monkeypatch) -> None:
+    gateway = TelethonGateway(1, "hash")
+    client = FakeClient()
+    monkeypatch.setattr(gateway, "client", lambda _session=None: client)
+
+    folders = await gateway.list_folders("encrypted-session")
+
+    assert [(item.id, item.title) for item in folders] == [(7, "Работа")]

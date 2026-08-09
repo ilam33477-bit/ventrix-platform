@@ -223,7 +223,8 @@ class TelethonGateway:
     async def list_folders(self, session_string: str) -> list[RemoteFolder]:
         try:
             async with self.connected_client(session_string) as client:
-                filters = await client(functions.messages.GetDialogFiltersRequest())
+                response = await client(functions.messages.GetDialogFiltersRequest())
+                filters = getattr(response, "filters", response)
                 return [
                     RemoteFolder(int(item.id), str(getattr(item, "title", "Рабочая папка")))
                     for item in filters
