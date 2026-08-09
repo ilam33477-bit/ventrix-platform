@@ -11,9 +11,9 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY services ./services
 COPY packages ./packages
+RUN pip install --upgrade pip && pip install ".[dev]"
 COPY alembic ./alembic
 COPY alembic.ini ./
-RUN pip install --upgrade pip && pip install ".[dev]"
 RUN mkdir -p /app/data /app/backups
 
 COPY infra/entrypoint.sh /entrypoint.sh
