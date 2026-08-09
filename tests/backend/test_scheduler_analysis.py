@@ -15,13 +15,14 @@ from services.backend.analysis.preprocessing import (
     pack_dialog_payloads,
 )
 from services.backend.analysis.schema import parse_analysis_response
-from services.backend.analysis.service import AnalysisPipelineService
+from services.backend.analysis.service import AnalysisPipelineService, canonical_problem_type
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
     AnalysisBatch,
     AnalysisRun,
     BackgroundJob,
     EncryptedSecret,
+    Report,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
@@ -41,6 +42,20 @@ def test_legacy_timezones_are_normalized(legacy: str) -> None:
 def test_invalid_timezone_is_rejected() -> None:
     with pytest.raises(ValueError, match="invalid IANA timezone"):
         normalize_timezone("Mars/Olympus")
+
+
+@pytest.mark.parametrize(
+    ("raw_type", "expected"),
+    [
+        ("unanswered_customer", "client_without_answer"),
+        ("negative_feedback", "customer_complaint"),
+        ("broken-promise", "overdue_commitment"),
+        ("invoice payment delay", "payment_risk"),
+        ("unexpected free form label", "operational_risk"),
+    ],
+)
+def test_problem_types_are_canonicalized(raw_type: str, expected: str) -> None:
+    assert canonical_problem_type(raw_type) == expected
 
 
 def test_next_analysis_time_respects_timezone_days_and_advance() -> None:
@@ -410,6 +425,7 @@ async def test_builder_packs_short_dialogs_in_one_tenant_safe_request(
         )
         session.add(run)
         await session.flush()
+        dialog_ids: list[str] = []
         for dialog_index in range(2):
             dialog = TelegramDialog(
                 tenant_id=tenant.id,
@@ -422,6 +438,7 @@ async def test_builder_packs_short_dialogs_in_one_tenant_safe_request(
             )
             session.add(dialog)
             await session.flush()
+            dialog_ids.append(dialog.id)
             for message_index in range(5):
                 session.add(
                     TelegramMessage(
@@ -437,6 +454,16 @@ async def test_builder_packs_short_dialogs_in_one_tenant_safe_request(
                 )
         await session.commit()
         run_id = run.id
+        scoped_run = AnalysisRun(
+            tenant_id=tenant.id,
+            telegram_account_id=connection.id,
+            trigger="signal_escalation",
+            status="running",
+            correlation_id="scoped-batch-test",
+        )
+        session.add(scoped_run)
+        await session.commit()
+        scoped_run_id = scoped_run.id
 
     batch_ids = await AnalysisBatchBuilder(
         session_factory,
@@ -456,3 +483,143 @@ async def test_builder_packs_short_dialogs_in_one_tenant_safe_request(
     assert batches[0].dialogs_count == 2
     assert len(batches[0].payload_json["dialogs"]) == 2
     assert batches[0].estimated_input_tokens <= batches[0].input_budget
+
+    scoped_batch_ids = await AnalysisBatchBuilder(
+        session_factory,
+        system_prompt="independent dialogs",
+    ).build(scoped_run_id, dialog_ids={dialog_ids[0]})
+    async with session_factory() as session:
+        scoped_batch = await session.get(AnalysisBatch, scoped_batch_ids[0])
+    assert scoped_batch.dialogs_count == 1
+    assert [item["id"] for item in scoped_batch.payload_json["dialogs"]] == [dialog_ids[0]]
+
+
+@pytest.mark.asyncio
+async def test_signal_deep_analysis_is_dialog_scoped_and_does_not_create_report_job(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        secret = EncryptedSecret(
+            tenant_id=tenant.id,
+            kind="telegram_session",
+            ciphertext=b"encrypted-session",
+            fingerprint="deep-analysis-session",
+        )
+        session.add(secret)
+        await session.flush()
+        connection = TelegramConnection(
+            tenant_id=tenant.id,
+            session_secret_id=secret.id,
+            telegram_user_id=9020,
+            status="ready",
+        )
+        session.add(connection)
+        await session.flush()
+        dialogs: list[TelegramDialog] = []
+        for index in range(2):
+            dialog = TelegramDialog(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                telegram_dialog_id=7200 + index,
+                title=f"Deep dialog {index}",
+                dialog_type="personal",
+                source="personal",
+                selected=True,
+            )
+            session.add(dialog)
+            await session.flush()
+            dialogs.append(dialog)
+            session.add(
+                TelegramMessage(
+                    tenant_id=tenant.id,
+                    connection_id=connection.id,
+                    dialog_id=dialog.id,
+                    telegram_message_id=1,
+                    sent_at=datetime.now(UTC),
+                    outgoing=False,
+                    body_text="Клиент ждёт подтверждение срока.",
+                    attachments_json=[],
+                )
+            )
+        await session.commit()
+
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue(
+        "analysis.deep",
+        {"trigger": "signal_escalation", "history_window_days": 7},
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+        dialog_id=dialogs[0].id,
+        category="ai_heavy",
+        is_heavy=True,
+    )
+    lease = await queue.claim_next(
+        "deep-analysis-worker",
+        allowed_categories=frozenset({"ai_heavy"}),
+    )
+    assert lease is not None and lease.id == job_id
+    result = await AnalysisPipelineService(
+        session_factory,
+        EncryptionService(encryption_key),
+        queue=queue,
+    ).pipeline(lease)
+
+    async with session_factory() as session:
+        batch = await session.scalar(
+            select(AnalysisBatch).where(AnalysisBatch.run_id == result["analysis_run_id"])
+        )
+        report_jobs = int(
+            await session.scalar(
+                select(func.count(BackgroundJob.id)).where(
+                    BackgroundJob.job_type == "report_generation"
+                )
+            )
+            or 0
+        )
+    assert result["report_suppressed"] is True
+    assert batch.dialogs_count == 1
+    assert [item["id"] for item in batch.payload_json["dialogs"]] == [dialogs[0].id]
+    assert report_jobs == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_signal_escalation_report_job_is_suppressed(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        run = AnalysisRun(
+            tenant_id=tenant.id,
+            trigger="signal_escalation",
+            status="running",
+            correlation_id="legacy-signal-report",
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue(
+        "report_generation",
+        {"analysis_run_id": run_id},
+        tenant_id=tenant.id,
+        category="report",
+    )
+    lease = await queue.claim_next(
+        "report-worker",
+        allowed_categories=frozenset({"report"}),
+    )
+    assert lease is not None and lease.id == job_id
+    result = await AnalysisPipelineService(
+        session_factory,
+        EncryptionService(encryption_key),
+        queue=queue,
+    ).generate_report(lease)
+
+    async with session_factory() as session:
+        stored_run = await session.get(AnalysisRun, run_id)
+        reports = int(await session.scalar(select(func.count(Report.id))) or 0)
+    assert result["report_suppressed"] is True
+    assert stored_run.status == "completed"
+    assert reports == 0

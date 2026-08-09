@@ -175,7 +175,13 @@ class AnalysisBatchBuilder:
         self.system_prompt = system_prompt
         self.estimator = ConservativeTokenEstimator()
 
-    async def build(self, run_id: str, *, history_window_days: int = 30) -> list[str]:
+    async def build(
+        self,
+        run_id: str,
+        *,
+        history_window_days: int = 30,
+        dialog_ids: set[str] | None = None,
+    ) -> list[str]:
         async with self.session_factory() as session:
             run = await session.get(AnalysisRun, run_id)
             if run is None:
@@ -193,16 +199,17 @@ class AnalysisBatchBuilder:
             )
             if profile is None or settings is None:
                 raise LookupError("tenant analysis profile/settings not found")
-            dialogs = list(
-                await session.scalars(
-                    select(TelegramDialog).where(
-                        TelegramDialog.tenant_id == run.tenant_id,
-                        TelegramDialog.connection_id == run.telegram_account_id,
-                        TelegramDialog.selected.is_(True),
-                        TelegramDialog.excluded.is_(False),
-                    )
-                )
+            dialog_query = select(TelegramDialog).where(
+                TelegramDialog.tenant_id == run.tenant_id,
+                TelegramDialog.connection_id == run.telegram_account_id,
+                TelegramDialog.selected.is_(True),
+                TelegramDialog.excluded.is_(False),
             )
+            if dialog_ids is not None:
+                if not dialog_ids:
+                    return []
+                dialog_query = dialog_query.where(TelegramDialog.id.in_(dialog_ids))
+            dialogs = list(await session.scalars(dialog_query))
             incremental = run.trigger == "scheduled"
             prepared: list[tuple[TelegramDialog, list[TelegramMessage], str, int]] = []
             for dialog in dialogs:

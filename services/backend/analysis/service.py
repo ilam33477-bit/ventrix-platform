@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -62,7 +63,42 @@ Use schema_version 1.0 and exactly this structure:
 {"schema_version":"1.0","tenant_id":"...","batch_id":"...","dialog_results":[{"chat_id":"...","dialog_type":"...","summary":"...","participants":[],"detected_patterns":[],"problems":[{"event_type":"...","is_problem":true,"priority":"medium","confidence":0.8,"requires_review":false,"source_message_ids":[],"evidence":[],"summary":"...","recommended_action":"..."}]}],"usage":{"input_tokens":0,"output_tokens":0}}.
 Never invent source message IDs or facts. Use the tenant profile and local features supplied.
 Never transfer facts, participants, message IDs, evidence, or conclusions between dialogs. Return one dialog_result for every supplied dialog id.
+Use only these event_type values: client_without_answer, customer_complaint,
+customer_question, commitment_risk, overdue_commitment, payment_risk, deal_risk,
+churn_risk, conflict, task_risk, operational_risk.
+Set is_problem=true only for a concrete actionable business risk supported by the
+source messages. Ordinary conversation, acknowledgements and neutral questions
+without a missed action are not problems.
 """
+
+CANONICAL_PROBLEM_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "client_without_answer",
+        ("without_answer", "no_response", "unanswered", "late_reply"),
+    ),
+    ("customer_complaint", ("complaint", "dissatisfaction", "negative_feedback", "жалоб")),
+    ("customer_question", ("customer_question", "unresolved_question", "вопрос")),
+    ("overdue_commitment", ("overdue", "missed_deadline", "broken_promise", "просроч")),
+    ("commitment_risk", ("commitment", "promise", "deadline_risk", "обещан")),
+    ("payment_risk", ("payment", "invoice", "refund", "оплат", "счет", "счёт")),
+    ("deal_risk", ("deal", "contract", "lost_lead", "сделк", "договор")),
+    ("churn_risk", ("churn", "lost_customer", "client_loss", "уход")),
+    ("conflict", ("conflict", "escalation", "конфликт")),
+    ("task_risk", ("task", "follow_up", "followup", "задач")),
+)
+CANONICAL_PROBLEM_TYPES = frozenset(
+    {item[0] for item in CANONICAL_PROBLEM_HINTS} | {"operational_risk"}
+)
+
+
+def canonical_problem_type(value: str) -> str:
+    normalized = re.sub(r"[^a-zа-я0-9]+", "_", value.strip().lower()).strip("_")
+    if normalized in CANONICAL_PROBLEM_TYPES:
+        return normalized
+    for canonical, hints in CANONICAL_PROBLEM_HINTS:
+        if any(hint in normalized for hint in hints):
+            return canonical
+    return "operational_risk"
 
 
 class AnalysisPipelineService:
@@ -140,6 +176,9 @@ class AnalysisPipelineService:
         batch_ids = await self.builder.build(
             run.id,
             history_window_days=int(job.payload.get("history_window_days", 30)),
+            dialog_ids={job.dialog_id}
+            if job.job_type == "analysis.deep" and job.dialog_id
+            else None,
         )
         for batch_id in batch_ids:
             await self.queue.enqueue(
@@ -155,7 +194,7 @@ class AnalysisPipelineService:
                 cost_class="heavy",
                 max_attempts=3,
             )
-        if not job.payload.get("tenant_run_id"):
+        if not job.payload.get("tenant_run_id") and job.job_type != "analysis.deep":
             await self.queue.enqueue(
                 "report_generation",
                 {"analysis_run_id": run.id},
@@ -169,7 +208,13 @@ class AnalysisPipelineService:
                 cost_class="heavy",
                 max_attempts=3,
             )
-        return {"analysis_run_id": run.id, "batches": len(batch_ids)}
+        if job.job_type == "analysis.deep" and not batch_ids:
+            await self._finish_deep_run(run.id)
+        return {
+            "analysis_run_id": run.id,
+            "batches": len(batch_ids),
+            "report_suppressed": job.job_type == "analysis.deep",
+        }
 
     async def process_batch(self, job: JobLease) -> dict[str, Any]:
         try:
@@ -238,7 +283,31 @@ class AnalysisPipelineService:
             job_id=job.id,
             duration_ms=int((time.perf_counter() - call_started) * 1000),
         )
-        return {"batch_id": batch_id, "problems": await self._create_problems(batch_id, parsed)}
+        problems = await self._create_problems(batch_id, parsed)
+        await self._finish_deep_run(run.id)
+        return {"batch_id": batch_id, "problems": problems}
+
+    async def _finish_deep_run(self, run_id: str, *, force: bool = False) -> None:
+        async def write(session: AsyncSession) -> None:
+            run = await session.get(AnalysisRun, run_id)
+            if run is None or run.trigger != "signal_escalation" or run.status == "completed":
+                return
+            remaining = int(
+                await session.scalar(
+                    select(func.count(AnalysisBatch.id)).where(
+                        AnalysisBatch.run_id == run.id,
+                        AnalysisBatch.status != "completed",
+                    )
+                )
+                or 0
+            )
+            if remaining and not force:
+                return
+            run.status = "completed"
+            run.stage = "deep_analysis_completed"
+            run.finished_at = datetime.now(UTC)
+
+        await self.transactions.run(write)
 
     async def generate_report(self, job: JobLease) -> dict[str, Any]:
         run_id = str(job.payload["analysis_run_id"])
@@ -254,6 +323,13 @@ class AnalysisPipelineService:
             )
         if run is None:
             raise RuntimeError("analysis run not found")
+        if run.trigger == "signal_escalation":
+            await self._finish_deep_run(run.id, force=True)
+            return {
+                "analysis_run_id": run.id,
+                "report_id": None,
+                "report_suppressed": True,
+            }
         if any(item.status in {"pending", "running"} for item in batches):
             raise JobDeferred(2, "waiting_for_required_ai_batches")
         if any(item.status == "failed" for item in batches):
@@ -555,8 +631,13 @@ class AnalysisPipelineService:
                 connection = await session.get(TelegramConnection, dialog.connection_id)
                 dialog_connection_employee = connection.assigned_employee_id if connection else None
                 for candidate in result.problems:
-                    if not candidate.is_problem or not candidate.source_message_ids:
+                    if (
+                        not candidate.is_problem
+                        or not candidate.source_message_ids
+                        or candidate.confidence < 0.5
+                    ):
                         continue
+                    problem_type = canonical_problem_type(candidate.event_type)
                     source_remote_id = int(candidate.source_message_ids[0])
                     source = await session.scalar(
                         select(TelegramMessage).where(
@@ -568,7 +649,7 @@ class AnalysisPipelineService:
                     if source is None:
                         continue
                     signal_fingerprint = hashlib.sha256(
-                        f"{batch.tenant_id}:{source.id}:{candidate.event_type}".encode()
+                        f"{batch.tenant_id}:{source.id}:{problem_type}".encode()
                     ).hexdigest()
                     signal = await session.scalar(
                         select(Signal).where(Signal.fingerprint == signal_fingerprint)
@@ -588,11 +669,11 @@ class AnalysisPipelineService:
                             source_message_id=source.id,
                             employee_id=dialog_connection_employee,
                             fingerprint=signal_fingerprint,
-                            signal_type=candidate.event_type,
+                            signal_type=problem_type,
                             local_score=criticality,
                             ai_score=criticality,
                             criticality=criticality,
-                            status="problem_created",
+                            status="triaged",
                             reason=candidate.summary,
                             detected_at=source.sent_at,
                             processed_at=datetime.now(UTC),
@@ -604,6 +685,15 @@ class AnalysisPipelineService:
                         )
                         session.add(signal)
                         await session.flush()
+                    minimum_confidence = (
+                        0.55 if candidate.priority in {"high", "critical"} else 0.65
+                    )
+                    if (
+                        candidate.priority in {"low", "informational"}
+                        or candidate.confidence < minimum_confidence
+                    ):
+                        signal.status = "triaged"
+                        continue
                     problem_fingerprint = f"signal:{signal_fingerprint}"
                     exists = await session.scalar(
                         select(OperationalProblem.id).where(
@@ -620,7 +710,7 @@ class AnalysisPipelineService:
                         signal_id=signal.id,
                         responsible_employee_id=dialog_connection_employee,
                         fingerprint=problem_fingerprint,
-                        problem_type=candidate.event_type,
+                        problem_type=problem_type,
                         priority=candidate.priority,
                         confidence=candidate.confidence,
                         evidence="\n".join(candidate.evidence)[:4000],
@@ -630,6 +720,7 @@ class AnalysisPipelineService:
                     )
                     session.add(problem)
                     await session.flush()
+                    signal.status = "problem_created"
                     session.add_all(
                         initialize_problem_lifecycle(
                             problem,

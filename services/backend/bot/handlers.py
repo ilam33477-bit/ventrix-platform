@@ -18,7 +18,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 from pydantic import ValidationError
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.api.deepseek import DeepSeekProvider
@@ -28,6 +28,7 @@ from ..jobs.queue import SQLiteJobQueue
 from ..models import (
     AIUsageCall,
     AIUsageMetric,
+    AnalysisRun,
     BackgroundJob,
     Employee,
     GroupIntegration,
@@ -1100,10 +1101,26 @@ async def tenant_test_reset_confirm(
                             "signal.scan_batch",
                             "signal.ai_triage",
                             "notification.initial_summary",
+                            "analysis.deep",
+                            "analysis.pipeline",
+                            "analysis.connection",
+                            "analysis.aggregate",
+                            "ai_batch_analysis",
+                            "report_generation",
+                            "report_delivery",
+                            "statistics_refresh",
                         )
                     ),
                 )
                 .values(status="cancelled", finished_at=datetime.now(UTC))
+            )
+        if mode == "full":
+            # Reports/analysis runs are tenant-wide and survive connection FK
+            # deletion via SET NULL. Remove them explicitly so a TEST reset
+            # cannot show stale summaries for already deleted source data.
+            await session.execute(delete(Report).where(Report.tenant_id == tenant_id))
+            await session.execute(
+                delete(AnalysisRun).where(AnalysisRun.tenant_id == tenant_id)
             )
         await session.commit()
     await render(

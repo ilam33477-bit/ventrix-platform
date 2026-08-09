@@ -80,7 +80,9 @@ class TenantClientRepository:
         return list(
             await self.session.scalars(
                 select(Report)
+                .join(AnalysisRun, AnalysisRun.id == Report.analysis_run_id)
                 .where(Report.tenant_id == self.tenant_id)
+                .where(AnalysisRun.trigger != "signal_escalation")
                 .order_by(Report.period_end.desc())
             )
         )

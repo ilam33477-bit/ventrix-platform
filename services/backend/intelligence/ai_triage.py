@@ -123,6 +123,7 @@ class AITriageService:
         notification_ids = await self.notifications.plan_for_signal(signal.id, problem_id)
         deep_job_id = None
         if result.needs_deep_analysis:
+            deep_bucket = int(datetime.now(UTC).timestamp() // 300)
             deep_job_id = await self.queue.enqueue(
                 "analysis.deep",
                 {"trigger": "signal_escalation", "signal_id": signal.id},
@@ -130,7 +131,9 @@ class AITriageService:
                 telegram_account_id=signal.telegram_connection_id,
                 dialog_id=signal.dialog_id,
                 priority=30,
-                idempotency_key=f"signal-deep-analysis:{signal.id}",
+                idempotency_key=(
+                    f"signal-deep-analysis:{signal.tenant_id}:{signal.dialog_id}:{deep_bucket}"
+                ),
                 correlation_id=signal.id,
                 is_heavy=True,
                 category="ai_heavy",
