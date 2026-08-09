@@ -195,6 +195,40 @@ async def test_worker_pool_claims_only_its_categories(session_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_rpc_bypasses_tenant_general_concurrency(
+    session_factory, make_service, tenant_payload
+) -> None:
+    queue = SQLiteJobQueue(session_factory, max_active_tenant_jobs=1)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(
+            tenant_id=tenant.id, telegram_user_id=100, status="ready"
+        )
+        session.add(connection)
+        await session.commit()
+        tenant_id = tenant.id
+        account_id = connection.id
+    await queue.enqueue("analysis.pipeline", {}, tenant_id=tenant_id, category="analysis")
+    rpc_id = await queue.enqueue(
+        "telegram.catch_up",
+        {},
+        tenant_id=tenant_id,
+        telegram_account_id=account_id,
+        category="telegram_rpc",
+    )
+    general = await queue.claim_next(
+        "general", allowed_categories=frozenset({"analysis"})
+    )
+    assert general is not None
+    rpc = await queue.claim_next(
+        "actor",
+        allowed_categories=frozenset({"telegram_rpc"}),
+        telegram_account_id=account_id,
+    )
+    assert rpc is not None and rpc.id == rpc_id
+
+
+@pytest.mark.asyncio
 async def test_telegram_runtime_lease_fences_previous_owner(
     session_factory, make_service, tenant_payload
 ) -> None:

@@ -11,7 +11,9 @@ from ..database import SQLiteTransactionManager
 from ..models import BackgroundJob, TenantQueueState
 
 AVAILABLE_STATUSES = ("pending", "scheduled", "waiting", "retry", "retry_scheduled")
-RESERVED_LANE_CATEGORIES = frozenset({"critical", "notification", "realtime"})
+RESERVED_LANE_CATEGORIES = frozenset(
+    {"critical", "notification", "realtime", "telegram_rpc"}
+)
 HEAVY_JOB_TYPES = {
     "telegram_initial_sync",
     "telegram_incremental_sync",
