@@ -46,7 +46,7 @@ flowchart LR
   API --> ANALYTICS["Product and AI analytics"]
 ```
 
-The MVP is a single-server modular monolith backed by one SQLite database in WAL mode. FastAPI, the owner bot and one background worker are separate processes sharing the same local volume. FSM and jobs are durable SQLite tables; short transactions, a busy timeout and bounded write concurrency protect the single-writer design. PostgreSQL and Redis are explicit future scale transitions, not MVP dependencies.
+The MVP is a single-server modular monolith backed by one SQLite database in WAL mode. FastAPI, bots, the bounded background worker and a dedicated Telegram session runtime are separate processes sharing one local volume. The session runtime owns exactly one long-lived Telethon client per connected account, converts push updates into durable jobs and performs cursor-based catch-up after reconnect. Worker category pools reserve realtime and notification capacity so AI/report work cannot starve ingestion; short transactions, busy timeout and bounded write concurrency protect SQLite. PostgreSQL and Redis are explicit future scale transitions, not MVP dependencies.
 
 ## 4. Monorepo structure
 
@@ -241,4 +241,4 @@ Release additionally requires: zero cross-tenant authorization failures in autom
 
 ## 21. Decisions for the first implementation slice
 
-The repository implements the domain state machine and router as a dependency-light core so they can be exhaustively tested. FastAPI is an adapter, not the owner of business rules. The current Foundation uses real SQLite persistence, encrypted Telegram bot credentials, persistent FSM and a single durable job worker. The Mini App remains representative and disconnected. Real Telegram user-session connector activation remains disabled until its dedicated security phase.
+The repository implements the domain state machine and router as a dependency-light core. FastAPI adapts persistent problems, transition audit and verification records rather than owning transition rules. The Foundation uses SQLite persistence, encrypted credentials, persistent FSM and a durable category-aware queue. The Mini App authenticates with Telegram `initData`, persists a resumable ten-step onboarding and manages tenant-scoped operations through the API boundary. Telegram ingestion is push-first (`NewMessage`/`MessageEdited`) with periodic reconciliation as recovery. Scheduled AI work uses `DialogState.meaningful_version` and only rebuilds changed dialog contexts before a consolidated tenant report.

@@ -8,7 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 TEXT_SUFFIXES = {
     ".ini", ".json", ".md", ".mjs", ".py", ".sh", ".toml", ".ts", ".tsx", ".txt", ".yaml", ".yml"
 }
-SKIP_PARTS = {".git", ".venv", "node_modules", "data", "backups", "__pycache__"}
+FORBIDDEN_PARTS = {
+    ".git",
+    ".next",
+    ".venv",
+    "backups",
+    "data",
+    "logs",
+    "node_modules",
+    "__pycache__",
+}
+FORBIDDEN_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".session", ".log"}
 PATTERNS = {
     "Telegram bot token": re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b"),
     "DeepSeek API key": re.compile(r"\b" + "sk" + r"-[A-Za-z0-9]{20,}\b"),
@@ -28,9 +38,11 @@ def candidate_files() -> list[Path]:
     paths: list[Path] = []
     for name in completed.stdout.splitlines():
         path = ROOT / name
-        if path.name == ".env" or any(part in SKIP_PARTS for part in path.parts):
-            continue
-        if path.is_file() and (path.suffix.lower() in TEXT_SUFFIXES or path.name == "Dockerfile"):
+        if path.is_file() and (
+            path.suffix.lower() in TEXT_SUFFIXES
+            or path.name == "Dockerfile"
+            or path.name.startswith(".env")
+        ):
             paths.append(path)
     return paths
 
@@ -38,13 +50,19 @@ def candidate_files() -> list[Path]:
 def scan() -> list[tuple[str, Path]]:
     findings: list[tuple[str, Path]] = []
     for path in candidate_files():
+        relative = path.relative_to(ROOT)
+        if (
+            path.name.startswith(".env") and path.name != ".env.example"
+        ) or any(part in FORBIDDEN_PARTS for part in relative.parts) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+            findings.append(("forbidden runtime/secret file", relative))
+            continue
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
         for label, pattern in PATTERNS.items():
             if pattern.search(content):
-                findings.append((label, path.relative_to(ROOT)))
+                findings.append((label, relative))
     return findings
 
 

@@ -34,6 +34,7 @@ opera-owner-bot = "services.backend.bot.main:main"
 opera-worker = "services.backend.jobs.worker:main"
 opera-client-bots = "services.backend.client_bots.main:main"
 opera-backup = "services.backend.scripts.backup_sqlite:main"
+opera-export-source = "scripts.export_source:main"
 
 [tool.setuptools.packages.find]
 include = ["services*", "packages*"]

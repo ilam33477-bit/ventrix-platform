@@ -5,15 +5,22 @@ from datetime import UTC, datetime, time, timedelta
 import pytest
 from sqlalchemy import func, select, update
 
-from services.backend.analysis.preprocessing import local_features
+from services.backend.analysis.preprocessing import compact_messages, local_features
 from services.backend.analysis.schema import parse_analysis_response
+from services.backend.analysis.service import AnalysisPipelineService
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
+    AnalysisRun,
+    BackgroundJob,
+    EncryptedSecret,
+    TelegramConnection,
+    TelegramDialog,
     TelegramMessage,
     TenantAnalysisSchedule,
     TenantSettings,
 )
 from services.backend.scheduler.service import TenantAnalysisScheduler, next_analysis_time
+from services.backend.services.encryption import EncryptionService
 from services.backend.timezones import normalize_timezone
 
 
@@ -158,3 +165,142 @@ def test_preprocessing_and_controlled_json_repair() -> None:
     parsed, repaired = parse_analysis_response(raw)
     assert repaired is True
     assert parsed.batch_id == "b1"
+
+
+def test_compaction_keeps_fresh_tail_and_relevant_historical_evidence() -> None:
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+    messages = [
+        TelegramMessage(
+            telegram_message_id=1,
+            sender_id=10,
+            sent_at=now - timedelta(days=3),
+            outgoing=True,
+            body_text="Обещаю отправить подписанный договор клиенту.",
+            attachments_json=[],
+        ),
+        *[
+            TelegramMessage(
+                telegram_message_id=index,
+                sender_id=10,
+                sent_at=now - timedelta(hours=20 - index),
+                outgoing=False,
+                body_text=f"Обычное старое сообщение {index}",
+                attachments_json=[],
+            )
+            for index in range(2, 8)
+        ],
+        TelegramMessage(
+            telegram_message_id=8,
+            sender_id=20,
+            sent_at=now - timedelta(minutes=2),
+            outgoing=False,
+            body_text="Последнее важное сообщение клиента",
+            attachments_json=[],
+        ),
+        TelegramMessage(
+            telegram_message_id=9,
+            sender_id=10,
+            sent_at=now - timedelta(minutes=1),
+            outgoing=True,
+            body_text="Самый свежий ответ сотрудника",
+            attachments_json=[],
+        ),
+    ]
+    compact = compact_messages(messages, max_chars=140, latest_count=2)
+    ids = [item["id"] for item in compact]
+    assert ids[-2:] == [8, 9]
+    assert 1 in ids
+
+
+@pytest.mark.asyncio
+async def test_multi_account_analysis_uses_one_tenant_aggregation_barrier(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        for index in (1, 2):
+            secret = EncryptedSecret(
+                tenant_id=tenant.id,
+                kind="telegram_session",
+                ciphertext=b"encrypted-session",
+                fingerprint=f"session-{index}",
+            )
+            session.add(secret)
+            await session.flush()
+            connection = TelegramConnection(
+                tenant_id=tenant.id,
+                session_secret_id=secret.id,
+                telegram_user_id=9000 + index,
+                status="ready",
+            )
+            session.add(connection)
+            await session.flush()
+            dialog = TelegramDialog(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                telegram_dialog_id=7000 + index,
+                title=f"Клиент {index}",
+                dialog_type="personal",
+                source="folder",
+                selected=True,
+            )
+            session.add(dialog)
+            await session.flush()
+            session.add(
+                TelegramMessage(
+                    tenant_id=tenant.id,
+                    connection_id=connection.id,
+                    dialog_id=dialog.id,
+                    telegram_message_id=1,
+                    sent_at=datetime.now(UTC),
+                    outgoing=False,
+                    body_text="Когда будет договор?",
+                    attachments_json=[],
+                )
+            )
+        await session.commit()
+
+    queue = SQLiteJobQueue(session_factory)
+    pipeline = AnalysisPipelineService(
+        session_factory,
+        EncryptionService(encryption_key),
+        queue=queue,
+    )
+    root_id = await queue.enqueue(
+        "analysis.pipeline",
+        {"trigger": "scheduled", "history_window_days": 7},
+        tenant_id=tenant.id,
+        category="analysis",
+        correlation_id="tenant-cycle-1",
+    )
+    root = await queue.claim_next("analysis-root", allowed_categories=frozenset({"analysis"}))
+    assert root is not None and root.id == root_id
+    await pipeline.pipeline(root)
+    await queue.complete(root)
+
+    while True:
+        child = await queue.claim_next(
+            "analysis-account", allowed_categories=frozenset({"analysis"})
+        )
+        if child is None:
+            break
+        assert child.job_type == "analysis.connection"
+        await pipeline.pipeline(child)
+        await queue.complete(child)
+
+    async with session_factory() as session:
+        runs = list(await session.scalars(select(AnalysisRun)))
+        aggregate_jobs = list(
+            await session.scalars(
+                select(BackgroundJob).where(BackgroundJob.job_type == "analysis.aggregate")
+            )
+        )
+        per_account_reports = await session.scalar(
+            select(func.count(BackgroundJob.id)).where(
+                BackgroundJob.job_type == "report_generation"
+            )
+        )
+    assert len(runs) == 3
+    assert sum(item.telegram_account_id is None for item in runs) == 1
+    assert len(aggregate_jobs) == 1
+    assert per_account_reports == 0

@@ -14,6 +14,7 @@ from ..database import SQLiteTransactionManager
 from ..models import (
     AnalysisBatch,
     AnalysisRun,
+    DialogState,
     TelegramDialog,
     TelegramMessage,
     TenantAIProfile,
@@ -27,6 +28,11 @@ DATE_RE = re.compile(
     r"\b(?:сегодня|завтра|послезавтра|\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)\b", re.IGNORECASE
 )
 CALL_RE = re.compile(r"\b(?:созвон|встреч|звонок|zoom|meet)\w*", re.IGNORECASE)
+HISTORICAL_EVIDENCE_RE = re.compile(
+    r"\b(?:обеща|отправлю|пришлю|сделаю|договор|контракт|оплат|сч[её]т|жалоб|"
+    r"возврат|дедлайн|срок|проблем|не получил|не ответил)\w*",
+    re.IGNORECASE,
+)
 
 
 def local_features(messages: list[TelegramMessage], now: datetime | None = None) -> dict[str, Any]:
@@ -57,10 +63,9 @@ def local_features(messages: list[TelegramMessage], now: datetime | None = None)
 
 
 def compact_messages(
-    messages: list[TelegramMessage], max_chars: int = 32_000
+    messages: list[TelegramMessage], max_chars: int = 32_000, latest_count: int = 40
 ) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    used = 0
+    normalized: list[tuple[TelegramMessage, str]] = []
     seen: set[tuple[int | None, datetime, str]] = set()
     for item in messages:
         text = " ".join((item.body_text or "").split())
@@ -70,20 +75,43 @@ def compact_messages(
         if key in seen:
             continue
         seen.add(key)
-        if used + len(text) > max_chars:
+        normalized.append((item, text))
+
+    selected: list[tuple[TelegramMessage, str]] = []
+    used = 0
+    # Reserve the context for the newest development first. Iterating backwards
+    # prevents an old busy prefix from evicting the current situation.
+    for item, text in reversed(normalized[-latest_count:]):
+        remaining = max_chars - used
+        if remaining <= 0:
             break
-        result.append(
-            {
-                "id": item.telegram_message_id,
-                "sender_id": item.sender_id,
-                "sent_at": item.sent_at.isoformat(),
-                "outgoing": item.outgoing,
-                "text": text,
-                "attachments": item.attachments_json,
-            }
-        )
-        used += len(text)
-    return result
+        selected.append((item, text[:remaining]))
+        used += min(len(text), remaining)
+    selected_ids = {item.telegram_message_id for item, _ in selected}
+    # Fill the remaining budget with the newest historical evidence, not an
+    # arbitrary prefix of the reporting window.
+    historical: list[tuple[TelegramMessage, str]] = []
+    for item, text in reversed(normalized[:-latest_count]):
+        if item.telegram_message_id in selected_ids or not HISTORICAL_EVIDENCE_RE.search(text):
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        historical.append((item, text[:remaining]))
+        used += min(len(text), remaining)
+    selected.extend(historical)
+    selected.sort(key=lambda pair: (pair[0].sent_at, pair[0].telegram_message_id))
+    return [
+        {
+            "id": item.telegram_message_id,
+            "sender_id": item.sender_id,
+            "sent_at": item.sent_at.isoformat(),
+            "outgoing": item.outgoing,
+            "text": text,
+            "attachments": item.attachments_json,
+        }
+        for item, text in selected
+    ]
 
 
 class AnalysisBatchBuilder:
@@ -124,8 +152,18 @@ class AnalysisBatchBuilder:
                     )
                 )
             )
-            prepared: list[tuple[TelegramDialog, list[TelegramMessage]]] = []
+            incremental = run.trigger == "scheduled"
+            prepared: list[tuple[TelegramDialog, list[TelegramMessage], str, int]] = []
             for dialog in dialogs:
+                state = await session.scalar(
+                    select(DialogState).where(DialogState.dialog_id == dialog.id)
+                )
+                if (
+                    incremental
+                    and state is not None
+                    and state.meaningful_version <= state.last_report_version
+                ):
+                    continue
                 messages = list(
                     await session.scalars(
                         select(TelegramMessage)
@@ -138,11 +176,18 @@ class AnalysisBatchBuilder:
                         .order_by(TelegramMessage.sent_at.asc())
                     )
                 )
-                prepared.append((dialog, messages))
+                prepared.append(
+                    (
+                        dialog,
+                        messages,
+                        state.compact_summary if state else "",
+                        state.meaningful_version if state else 0,
+                    )
+                )
 
         async def write(session: AsyncSession) -> list[str]:
             batch_ids: list[str] = []
-            for dialog, messages in prepared:
+            for dialog, messages, historical_summary, state_version in prepared:
                 compact = compact_messages(messages)
                 if not compact:
                     continue
@@ -183,7 +228,9 @@ class AnalysisBatchBuilder:
                             "type": dialog.classification or dialog.dialog_type,
                             "participants": features["participants"],
                             "messages": compact,
+                            "historical_summary": historical_summary,
                             "local_features": features,
+                            "state_version": state_version,
                         },
                     },
                 )

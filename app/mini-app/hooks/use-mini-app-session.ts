@@ -48,9 +48,12 @@ export function useMiniAppSession() {
     };
   }, [apiBase, load]);
 
-  const advanceOnboarding = useCallback(async (step: OnboardingStep) => {
+  const advanceOnboarding = useCallback(async (
+    step: OnboardingStep,
+    status: "completed" | "skipped" = "completed",
+  ) => {
     if (!api || !session) return;
-    const onboarding = await api.updateOnboarding(step);
+    const onboarding = await api.updateOnboarding(step, status);
     setSession({
       ...session,
       auth: {

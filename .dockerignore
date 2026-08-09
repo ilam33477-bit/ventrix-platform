@@ -11,3 +11,12 @@ data
 backups
 public
 app
+tests
+docs
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.pdf
+._*
+.DS_Store

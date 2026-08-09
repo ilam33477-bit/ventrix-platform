@@ -11,6 +11,7 @@ from ..database import SQLiteTransactionManager
 from ..models import BackgroundJob, TenantQueueState
 
 AVAILABLE_STATUSES = ("pending", "scheduled", "waiting", "retry", "retry_scheduled")
+RESERVED_LANE_CATEGORIES = frozenset({"critical", "notification", "realtime"})
 HEAVY_JOB_TYPES = {
     "telegram_initial_sync",
     "telegram_incremental_sync",
@@ -51,6 +52,7 @@ class JobLease:
     dialog_id: str | None
     correlation_id: str | None
     job_type: str
+    category: str
     cost_class: str
     payload: dict[str, Any]
     attempts: int
@@ -94,6 +96,8 @@ class SQLiteJobQueue:
         is_heavy: bool | None = None,
         category: str = "general",
         cost_class: str = "light",
+        partition_key: str | None = None,
+        partition_sequence: int | None = None,
     ) -> str:
         if not job_type.strip():
             raise ValueError("job_type is required")
@@ -126,6 +130,8 @@ class SQLiteJobQueue:
                 is_heavy=job_type in HEAVY_JOB_TYPES if is_heavy is None else is_heavy,
                 category=category,
                 cost_class=cost_class,
+                partition_key=partition_key,
+                partition_sequence=partition_sequence,
             )
             session.add(job)
             await session.flush()
@@ -133,17 +139,30 @@ class SQLiteJobQueue:
 
         return await self.transactions.run(write)
 
-    async def claim_next(self, worker_id: str) -> JobLease | None:
+    async def claim_next(
+        self,
+        worker_id: str,
+        *,
+        allowed_categories: frozenset[str] | None = None,
+        telegram_account_id: str | None = None,
+    ) -> JobLease | None:
         now = datetime.now(UTC)
 
         async def write(session: AsyncSession) -> JobLease | None:
+            filters = [
+                BackgroundJob.status.in_(AVAILABLE_STATUSES),
+                BackgroundJob.scheduled_at <= now,
+            ]
+            if allowed_categories is not None:
+                if not allowed_categories:
+                    return None
+                filters.append(BackgroundJob.category.in_(allowed_categories))
+            if telegram_account_id is not None:
+                filters.append(BackgroundJob.telegram_account_id == telegram_account_id)
             candidates = list(
                 await session.scalars(
                     select(BackgroundJob)
-                    .where(
-                        BackgroundJob.status.in_(AVAILABLE_STATUSES),
-                        BackgroundJob.scheduled_at <= now,
-                    )
+                    .where(*filters)
                     .order_by(
                         BackgroundJob.priority.asc(),
                         BackgroundJob.scheduled_at.asc(),
@@ -195,10 +214,56 @@ class SQLiteJobQueue:
                     )
                 ).all()
             )
+            partition_keys = {item.partition_key for item in candidates if item.partition_key}
+            earliest_partition_sequence = (
+                dict(
+                    (
+                        await session.execute(
+                            select(
+                                BackgroundJob.partition_key,
+                                func.min(BackgroundJob.partition_sequence),
+                            )
+                            .where(
+                                BackgroundJob.partition_key.in_(partition_keys),
+                                BackgroundJob.status.in_((*AVAILABLE_STATUSES, "running")),
+                                BackgroundJob.partition_sequence.is_not(None),
+                            )
+                            .group_by(BackgroundJob.partition_key)
+                        )
+                    ).all()
+                )
+                if partition_keys
+                else {}
+            )
+            running_partitions = (
+                set(
+                    await session.scalars(
+                        select(BackgroundJob.partition_key).where(
+                            BackgroundJob.partition_key.in_(partition_keys),
+                            BackgroundJob.status == "running",
+                        )
+                    )
+                )
+                if partition_keys
+                else set()
+            )
             eligible = []
             for candidate in candidates:
+                if candidate.partition_key in running_partitions:
+                    continue
+                if (
+                    candidate.partition_key
+                    and candidate.partition_sequence is not None
+                    and earliest_partition_sequence.get(candidate.partition_key)
+                    != candidate.partition_sequence
+                ):
+                    continue
                 if candidate.tenant_id:
-                    if running_by_tenant.get(candidate.tenant_id, 0) >= self.max_active_tenant_jobs:
+                    if (
+                        candidate.category not in RESERVED_LANE_CATEGORIES
+                        and running_by_tenant.get(candidate.tenant_id, 0)
+                        >= self.max_active_tenant_jobs
+                    ):
                         continue
                     if (
                         candidate.is_heavy
@@ -263,6 +328,7 @@ class SQLiteJobQueue:
                 dialog_id=job.dialog_id,
                 correlation_id=job.correlation_id,
                 job_type=job.job_type,
+                category=job.category,
                 cost_class=job.cost_class,
                 payload=dict(job.payload_json),
                 attempts=job.attempts,

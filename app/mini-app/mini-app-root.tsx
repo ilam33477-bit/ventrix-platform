@@ -7,7 +7,7 @@ import { ConnectionManager } from "./features/connections/connection-manager";
 import { DashboardView } from "./features/dashboard/dashboard-view";
 import { OnboardingFlow } from "./features/onboarding/onboarding-flow";
 import { ProblemsView } from "./features/problems/problems-view";
-import { EmployeesView, GroupsView, MoreView, ReportsView, SettingsView } from "./features/sections/section-views";
+import { CommitmentsView, EmployeesView, GroupsView, MoreView, ReportsView, SettingsView } from "./features/sections/section-views";
 import { StatisticsView } from "./features/statistics/statistics-view";
 import { useMiniAppSession } from "./hooks/use-mini-app-session";
 import { MiniAppShell } from "./layout/app-shell";
@@ -33,13 +33,14 @@ export function MiniAppRoot() {
 
   const content = (() => {
     switch (activeTab) {
-      case "problems": return <ProblemsView problems={session.bootstrap.problems} />;
+      case "problems": return <ProblemsView api={api} />;
+      case "commitments": return <CommitmentsView api={api} onOpenProblem={() => setActiveTab("problems")} />;
       case "statistics": return <StatisticsView summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;
       case "employees": return <EmployeesView api={api} />;
       case "connections": return <ConnectionManager api={api} connections={session.bootstrap.connections} />;
       case "groups": return <GroupsView api={api} />;
-      case "settings": return <SettingsView />;
+      case "settings": return <SettingsView api={api} />;
       case "more": return <MoreView onNavigate={setActiveTab} />;
       default: return <DashboardView summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => setActiveTab("problems")} />;
     }

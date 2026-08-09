@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from typing import Any
 from uuid import uuid4
 
@@ -125,6 +125,21 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
     signal_immediate_threshold: Mapped[int] = mapped_column(
         Integer, default=85, server_default="85", nullable=False
     )
+    manager_notification_threshold: Mapped[int] = mapped_column(
+        Integer, default=65, server_default="65", nullable=False
+    )
+    employee_notification_threshold: Mapped[int] = mapped_column(
+        Integer, default=70, server_default="70", nullable=False
+    )
+    group_notification_threshold: Mapped[int] = mapped_column(
+        Integer, default=85, server_default="85", nullable=False
+    )
+    notification_immediate_threshold: Mapped[int] = mapped_column(
+        Integer, default=90, server_default="90", nullable=False
+    )
+    critical_fast_lane_rules: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, server_default="[]", nullable=False
+    )
     ai_daily_soft_limit: Mapped[int | None] = mapped_column(Integer)
     ai_daily_hard_limit: Mapped[int | None] = mapped_column(Integer)
     employee_notifications_enabled: Mapped[bool] = mapped_column(
@@ -136,8 +151,12 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
     client_onboarding_step: Mapped[str] = mapped_column(
         String(32), default="welcome", server_default="welcome", nullable=False
     )
-    client_onboarding_completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
+    client_onboarding_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    client_onboarding_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}", nullable=False
+    )
+    report_config_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}", nullable=False
     )
 
     @validates("timezone")
@@ -160,6 +179,13 @@ class TenantSettings(StringPrimaryKeyMixin, TimestampMixin, Base):
             "signal_problem_threshold BETWEEN signal_report_threshold AND 100 AND "
             "signal_immediate_threshold BETWEEN signal_problem_threshold AND 100",
             name="ck_tenant_settings_signal_thresholds",
+        ),
+        CheckConstraint(
+            "manager_notification_threshold BETWEEN 0 AND 100 AND "
+            "employee_notification_threshold BETWEEN 0 AND 100 AND "
+            "group_notification_threshold BETWEEN 0 AND 100 AND "
+            "notification_immediate_threshold BETWEEN 0 AND 100",
+            name="ck_tenant_settings_notification_thresholds",
         ),
         CheckConstraint(
             "ai_daily_soft_limit IS NULL OR ai_daily_soft_limit > 0",
@@ -295,6 +321,41 @@ class AuditLog(StringPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (Index("ix_audit_logs_tenant_created", "tenant_id", "created_at"),)
 
 
+class OwnerClientDraft(StringPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "owner_client_drafts"
+
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("platform_owner.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default="draft", server_default="draft", nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    schema_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+    prompt_version: Mapped[str] = mapped_column(
+        String(32), default="client-draft-v1", server_default="client-draft-v1", nullable=False
+    )
+    parse_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    raw_prompt_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary)
+    draft_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    corrections_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    manual_changes_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    parser_provider: Mapped[str | None] = mapped_column(String(64))
+    parser_model: Mapped[str | None] = mapped_column(String(100))
+    confirmation_key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    created_tenant_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="SET NULL"), index=True
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmation_actor_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
 class ProductEvent(StringPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "product_events"
 
@@ -381,6 +442,20 @@ class TelegramConnection(StringPrimaryKeyMixin, TimestampMixin, Base):
     health_status: Mapped[str] = mapped_column(
         String(32), default="unknown", server_default="unknown", nullable=False, index=True
     )
+    runtime_status: Mapped[str] = mapped_column(
+        String(32), default="stopped", server_default="stopped", nullable=False, index=True
+    )
+    runtime_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    reconnect_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updates_received: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    duplicate_events: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    catchup_events: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    edited_updates_received: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_reconnect_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_catchup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rate_limited_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     __table_args__ = (
@@ -390,6 +465,20 @@ class TelegramConnection(StringPrimaryKeyMixin, TimestampMixin, Base):
         ),
         Index("ix_telegram_connections_tenant_active", "tenant_id", "deleted_at"),
     )
+
+
+class TelegramRuntimeLease(TimestampMixin, Base):
+    __tablename__ = "telegram_runtime_leases"
+
+    connection_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("telegram_connections.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_instance_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    generation: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    lease_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class TelegramFolder(StringPrimaryKeyMixin, TimestampMixin, Base):
@@ -417,6 +506,9 @@ class TelegramDialog(StringPrimaryKeyMixin, TimestampMixin, Base):
         String(36), ForeignKey("telegram_connections.id", ondelete="CASCADE"), index=True
     )
     telegram_dialog_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    canonical_peer_id: Mapped[str] = mapped_column(
+        String(100), default="", server_default="", nullable=False, index=True
+    )
     folder_id: Mapped[int | None] = mapped_column(Integer, index=True)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     username: Mapped[str | None] = mapped_column(String(64))
@@ -447,6 +539,12 @@ class TelegramDialog(StringPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("connection_id", "telegram_dialog_id", name="uq_telegram_dialog_remote"),
     )
+
+    @validates("telegram_dialog_id")
+    def derive_canonical_peer_id(self, _key: str, value: int) -> int:
+        if not self.canonical_peer_id:
+            self.canonical_peer_id = str(value)
+        return value
 
 
 class InitialAnalysisRun(StringPrimaryKeyMixin, TimestampMixin, Base):
@@ -538,6 +636,12 @@ class TelegramMessage(StringPrimaryKeyMixin, TimestampMixin, Base):
     telegram_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sender_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     sender_username: Mapped[str | None] = mapped_column(String(64))
+    sender_role: Mapped[str] = mapped_column(
+        String(32), default="unknown", server_default="unknown", nullable=False, index=True
+    )
+    ingestion_source: Mapped[str] = mapped_column(
+        String(32), default="history", server_default="history", nullable=False, index=True
+    )
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -646,6 +750,38 @@ class DialogState(StringPrimaryKeyMixin, TimestampMixin, Base):
     last_ai_processed_message_id: Mapped[int | None] = mapped_column(BigInteger)
     last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     meaningful_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_report_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    awaiting_employee_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    awaiting_customer_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    response_expected_message_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("telegram_messages.id", ondelete="SET NULL")
+    )
+    next_sla_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_employee_reply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_customer_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MonitoredSource(StringPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "monitored_sources"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    connection_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("telegram_connections.id", ondelete="CASCADE"), index=True
+    )
+    canonical_peer_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", index=True)
+    added_via: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    telegram_link: Mapped[str | None] = mapped_column(String(500))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id", "canonical_peer_id", name="uq_monitored_source_connection_peer"
+        ),
+    )
 
 
 class Commitment(StringPrimaryKeyMixin, TimestampMixin, Base):
@@ -706,10 +842,13 @@ class OperationalProblem(StringPrimaryKeyMixin, TimestampMixin, Base):
     commitment_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("commitments.id", ondelete="SET NULL"), index=True
     )
+    responsible_employee_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("employees.id", ondelete="SET NULL"), index=True
+    )
     fingerprint: Mapped[str] = mapped_column(String(200), unique=True)
     problem_type: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(
-        String(32), default="open", server_default="open", index=True
+        String(32), default="new", server_default="new", nullable=False, index=True
     )
     priority: Mapped[str] = mapped_column(
         String(16), default="medium", server_default="medium", index=True
@@ -721,7 +860,56 @@ class OperationalProblem(StringPrimaryKeyMixin, TimestampMixin, Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_reason: Mapped[str | None] = mapped_column(Text)
+    resolution_evidence: Mapped[str | None] = mapped_column(Text)
+
+
+class ProblemTransition(StringPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "problem_transitions"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    problem_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("operational_problems.id", ondelete="CASCADE"), index=True
+    )
+    from_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    actor_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[str | None] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False, index=True
+    )
+
+
+class ProblemVerification(StringPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "problem_verifications"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    problem_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("operational_problems.id", ondelete="CASCADE"), index=True
+    )
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    method: Mapped[str] = mapped_column(String(64), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_message_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False, index=True
+    )
+    __table_args__ = (
+        CheckConstraint("confidence BETWEEN 0 AND 1", name="ck_problem_verification_confidence"),
+    )
 
 
 class FSMState(StringPrimaryKeyMixin, TimestampMixin, Base):
@@ -806,6 +994,8 @@ class BackgroundJob(StringPrimaryKeyMixin, TimestampMixin, Base):
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     delay_reason: Mapped[str | None] = mapped_column(String(200))
+    partition_key: Mapped[str | None] = mapped_column(String(200), index=True)
+    partition_sequence: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -817,6 +1007,12 @@ class BackgroundJob(StringPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_background_jobs_available", "status", "scheduled_at", "priority"),
         Index("ix_background_jobs_tenant_type", "tenant_id", "job_type"),
         Index("ix_background_jobs_fair_claim", "status", "priority", "scheduled_at", "tenant_id"),
+        Index(
+            "ix_background_jobs_partition_order",
+            "partition_key",
+            "partition_sequence",
+            "status",
+        ),
     )
 
 

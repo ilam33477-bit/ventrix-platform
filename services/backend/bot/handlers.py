@@ -21,12 +21,15 @@ from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from services.api.deepseek import DeepSeekProvider
+
 from ..config import Settings
 from ..jobs.queue import SQLiteJobQueue
 from ..models import (
     AIUsageMetric,
     BackgroundJob,
     OperationalProblem,
+    OwnerClientDraft,
     ProductEvent,
     Report,
     TelegramConnection,
@@ -35,12 +38,15 @@ from ..models import (
 )
 from ..scheduler.service import TenantAnalysisScheduler
 from ..schemas import AIProfileUpdate, BotCreate, TenantCreate, TenantUpdate
+from ..services.client_drafts import ClientDraftData, OwnerClientDraftService
 from ..services.encryption import EncryptionService
 from ..services.foundation import BotAlreadyExistsError, FoundationService
 from ..services.product_events import ProductEventService
 from ..services.telegram import BotTokenVerificationError, TelegramBotVerifier
 from .keyboards import (
     access_actions,
+    ai_draft_confirmation,
+    ai_draft_field_selector,
     ai_profile_actions,
     ai_recommendation_choice,
     back_to_owner_menu,
@@ -55,6 +61,7 @@ from .keyboards import (
     owner_main_menu,
     tenant_actions,
     tenant_bot_missing,
+    tenant_create_mode,
     tenant_edit_selector,
     tenant_selector,
 )
@@ -63,6 +70,7 @@ from .states import (
     BotCreateStates,
     BotRotateStates,
     TenantAccessStates,
+    TenantAICreateStates,
     TenantCreateStates,
     TenantEditStates,
 )
@@ -418,12 +426,200 @@ async def restart_flow(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "owner:tenant_create")
 async def tenant_create_start(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await render(
+        query,
+        "<b>Новый клиент</b>\n\nОпишите компанию одним сообщением — Ventrix соберёт проверяемый черновик. Или используйте ручную форму.",
+        tenant_create_mode(),
+    )
+
+
+@router.callback_query(F.data == "owner:tenant_create:manual")
+async def tenant_create_manual(query: CallbackQuery, state: FSMContext) -> None:
     await begin_flow(
         query,
         state,
         TenantCreateStates.name,
         "tenant_create",
         "<b>Новый клиент · 1/7</b>\n\nВведите название компании.",
+    )
+
+
+@router.callback_query(F.data == "owner:tenant_create:ai")
+async def tenant_create_ai(query: CallbackQuery, state: FSMContext) -> None:
+    await begin_flow(
+        query,
+        state,
+        TenantAICreateStates.prompt,
+        "tenant_create_ai",
+        "<b>Создание клиента с AI</b>\n\nОдним сообщением укажите компанию, Telegram user ID владельца, нишу, продукты, аудиторию, график и важные риски. Секреты и bot token сюда не отправляйте.",
+    )
+
+
+def ai_draft_text(data: ClientDraftData, version: int) -> str:
+    username = f"@{data.owner_telegram_username}" if data.owner_telegram_username else "—"
+    return (
+        f"<b>Черновик клиента · v{version}</b>\n\n"
+        f"Компания: <b>{escape(data.name)}</b>\n"
+        f"Владелец: {escape(data.owner_name)} · {data.owner_telegram_user_id} · {escape(username)}\n"
+        f"Ниша: {escape(data.niche)}\n"
+        f"Продукты: {escape(data.products_services)}\n"
+        f"Аудитория: {escape(data.target_audience)}\n"
+        f"Timezone: {escape(data.timezone)}\n"
+        f"SLA ответа: {data.response_sla_minutes} мин.\n"
+        f"Отчёт: {escape(data.daily_report_time)}\n\n"
+        f"Критичные события:\n{escape(data.critical_problem_criteria)}\n\n"
+        "Проверьте данные. До подтверждения клиент в БД не создаётся."
+    )
+
+
+def ai_draft_service(session: AsyncSession, settings: Settings) -> OwnerClientDraftService:
+    if not settings.deepseek_api_key:
+        raise RuntimeError("DeepSeek API is not configured")
+    return OwnerClientDraftService(
+        session,
+        DeepSeekProvider(
+            base_url=settings.deepseek_base_url,
+            timeout_seconds=settings.ai_request_timeout_seconds,
+            api_key_value=settings.deepseek_api_key.get_secret_value(),
+        ),
+        EncryptionService(settings.app_encryption_key.get_secret_value()),
+        settings.deepseek_fast_model,
+    )
+
+
+@router.message(TenantAICreateStates.prompt)
+async def tenant_ai_prompt(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    prompt = (message.text or "").strip()
+    if len(prompt) < 20:
+        await update_flow_screen(message, state, "Опишите клиента подробнее — минимум 20 символов.")
+        return
+    try:
+        async with session_factory() as session:
+            draft = await ai_draft_service(session, settings).create(
+                settings.platform_owner_telegram_id, prompt
+            )
+    except Exception as exc:
+        logger.exception("Owner AI client draft failed")
+        await update_flow_screen(
+            message, state, f"Не удалось собрать черновик: {escape(str(exc))}", cancel_flow()
+        )
+        return
+    await state.update_data(draft_id=draft.id)
+    await state.set_state(TenantAICreateStates.confirm)
+    await update_flow_screen(
+        message,
+        state,
+        ai_draft_text(ClientDraftData.model_validate(draft.draft_json), draft.version),
+        ai_draft_confirmation(),
+    )
+
+
+@router.callback_query(TenantAICreateStates.confirm, F.data == "flow:ai_draft:correct")
+async def tenant_ai_correction_start(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TenantAICreateStates.correction)
+    await render(query, "Опишите одним сообщением, что изменить в черновике.", cancel_flow())
+
+
+@router.callback_query(TenantAICreateStates.confirm, F.data == "flow:ai_draft:fields")
+async def tenant_ai_field_selector(query: CallbackQuery) -> None:
+    await render(query, "Какое поле изменить?", ai_draft_field_selector())
+
+
+@router.callback_query(F.data.startswith("flow:ai_draft:field:"))
+async def tenant_ai_field_start(query: CallbackQuery, state: FSMContext) -> None:
+    field = query.data.rsplit(":", 1)[-1]
+    await state.update_data(correction_field=field)
+    await state.set_state(TenantAICreateStates.correction)
+    await render(query, f"Введите новое значение поля <code>{escape(field)}</code>.", cancel_flow())
+
+
+@router.callback_query(TenantAICreateStates.confirm, F.data == "flow:ai_draft:back")
+async def tenant_ai_draft_back(
+    query: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    data = await state.get_data()
+    async with session_factory() as session:
+        draft = await session.get(OwnerClientDraft, str(data["draft_id"]))
+    if draft is None:
+        raise LookupError("Client draft not found")
+    await render(
+        query,
+        ai_draft_text(ClientDraftData.model_validate(draft.draft_json), draft.version),
+        ai_draft_confirmation(),
+    )
+
+
+@router.message(TenantAICreateStates.correction)
+async def tenant_ai_correction(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    data = await state.get_data()
+    correction = (message.text or "").strip()
+    if field := data.get("correction_field"):
+        correction = f"Измени только поле {field}. Новое значение: {correction}"
+    try:
+        async with session_factory() as session:
+            draft = await ai_draft_service(session, settings).correct(
+                settings.platform_owner_telegram_id,
+                str(data["draft_id"]),
+                correction,
+            )
+    except Exception as exc:
+        logger.exception("Owner AI client draft correction failed")
+        await update_flow_screen(message, state, f"Исправление не применено: {escape(str(exc))}")
+        return
+    await state.set_state(TenantAICreateStates.confirm)
+    await state.update_data(correction_field=None)
+    await update_flow_screen(
+        message,
+        state,
+        ai_draft_text(ClientDraftData.model_validate(draft.draft_json), draft.version),
+        ai_draft_confirmation(),
+    )
+
+
+@router.callback_query(TenantAICreateStates.confirm, F.data == "flow:ai_draft:confirm")
+async def tenant_ai_confirm(
+    query: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    telegram_verifier: TelegramBotVerifier,
+) -> None:
+    data = await state.get_data()
+    async with session_factory() as session:
+        draft = await session.get(OwnerClientDraft, str(data["draft_id"]))
+        if draft is None:
+            raise LookupError("Client draft not found")
+        if draft.created_tenant_id:
+            tenant = await service_for(session, settings, telegram_verifier).get_tenant(
+                draft.created_tenant_id
+            )
+        else:
+            payload = ClientDraftData.model_validate(draft.draft_json).tenant_payload()
+            foundation = service_for(session, settings, telegram_verifier)
+            tenant = await foundation.create_tenant(payload, commit=False)
+            draft.created_tenant_id = tenant.id
+            draft.status = "confirmed"
+            draft.confirmed_at = datetime.now(UTC)
+            await session.commit()
+            tenant = await foundation.get_tenant(tenant.id)
+    await state.clear()
+    await render(
+        query,
+        "Клиент создан из подтверждённого AI-черновика.\n\n" + tenant_card(tenant),
+        tenant_actions(tenant.id, suspended=tenant.status != "active"),
     )
 
 

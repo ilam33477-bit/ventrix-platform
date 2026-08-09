@@ -10,6 +10,7 @@ from sqlalchemy import func, select, text
 
 from ..config import get_settings
 from ..database import get_session_factory
+from ..metrics import collect_runtime_metrics
 from ..models import BackgroundJob, BotInstance, RuntimeHealth, TelegramConnection
 from ..services.encryption import EncryptionService
 from .client_router import router as client_router
@@ -45,6 +46,10 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/health/live", tags=["system"])
+    async def health_live() -> dict[str, str]:
+        return {"status": "live"}
+
     @app.get("/ready", tags=["system"])
     async def ready(response: Response) -> dict[str, str]:
         try:
@@ -56,6 +61,15 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001 - readiness must convert dependency failures to 503
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": "not_ready"}
+
+    @app.get("/health/ready", tags=["system"])
+    async def health_ready(response: Response) -> dict[str, str]:
+        return await ready(response)
+
+    @app.get("/metrics", tags=["system"])
+    async def metrics() -> dict[str, object]:
+        async with get_session_factory()() as session:
+            return await collect_runtime_metrics(session)
 
     @app.get("/health/details", tags=["system"])
     async def health_details() -> dict[str, object]:

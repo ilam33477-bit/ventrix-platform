@@ -1,0 +1,58 @@
+services:
+  backend:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["api"]
+    volumes: &ventrix-volumes
+      - ./data:/app/data
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:8010:8000"
+    restart: unless-stopped
+
+  background-worker:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["worker"]
+    volumes: *ventrix-volumes
+    depends_on: &healthy-backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  telegram-session-runtime:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["python", "-m", "services.backend.telegram_sessions.runtime"]
+    volumes: *ventrix-volumes
+    depends_on: *healthy-backend
+    restart: unless-stopped
+
+  client-bots:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["client-bots"]
+    volumes: *ventrix-volumes
+    depends_on: *healthy-backend
+    restart: unless-stopped
+
+  owner-bot:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["bot"]
+    volumes: *ventrix-volumes
+    depends_on: *healthy-backend
+    restart: unless-stopped
+
+  scheduler:
+    image: ventrix-app:20260809-hardening2
+    env_file: .env
+    command: ["scheduler"]
+    volumes: *ventrix-volumes
+    depends_on: *healthy-backend
+    restart: unless-stopped

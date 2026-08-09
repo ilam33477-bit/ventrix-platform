@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -21,7 +22,7 @@ from ..models import (
     TelegramSyncCursor,
 )
 from ..services.encryption import EncryptionService
-from .gateway import LoginResult, TelegramSessionRevoked, TelegramUserGateway
+from .gateway import LoginResult, TelegramSessionRevoked, TelegramUserGateway, TelethonGateway
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,30 @@ class TelegramConnectionService:
     async def refresh_catalog(
         self, tenant_id: str, connection_id: str | None = None
     ) -> TelegramConnection:
+        if not isinstance(self.gateway, TelethonGateway):
+            return await self._legacy_refresh_catalog(tenant_id, connection_id)
+        connection = await self.get(tenant_id, connection_id)
+        if connection is None or connection.session_secret_id is None:
+            raise TelegramConnectionError("connected session is required")
+        job_id = await self.queue.enqueue(
+            "telegram.refresh_catalog",
+            {},
+            tenant_id=tenant_id,
+            telegram_account_id=connection.id,
+            category="telegram_rpc",
+            idempotency_key=(f"telegram-catalog:{connection.id}:{datetime.now(UTC):%Y%m%d%H%M%S}"),
+            max_attempts=5,
+        )
+        await self._wait_for_runtime_job(job_id)
+        refreshed = await self.get(tenant_id, connection.id)
+        if refreshed is None:
+            raise TelegramConnectionError("connection disappeared")
+        return refreshed
+
+    async def _legacy_refresh_catalog(
+        self, tenant_id: str, connection_id: str | None = None
+    ) -> TelegramConnection:
+        """Deprecated test adapter; production catalog RPC is owned by TelegramSessionActor."""
         connection, session_string = await self.connection_session(tenant_id, connection_id)
         folders = await self.gateway.list_folders(session_string)
         dialogs = await self.gateway.list_dialogs(session_string)
@@ -292,7 +317,9 @@ class TelegramConnectionService:
                     tenant_id=tenant_id,
                     connection_id=connection.id,
                     telegram_dialog_id=remote.id,
+                    canonical_peer_id=str(remote.id),
                 )
+                row.canonical_peer_id = str(remote.id)
                 row.title = remote.title
                 row.username = remote.username
                 row.dialog_type = remote.dialog_type
@@ -301,10 +328,14 @@ class TelegramConnectionService:
                 row.participants_count = remote.participants_count
                 row.last_message_at = remote.last_message_at
                 if remote.dialog_type == "personal":
-                    row.classification = "unknown"
-                    row.confidence = 0.0
-                    row.requires_user_confirmation = True
+                    row.classification = "auto_personal"
+                    row.confidence = 1.0
+                    row.requires_user_confirmation = False
+                    row.selected = True
+                    row.excluded = False
+                elif row.id is None:
                     row.selected = False
+                    row.excluded = False
                 if row.id is None:
                     session.add(row)
             current = await session.get(TelegramConnection, connection.id)
@@ -318,6 +349,64 @@ class TelegramConnectionService:
 
         await self.transactions.run(write)
         return await self.get(tenant_id, connection.id)
+
+    async def _wait_for_runtime_job(self, job_id: str, timeout_seconds: float = 30.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            job = await self.queue.get(job_id)
+            if job is not None and job.status == "completed":
+                return
+            if job is not None and job.status in {"failed", "cancelled"}:
+                raise TelegramConnectionError(f"Telegram runtime RPC failed: {job.status}")
+            await asyncio.sleep(0.1)
+        raise TelegramConnectionError("Telegram runtime RPC timed out")
+
+    async def activate_default_scope(
+        self,
+        tenant_id: str,
+        *,
+        history_days: int = 7,
+        connection_id: str | None = None,
+    ) -> TelegramConnection:
+        if history_days not in {3, 7, 14, 30}:
+            raise ValueError("history_days must be 3, 7, 14 or 30")
+
+        async def write(session: AsyncSession) -> None:
+            connection = await session.scalar(
+                select(TelegramConnection).where(
+                    TelegramConnection.id == connection_id,
+                    TelegramConnection.tenant_id == tenant_id,
+                    TelegramConnection.deleted_at.is_(None),
+                )
+            )
+            if connection is None:
+                raise TelegramConnectionError("connected session is required")
+            connection.personal_dialogs_consent = True
+            connection.history_days = history_days
+            connection.selected_folder_id = None
+            connection.selected_folder_ids = []
+            connection.selected_folder_title = None
+            connection.progress_stage = "personal_sources_enabled"
+            connection.progress_percent = 30
+            dialogs = list(
+                await session.scalars(
+                    select(TelegramDialog).where(TelegramDialog.connection_id == connection.id)
+                )
+            )
+            for dialog in dialogs:
+                if dialog.dialog_type == "personal":
+                    dialog.selected = True
+                    dialog.excluded = False
+                    dialog.classification = "auto_personal"
+                    dialog.requires_user_confirmation = False
+                else:
+                    dialog.selected = False
+
+        await self.transactions.run(write)
+        result = await self.get(tenant_id, connection_id)
+        if result is None:
+            raise TelegramConnectionError("connection disappeared")
+        return result
 
     async def list_folders(
         self, tenant_id: str, connection_id: str | None = None
@@ -373,7 +462,9 @@ class TelegramConnectionService:
             connection.selected_folder_id = folder_ids[0]
             connection.selected_folder_ids = folder_ids
             connection.selected_folder_title = ", ".join(by_id[item].title for item in folder_ids)
-            connection.personal_dialogs_consent = personal_dialogs_consent
+            # Legacy folder configuration may still call this endpoint. The current
+            # source policy always monitors personal dialogs; groups remain opt-in.
+            connection.personal_dialogs_consent = True
             connection.history_days = history_days
             connection.progress_stage = "scope_selected"
             connection.progress_percent = 30
@@ -384,8 +475,10 @@ class TelegramConnectionService:
             )
             for dialog in dialogs:
                 in_work_folder = dialog.folder_id in folder_ids
-                personal_candidate = personal_dialogs_consent and dialog.dialog_type == "personal"
+                personal_candidate = dialog.dialog_type == "personal"
                 dialog.selected = (in_work_folder or personal_candidate) and not dialog.excluded
+                if personal_candidate:
+                    dialog.requires_user_confirmation = False
 
         await self.transactions.run(write)
         result = await self.get(tenant_id, connection_id)
@@ -474,6 +567,7 @@ class TelegramConnectionService:
 
         run_id = await self.transactions.run(write)
         async with self.session_factory() as session:
+            current_run = await session.get(InitialAnalysisRun, run_id)
             cursor_ids = list(
                 await session.scalars(
                     select(TelegramSyncCursor.id).where(TelegramSyncCursor.run_id == run_id)
@@ -484,7 +578,10 @@ class TelegramConnectionService:
                 "telegram.sync_chat",
                 {"cursor_id": cursor_id},
                 tenant_id=tenant_id,
+                telegram_account_id=current_run.connection_id,
                 idempotency_key=f"telegram-sync:{cursor_id}:0",
+                category="telegram_rpc",
+                cost_class="light",
                 max_attempts=8,
             )
         async with self.session_factory() as session:
@@ -564,18 +661,33 @@ class TelegramConnectionService:
         await self.transactions.run(write)
 
     async def disconnect(self, tenant_id: str, connection_id: str | None = None) -> None:
-        try:
-            target, session_string = await self.connection_session(tenant_id, connection_id)
+        target = await self.get(tenant_id, connection_id)
+        if target is not None:
             connection_id = target.id
-        except TelegramConnectionError:
-            session_string = ""
-        if session_string:
+        if (
+            target is not None
+            and target.session_secret_id
+            and isinstance(self.gateway, TelethonGateway)
+        ):
+            job_id = await self.queue.enqueue(
+                "telegram.logout",
+                {},
+                tenant_id=tenant_id,
+                telegram_account_id=target.id,
+                category="telegram_rpc",
+                idempotency_key=f"telegram-logout:{target.id}",
+                max_attempts=2,
+            )
             try:
-                await self.gateway.terminate_session(session_string)
+                await self._wait_for_runtime_job(job_id)
             except Exception as exc:  # noqa: BLE001 - local removal must still complete
                 logger.warning("Remote Telegram logout failed (%s)", type(exc).__name__)
-            finally:
-                session_string = ""
+        elif target is not None and target.session_secret_id:
+            _, session_string = await self.connection_session(tenant_id, target.id)
+            try:
+                await self.gateway.terminate_session(session_string)
+            except Exception as exc:  # noqa: BLE001 - test adapter logout is best effort
+                logger.warning("Remote Telegram logout failed (%s)", type(exc).__name__)
 
         async def write(session: AsyncSession) -> None:
             query = select(TelegramConnection).where(
@@ -648,6 +760,29 @@ class TelegramConnectionService:
         await self.transactions.run(write)
 
     async def check_health(
+        self, tenant_id: str, connection_id: str | None = None
+    ) -> TelegramConnection:
+        connection = await self.get(tenant_id, connection_id)
+        if connection is None or connection.session_secret_id is None:
+            raise TelegramConnectionError("connected session is required")
+        if isinstance(self.gateway, TelethonGateway):
+            job_id = await self.queue.enqueue(
+                "telegram.health",
+                {},
+                tenant_id=tenant_id,
+                telegram_account_id=connection.id,
+                category="telegram_rpc",
+                idempotency_key=(f"telegram-health:{connection.id}:{datetime.now(UTC):%Y%m%d%H%M}"),
+                max_attempts=3,
+            )
+            await self._wait_for_runtime_job(job_id)
+            result = await self.get(tenant_id, connection.id)
+            if result is None:
+                raise TelegramConnectionError("connection disappeared")
+            return result
+        return await self._legacy_check_health(tenant_id, connection_id)
+
+    async def _legacy_check_health(
         self, tenant_id: str, connection_id: str | None = None
     ) -> TelegramConnection:
         connection, session_string = await self.connection_session(tenant_id, connection_id)

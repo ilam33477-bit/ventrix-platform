@@ -13,8 +13,14 @@ from sqlalchemy import select, update
 from services.backend.bot.sqlite_storage import SQLiteFSMStorage
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.jobs.worker import HANDLERS, BackgroundWorker
-from services.backend.models import BackgroundJob, FSMState
+from services.backend.models import (
+    BackgroundJob,
+    FSMState,
+    TelegramConnection,
+    TelegramRuntimeLease,
+)
 from services.backend.scripts.backup_sqlite import backup_database, restore_database
+from services.backend.telegram_sessions.leases import TelegramRuntimeLeaseStore
 
 
 @pytest.mark.asyncio
@@ -168,6 +174,72 @@ async def test_multiple_sqlite_workers_claim_each_job_once(session_factory) -> N
     assert all(job.status == "completed" for job in jobs)
     assert all(job.attempts == 0 for job in jobs)
     assert len({job.result_json["worker"] for job in jobs}) >= 2
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_claims_only_its_categories(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    telegram_id = await queue.enqueue("telegram.fetch_updates", {}, category="telegram")
+    ai_id = await queue.enqueue("signal.ai_triage", {}, category="ai_fast")
+    notification_id = await queue.enqueue("notification.manager", {}, category="notification")
+
+    ai = await queue.claim_next("ai-pool", allowed_categories=frozenset({"ai_fast"}))
+    notification = await queue.claim_next(
+        "notification-pool", allowed_categories=frozenset({"notification"})
+    )
+    telegram = await queue.claim_next("telegram-pool", allowed_categories=frozenset({"telegram"}))
+
+    assert ai is not None and ai.id == ai_id
+    assert notification is not None and notification.id == notification_id
+    assert telegram is not None and telegram.id == telegram_id
+
+
+@pytest.mark.asyncio
+async def test_telegram_runtime_lease_fences_previous_owner(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, telegram_user_id=100, status="ready")
+        session.add(connection)
+        await session.commit()
+
+    leases = TelegramRuntimeLeaseStore(session_factory, ttl_seconds=30)
+    first = await leases.acquire(connection.id, "runtime-a")
+    assert first is not None and first.generation == 1
+    assert await leases.acquire(connection.id, "runtime-b") is None
+
+    async with session_factory() as session:
+        await session.execute(
+            update(TelegramRuntimeLease)
+            .where(TelegramRuntimeLease.connection_id == connection.id)
+            .values(lease_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+
+    second = await leases.acquire(connection.id, "runtime-b")
+    assert second is not None and second.generation == 2
+    assert not await leases.is_current(first)
+    assert await leases.heartbeat(first) is None
+    assert not await leases.release(first)
+    assert await leases.is_current(second)
+
+
+@pytest.mark.asyncio
+async def test_partitioned_jobs_are_claimed_in_sequence(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    later = await queue.enqueue(
+        "system.echo", {"order": 2}, partition_key="dialog:1", partition_sequence=2
+    )
+    earlier = await queue.enqueue(
+        "system.echo", {"order": 1}, partition_key="dialog:1", partition_sequence=1
+    )
+    first = await queue.claim_next("ordered-worker")
+    assert first is not None and first.id == earlier
+    assert await queue.claim_next("parallel-worker") is None
+    await queue.complete(first)
+    second = await queue.claim_next("ordered-worker")
+    assert second is not None and second.id == later
 
 
 def test_consistent_backup_and_restore(tmp_path) -> None:

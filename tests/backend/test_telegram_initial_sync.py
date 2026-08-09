@@ -5,12 +5,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, select
 
+from services.backend.intelligence.signals import SignalService
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.jobs.worker import BackgroundWorker
 from services.backend.models import (
+    BackgroundJob,
     EncryptedSecret,
     InitialAnalysisRun,
-    OperationalProblem,
+    Signal,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
@@ -155,28 +157,40 @@ async def test_folder_scope_resumable_batches_problems_and_personal_consent(
         batch_pause_seconds=0.001,
     )
     queue = SQLiteJobQueue(session_factory)
-    worker = BackgroundWorker(queue, "sync-worker", {"telegram.sync_chat": sync.sync_chat})
+    signal_service = SignalService(session_factory, queue)
+    worker = BackgroundWorker(
+        queue,
+        "sync-worker",
+        {
+            "telegram.sync_chat": sync.sync_chat,
+            "signal.local_scan": signal_service.local_scan_job,
+            "signal.scan_batch": signal_service.scan_batch_job,
+        },
+    )
     while await worker.run_once():
         pass
 
     async with session_factory() as session:
         completed = await session.get(InitialAnalysisRun, run.id)
         messages = await session.scalar(select(func.count(TelegramMessage.id)))
-        problems = list(await session.scalars(select(OperationalProblem)))
+        signals = list(await session.scalars(select(Signal)))
+        jobs = list(await session.scalars(select(BackgroundJob)))
         personal = await session.scalar(
             select(TelegramDialog).where(TelegramDialog.dialog_type == "personal")
         )
     assert completed.status == "completed" and completed.progress_percent == 100
-    assert messages == 1
-    assert problems[0].problem_type == "client_without_answer"
-    assert problems[0].evidence.startswith("Когда")
-    assert personal.selected is False and personal.requires_user_confirmation is True
-    assert gateway.fetch_calls == [(1001, 0)]
+    assert messages == 2
+    assert {item.signal_type for item in signals} >= {"contract_question"}, [
+        (item.job_type, item.status, item.last_error) for item in jobs
+    ]
+    assert personal.selected is True and personal.requires_user_confirmation is False
+    assert gateway.fetch_calls == [(1001, 0), (1002, 0)]
 
-    # Re-running the same handler/job input cannot duplicate messages or problems.
+    # Initial sync now enters the same Signal lifecycle as incremental ingestion.
     async with session_factory() as session:
-        assert await session.scalar(select(func.count(TelegramMessage.id))) == 1
-        assert await session.scalar(select(func.count(OperationalProblem.id))) == 1
+        assert await session.scalar(select(func.count(TelegramMessage.id))) == 2
+        signal_count = await session.scalar(select(func.count(Signal.id)))
+        assert signal_count == len(signals)
 
 
 @pytest.mark.asyncio

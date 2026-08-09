@@ -17,9 +17,14 @@ export type ConnectionState =
 
 export type OnboardingStep =
   | "welcome"
+  | "mini_guide"
   | "telegram_connection"
-  | "scope_selection"
-  | "employees_review"
+  | "monitoring_started"
+  | "employees"
+  | "notifications"
+  | "reports"
+  | "groups"
+  | "final_review"
   | "completed";
 
 export type ClientOnboarding = {
@@ -27,6 +32,7 @@ export type ClientOnboarding = {
   completed: boolean;
   completed_at: string | null;
   steps: OnboardingStep[];
+  statuses: Partial<Record<OnboardingStep, "completed" | "skipped">>;
 };
 
 export type DashboardSummary = {
@@ -69,7 +75,48 @@ export type Problem = {
   evidence: string;
   explanation: string;
   recommended_action: string;
+  status: ProblemStatus;
+  responsible_employee_id: string | null;
+  deadline_at: string | null;
   occurred_at: string;
+};
+
+export type ProblemStatus =
+  | "new" | "needs_confirmation" | "acknowledged" | "assigned"
+  | "in_progress" | "waiting" | "resolved" | "auto_resolved"
+  | "false_positive" | "ignored" | "reopened";
+
+export type ProblemDetail = Problem & {
+  closed_reason: string | null;
+  resolution_evidence: string | null;
+  transitions: Array<{
+    from_status: string;
+    to_status: string;
+    actor_type: string;
+    reason: string;
+    evidence: string | null;
+    occurred_at: string;
+  }>;
+  verifications: Array<{
+    outcome: string;
+    confidence: number;
+    method: string;
+    reason: string;
+    evidence_message_ids: string[];
+    checked_at: string;
+  }>;
+};
+
+export type Commitment = {
+  id: string;
+  type: string;
+  status: string;
+  expected_action: string;
+  deadline_at: string | null;
+  employee_id: string | null;
+  dialog_id: string;
+  confidence: number;
+  linked_problem_id: string | null;
 };
 
 export type TelegramConnection = {
@@ -93,6 +140,7 @@ export type Employee = {
   status: string;
   notifications_enabled: boolean;
   criticality_threshold: number;
+  access_status?: string | null;
 };
 
 export type GroupIntegration = {
@@ -103,6 +151,7 @@ export type GroupIntegration = {
   participants_count: number;
   notifications_enabled: boolean;
   minimum_criticality: number;
+  reminder_cooldown_minutes?: number;
 };
 
 export type ReportSummary = {
@@ -112,6 +161,31 @@ export type ReportSummary = {
   period_start?: string;
   period_end?: string;
   created_at?: string;
+};
+
+export type ReportDetail = ReportSummary & {
+  period: { start: string; end: string };
+  sections: Array<{ key: string; position: number; data: Record<string, unknown> }>;
+  metrics: Record<string, number>;
+  problem_ids: string[];
+};
+
+export type ClientSettings = {
+  timezone: string;
+  daily_report_time: string;
+  analysis_enabled: boolean;
+  enabled_days: number[];
+  history_window_days: number;
+  signal_report_threshold: number;
+  signal_problem_threshold: number;
+  signal_immediate_threshold: number;
+  manager_notification_threshold: number;
+  employee_notification_threshold: number;
+  group_notification_threshold: number;
+  notification_immediate_threshold: number;
+  employee_notifications_enabled: boolean;
+  group_reminders_enabled: boolean;
+  next_analysis_at: string | null;
 };
 
 export type AnalysisProgress = {
@@ -147,9 +221,39 @@ export type Bootstrap = {
 
 export type Folder = { id: number; title: string; chat_count: number };
 
+export type TelegramSource = {
+  id: string;
+  canonical_peer_id: string;
+  type: "group" | "channel";
+  title: string;
+  enabled: boolean;
+  added_via: string;
+  metadata: { participants_count?: number | null };
+};
+
+export type TelegramSourcePreview = {
+  kind: "group" | "folder";
+  token: string;
+  requires_join: boolean;
+  peers: Array<{
+    canonical_peer_id: string;
+    title: string;
+    source_type: "group" | "channel";
+    participants_count?: number | null;
+  }>;
+};
+
+export type AsyncJob<T = Record<string, unknown>> = {
+  id: string;
+  status: string;
+  result: T | null;
+  last_error: string | null;
+};
+
 export type TabId =
   | "dashboard"
   | "problems"
+  | "commitments"
   | "statistics"
   | "reports"
   | "employees"

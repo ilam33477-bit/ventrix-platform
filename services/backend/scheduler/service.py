@@ -225,7 +225,7 @@ class TenantAnalysisScheduler:
         for connection in connections:
             job_ids.append(
                 await self.queue.enqueue(
-                    "telegram.fetch_updates",
+                    "telegram.catch_up",
                     {},
                     tenant_id=connection.tenant_id,
                     telegram_account_id=connection.id,
@@ -233,7 +233,7 @@ class TenantAnalysisScheduler:
                     idempotency_key=f"telegram-fetch:{connection.id}:bucket:{fetch_bucket}",
                     correlation_id=str(uuid4()),
                     is_heavy=False,
-                    category="telegram",
+                    category="telegram_rpc",
                     cost_class="light",
                     max_attempts=8,
                 )

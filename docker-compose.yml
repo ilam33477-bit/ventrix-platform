@@ -39,6 +39,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  telegram-session-runtime:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "services.backend.telegram_sessions.runtime"]
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
   scheduler:
     build: .
     env_file: .env

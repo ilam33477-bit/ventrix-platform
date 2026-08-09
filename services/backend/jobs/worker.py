@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
@@ -23,10 +24,9 @@ from ..intelligence.reconciliation import ReconciliationService
 from ..intelligence.signals import SignalService
 from ..observability import configure_structured_logging, log_event
 from ..services.encryption import EncryptionService
+from ..telegram_sessions.event_ingestion import TelegramEventIngestion
 from ..telegram_sessions.gateway import TelethonGateway
-from ..telegram_sessions.incremental import IncrementalTelegramIngestion
 from ..telegram_sessions.service import TelegramConnectionService
-from ..telegram_sessions.sync import TelegramSyncHandlers
 from .maintenance import MaintenanceJobHandlers
 from .queue import JobDeferred, JobLease, SQLiteJobQueue
 
@@ -57,11 +57,15 @@ class BackgroundWorker:
         worker_id: str,
         handlers: dict[str, JobHandler],
         heartbeat_seconds: float = 10.0,
+        allowed_categories: frozenset[str] | None = None,
+        telegram_account_id: str | None = None,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
         self.handlers = handlers
         self.heartbeat_seconds = heartbeat_seconds
+        self.allowed_categories = allowed_categories
+        self.telegram_account_id = telegram_account_id
 
     async def _heartbeat(self, lease: JobLease) -> None:
         while True:
@@ -70,7 +74,11 @@ class BackgroundWorker:
                 return
 
     async def run_once(self) -> bool:
-        lease = await self.queue.claim_next(self.worker_id)
+        lease = await self.queue.claim_next(
+            self.worker_id,
+            allowed_categories=self.allowed_categories,
+            telegram_account_id=self.telegram_account_id,
+        )
         if lease is None:
             return False
         handler = self.handlers.get(lease.job_type)
@@ -78,6 +86,20 @@ class BackgroundWorker:
             await self.queue.fail(lease, LookupError("unsupported job type"))
             return True
         heartbeat = asyncio.create_task(self._heartbeat(lease))
+        started = time.perf_counter()
+        log_event(
+            logger,
+            logging.INFO,
+            "background_job_started",
+            job_id=lease.id,
+            tenant_id=lease.tenant_id,
+            account_id=lease.telegram_account_id,
+            dialog_id=lease.dialog_id,
+            correlation_id=lease.correlation_id,
+            stage=lease.job_type,
+            category=lease.category,
+            worker_id=self.worker_id,
+        )
         try:
             result = await handler(lease)
         except JobDeferred as exc:
@@ -96,6 +118,20 @@ class BackgroundWorker:
             )
         else:
             await self.queue.complete(lease, result)
+            log_event(
+                logger,
+                logging.INFO,
+                "background_job_completed",
+                job_id=lease.id,
+                tenant_id=lease.tenant_id,
+                account_id=lease.telegram_account_id,
+                dialog_id=lease.dialog_id,
+                correlation_id=lease.correlation_id,
+                stage=lease.job_type,
+                category=lease.category,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                worker_id=self.worker_id,
+            )
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
@@ -119,34 +155,18 @@ async def run() -> None:
             "telegram": settings.max_active_telegram_requests,
             "sync": settings.max_active_sync_jobs,
             "report": settings.max_active_report_jobs,
+            "notification": settings.max_active_notification_jobs,
         },
     )
     worker_id = f"{settings.worker_id}:{socket.gethostname()}:{os.getpid()}"
     handlers = dict(HANDLERS)
     connection_service = None
-    incremental = None
     encryption = EncryptionService(settings.app_encryption_key.get_secret_value())
     if settings.telegram_api_id and settings.telegram_api_hash:
         gateway = TelethonGateway(
             settings.telegram_api_id, settings.telegram_api_hash.get_secret_value()
         )
-        telegram_handlers = TelegramSyncHandlers(
-            session_factory,
-            encryption,
-            gateway,
-            batch_size=settings.telegram_sync_batch_size,
-            batch_pause_seconds=settings.telegram_sync_batch_pause_seconds,
-            max_messages_per_chat=settings.telegram_sync_max_messages_per_chat,
-        )
-        handlers["telegram.sync_chat"] = telegram_handlers.sync_chat
         connection_service = TelegramConnectionService(session_factory, encryption, gateway)
-        incremental = IncrementalTelegramIngestion(
-            session_factory,
-            encryption,
-            gateway,
-            queue,
-            batch_size=settings.telegram_sync_batch_size,
-        )
     provider = None
     if settings.deepseek_api_key:
         provider = DeepSeekProvider(
@@ -171,6 +191,7 @@ async def run() -> None:
         fsm_ttl_hours=settings.fsm_ttl_hours,
     )
     signals = SignalService(session_factory, queue)
+    event_ingestion = TelegramEventIngestion(session_factory, queue)
     triage = AITriageService(
         session_factory,
         queue,
@@ -183,6 +204,8 @@ async def run() -> None:
         session_factory,
         queue,
         notification_cooldown_minutes=settings.notification_cooldown_minutes,
+        verification_provider=provider,
+        verification_model=settings.deepseek_fast_model,
     )
     notification_sender = TelegramBotNotificationSender(
         session_factory,
@@ -195,6 +218,7 @@ async def run() -> None:
             "analysis.pipeline": analysis.pipeline,
             "analysis.connection": analysis.pipeline,
             "analysis.deep": analysis.pipeline,
+            "analysis.aggregate": analysis.aggregate_tenant_run,
             "telegram_initial_sync": maintenance.telegram_sync,
             "telegram_incremental_sync": maintenance.telegram_sync,
             "dialog_classification": maintenance.dialog_classification,
@@ -211,8 +235,12 @@ async def run() -> None:
             "cleanup": maintenance.cleanup,
             "retry_failed_job": maintenance.retry_failed_job,
             "signal.local_scan": signals.local_scan_job,
+            "signal.scan_batch": signals.scan_batch_job,
+            "telegram.ingest_event": event_ingestion.ingest,
             "signal.ai_triage": triage.triage,
             "commitment.reconcile": reconciliation.reconcile,
+            "commitment.deadline_check": reconciliation.deadline_check,
+            "dialog.sla_check": reconciliation.sla_check,
             "problem.evaluate": reconciliation.evaluate_problem,
             "analysis.hourly": reconciliation.reconcile,
             "notification.employee": notification_dispatcher.dispatch,
@@ -221,25 +249,73 @@ async def run() -> None:
             "maintenance.session_health": maintenance.session_health_check,
         }
     )
-    if incremental is not None:
-        handlers["telegram.fetch_updates"] = incremental.fetch_updates
-        handlers["telegram.history_sync"] = maintenance.telegram_sync
-    worker = BackgroundWorker(
-        queue, worker_id, handlers, heartbeat_seconds=settings.worker_heartbeat_seconds
-    )
     lock_timeout = timedelta(seconds=settings.worker_lock_timeout_seconds)
     await queue.recover_stale(lock_timeout)
     storage = SQLiteFSMStorage(session_factory, ttl=timedelta(hours=settings.fsm_ttl_hours))
-    cleanup_counter = 0
-    while True:
-        worked = await worker.run_once()
-        cleanup_counter += 1
-        if cleanup_counter >= 300:
+
+    pool_specs = (
+        (
+            "realtime",
+            frozenset({"realtime", "critical"}),
+            settings.worker_realtime_concurrency,
+        ),
+        (
+            "notification",
+            frozenset({"notification"}),
+            settings.worker_notification_concurrency,
+        ),
+        (
+            "telegram",
+            frozenset({"telegram", "sync", "historical"}),
+            settings.worker_telegram_concurrency,
+        ),
+        ("ai", frozenset({"ai", "ai_fast"}), settings.worker_ai_concurrency),
+        (
+            "heavy",
+            frozenset({"ai_heavy", "analysis", "report"}),
+            settings.worker_heavy_concurrency,
+        ),
+        (
+            "general",
+            frozenset({"general", "reconciliation"}),
+            settings.worker_general_concurrency,
+        ),
+    )
+
+    async def worker_loop(worker: BackgroundWorker) -> None:
+        while True:
+            if not await worker.run_once():
+                await asyncio.sleep(settings.worker_poll_interval_seconds)
+
+    async def maintenance_loop() -> None:
+        while True:
+            await asyncio.sleep(min(60.0, float(settings.worker_lock_timeout_seconds) / 2))
             await storage.cleanup_expired()
             await queue.recover_stale(lock_timeout)
-            cleanup_counter = 0
-        if not worked:
-            await asyncio.sleep(settings.worker_poll_interval_seconds)
+
+    log_event(
+        logger,
+        logging.INFO,
+        "background_worker_pools_started",
+        worker_id=worker_id,
+        pools={name: concurrency for name, _, concurrency in pool_specs},
+    )
+    async with asyncio.TaskGroup() as tasks:
+        for pool_name, categories, concurrency in pool_specs:
+            for index in range(concurrency):
+                tasks.create_task(
+                    worker_loop(
+                        BackgroundWorker(
+                            queue,
+                            f"{worker_id}:{pool_name}:{index + 1}",
+                            handlers,
+                            heartbeat_seconds=settings.worker_heartbeat_seconds,
+                            allowed_categories=categories,
+                        )
+                    ),
+                    name=f"worker-{pool_name}-{index + 1}",
+                )
+        tasks.create_task(maintenance_loop(), name="worker-maintenance")
 
 
 def main() -> None:

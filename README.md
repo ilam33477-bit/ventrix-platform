@@ -17,17 +17,19 @@
 - динамический запуск, остановка, перезапуск, проверка, ротация token и soft-delete bot instance;
 - owner-only авторизация в клиентском боте и product events со статистикой;
 - inline-first интерфейс обоих Telegram-ботов: callback-навигация, редактируемые экраны и строгая блокировка пересекающихся FSM-сценариев;
-- параллельные SQLite workers с атомарным claim, уникальным `locked_by` и heartbeat;
+- bounded worker pools по категориям (`telegram`, `ai`, `notifications`, `reports/heavy`) с атомарным claim, tenant fairness, `locked_by` и heartbeat; записи SQLite остаются ограниченными одним process-wide semaphore;
 - консистентный backup через SQLite backup API и проверку целостности;
 - тесты CRUD, API, миграций, FSM persistence, job queue, конкурентных записей и backup/restore.
 - безопасное подключение рабочего Telegram через Telethon StringSession: телефон → код → optional 2FA;
 - выбор рабочей папки, отдельное согласие на классификацию личных диалогов и периоды 3/7/14/30 дней;
 - постепенная initial sync по durable queue с batch, паузами, FloodWait, retry, offset, idempotency и продолжением после рестарта;
-- live progress в одном сообщении, итоговые метрики, проблемы с evidence и подтверждение спорных личных диалогов;
+- live progress в одном сообщении, единый Signal → Commitment/Problem lifecycle, evidence, валидируемые переходы и remediation verification;
 - динамическая Mini App с onboarding-состояниями и tenant bootstrap, защищённым Telegram WebApp `initData`.
 - единый tenant-aware scheduler с устойчивым расписанием, ранним стартом анализа и fair SQLite queue;
 - валидируемые JSON-пакеты DeepSeek, локальная предобработка, отчёты, метрики использования AI и health-срез;
-- модели сотрудников, отделов, ролей, memberships и permissions для следующего этапа продукта.
+- автоматическая связка Employee → TenantMembership → permissions и server-side role scope;
+- Mini App control center: управление проблемами, обязательствами, сотрудниками, группами, настройками и деталями отчётов;
+- `/health/live`, `/health/ready`, `/health/details` и `/metrics` для pilot observability.
 
 ## Секреты и обязательные переменные
 
@@ -90,6 +92,9 @@ docker compose up --build
 
 ```bash
 curl http://localhost:8000/health
+curl http://localhost:8000/health/live
+curl http://localhost:8000/health/ready
+curl http://localhost:8000/metrics
 curl http://localhost:8000/ready
 ```
 
@@ -145,7 +150,7 @@ docker compose run --rm backend alembic upgrade head
 
 Клиентский бот разрешает доступ только `tenant.owner_telegram_user_id`. Посторонний пользователь не получает tenant-данные, а попытка записывается как `unauthorized_access_attempt`. Inline-меню: **Сводка**, **Важное**, **Отчёты**, **Подключения**, **Открыть панель**, **Настройки**. Клиентский интерфейс не показывает владельца платформы, поддержку, публичные цены или тарифы.
 
-Для user-session создайте Telegram application на `my.telegram.org`, внесите её API ID/hash в `.env` и перезапустите `client-bots` и `background-worker`. В клиентском боте откройте **Подключения**. Мастер попросит создать рабочую папку, удалит сообщения с кодом/2FA после обработки и не включит личные диалоги без отдельного согласия. По умолчанию анализируется 7 дней. Кнопки остановки, отключения и полной очистки доступны в том же inline-потоке.
+Для user-session создайте Telegram application на `my.telegram.org`, внесите её API ID/hash в `.env` и перезапустите `telegram-session-runtime` и `background-worker`. После одноразового входа по коду/optional 2FA отдельный long-lived actor принимает `NewMessage` и `MessageEdited`; коды и пароль не сохраняются. Все личные диалоги включаются по умолчанию, начальная история — 7 дней. Группы подключаются только через preview ссылки/общей папки и отдельное подтверждение пользователя.
 
 Mini App отправляет backend только подписанную строку `Telegram.WebApp.initData`. Backend проверяет HMAC и срок `auth_date`, затем сопоставляет Telegram user ID с владельцем tenant. Для отдельного frontend origin укажите HTTPS `CLIENT_MINI_APP_URL`, а во frontend — `NEXT_PUBLIC_API_BASE_URL`.
 
@@ -161,14 +166,18 @@ Frontend готовится к Vercel из корня репозитория —
 
 ## Background jobs
 
-Рабочий контур использует гибридную обработку: каждый активный Telegram account получает
-короткий incremental poll, новые сообщения идемпотентно сохраняются по dialog cursor и проходят
+Рабочий контур использует push-first гибридную обработку: каждый активный Telegram account имеет
+один long-lived Telethon client, новые события идемпотентно сохраняются по dialog cursor и проходят
 локальный signal engine. Только значимые `Signal` ставятся в дешёвый `signal.ai_triage` с компактным
 `DialogState`; полный `analysis.pipeline` оставлен для глубокого анализа и отчётов. Обязательства
 хранятся отдельно в `Commitment` и ежечасно проверяются SQL/local reconciliation без повторного
-чтения всей переписки. Все tenants и все их Telegram sessions обслуживаются общей priority queue.
+чтения всей переписки. Редкий `telegram.catch_up` после reconnect и по расписанию восстанавливает
+пропущенные updates через те же event jobs. Все tenants и sessions обслуживаются общей priority queue.
+Внутри одного `background-worker` работают небольшие изолированные pools: долгий AI/report job не
+удерживает Telegram ingestion или critical notification. Это bounded concurrency для single-host
+SQLite, а не попытка запустить десятки конкурирующих writer-процессов.
 
-Приоритетные типы: `telegram.fetch_updates`, `telegram.history_sync`, `signal.local_scan`,
+Приоритетные типы: `telegram.ingest_event`, `telegram.catch_up`, `telegram.history_sync`, `signal.scan_batch`,
 `signal.ai_triage`, `commitment.reconcile`, `problem.evaluate`, `analysis.hourly`, `analysis.deep`,
 `notification.employee`, `notification.manager`, `notification.group`, `report.employee`,
 `report.client`, `report.company`, `maintenance.session_health`. Классы ресурсов — `light`,
@@ -187,6 +196,19 @@ docker compose exec backend python -m services.backend.jobs.cli enqueue-test --t
 ```
 
 Каждый worker получает уникальный ID `configured-name:hostname:pid`. Claim выполняется условным `UPDATE` в короткой транзакции, поэтому несколько процессов не выполняют один job одновременно. Во время handler worker обновляет `locked_at`; после ошибки увеличивается `attempts` и планируется exponential retry. При старте восстанавливаются только действительно stale leases. Для повторной постановки используйте `idempotency_key`.
+
+Initial sync, incremental ingestion и scheduled analysis коррелируют находки через один downstream
+lifecycle. Проблемы изменяются только через доменную FSM, а автоматическое закрытие требует
+deterministic/AI verification с достаточной уверенностью и сохраняет audit trail.
+
+Безопасный экспорт только исходников:
+
+```bash
+.venv/bin/python -m scripts.export_source
+```
+
+Команда предварительно запускает secret scan и исключает `.env`, БД, backup, Telegram sessions,
+логи, `.git`, virtualenv, `node_modules` и build outputs.
 
 ## Резервное копирование и восстановление
 
@@ -233,12 +255,12 @@ python -m venv .venv
 - записи ограничиваются короткими транзакциями и повторяются при `database is locked`; при устойчивой высокой конкуренции latency растёт;
 - WAL улучшает совместную работу читателей и writer-процессов, но не превращает SQLite в распределённую БД;
 - все процессы должны работать на одном сервере и общем локальном volume; сетевой filesystem не поддерживается;
-- runtime manager сейчас использует long polling и предполагает один активный менеджер для каждого bot instance; межпроцессное распределение client bots ещё не реализовано;
+- Telegram session runtime предполагает ровно один actor на подключённый account; multi-host lease/leader election ещё не реализованы;
 - backup-файлы содержат зашифрованные секреты и сами должны храниться как секретные данные;
 - нет внешней очереди, distributed locks, multi-host failover и горизонтального масштабирования;
 - полноценная AI-обработка требует действующего `DEEPSEEK_API_KEY`; без него job завершится контролируемой ошибкой и останется наблюдаемым в очереди;
 - Telethon использует глобальную Telegram application, но каждая user session, выбор диалогов и progress изолированы по tenant;
-- классификация личных диалогов использует ограниченный набор контекстных сигналов; низкая уверенность всегда требует ручного подтверждения;
+- все личные диалоги являются источниками, но relevance gate отбрасывает низкоценные сообщения; качество редких доменных формулировок требует пилотной калибровки;
 - frontend build требует Node-зависимости из `package-lock.json`; при недоступности npm registry Python/backend проверки остаются независимыми.
 
 ## Когда переходить на PostgreSQL или Redis

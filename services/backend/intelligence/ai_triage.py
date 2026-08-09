@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -22,6 +22,7 @@ from ..models import (
     TenantSettings,
 )
 from .notifications import NotificationOrchestrator
+from .problem_lifecycle import initialize_problem_lifecycle
 from .triage import TriageResult, parse_triage_result
 
 TRIAGE_SYSTEM_PROMPT = """You triage one new Telegram business event. Return JSON only.
@@ -111,12 +112,37 @@ class AITriageService:
             None,
         )
         problem_id = await self._apply_result(signal.id, result, settings, repaired)
+        await self.notifications.reconcile_provisional(
+            signal.id,
+            confirmed=(
+                result.criticality >= settings.manager_notification_threshold
+                and result.requires_manager_notification
+            ),
+            confirmed_criticality=result.criticality,
+        )
         notification_ids = await self.notifications.plan_for_signal(signal.id, problem_id)
+        deep_job_id = None
+        if result.needs_deep_analysis:
+            deep_job_id = await self.queue.enqueue(
+                "analysis.deep",
+                {"trigger": "signal_escalation", "signal_id": signal.id},
+                tenant_id=signal.tenant_id,
+                telegram_account_id=signal.telegram_connection_id,
+                dialog_id=signal.dialog_id,
+                priority=30,
+                idempotency_key=f"signal-deep-analysis:{signal.id}",
+                correlation_id=signal.id,
+                is_heavy=True,
+                category="ai_heavy",
+                cost_class="heavy",
+                max_attempts=3,
+            )
         return {
             "signal_id": signal.id,
             "criticality": result.criticality,
             "problem_id": problem_id,
             "notifications": len(notification_ids),
+            "deep_analysis_job_id": deep_job_id,
         }
 
     async def _payload(
@@ -248,15 +274,29 @@ class AITriageService:
                     signal_id=signal.id,
                     fingerprint=f"signal:{signal.fingerprint}",
                     problem_type=result.category,
+                    responsible_employee_id=signal.employee_id,
                     priority=self._priority(result.criticality, settings),
                     confidence=result.criticality / 100,
                     evidence=(source.body_text or "")[:2000],
                     explanation=result.reason,
                     recommended_action=result.recommended_action,
+                    deadline_at=(
+                        datetime.now(UTC) + timedelta(minutes=result.recommended_deadline_minutes)
+                        if result.recommended_deadline_minutes is not None
+                        else None
+                    ),
                     occurred_at=source.sent_at,
                 )
                 session.add(problem)
                 await session.flush()
+                session.add_all(
+                    initialize_problem_lifecycle(
+                        problem,
+                        responsible_employee_id=signal.employee_id,
+                        requires_confirmation=signal.employee_id is None,
+                        reason="Ответственный определён из Telegram connection/employee mapping.",
+                    )
+                )
             signal.status = "problem_created"
             return problem.id
 

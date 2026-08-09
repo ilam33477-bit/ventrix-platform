@@ -12,11 +12,18 @@ from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, SecretStr, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from packages.ops_core.problems import ProblemStatus
 
 from ..config import Settings, get_settings
 from ..database import get_session
+from ..intelligence.problem_lifecycle import (
+    ACTIVE_PROBLEM_STATUSES,
+    ProblemLifecycleService,
+    TransitionRequest,
+)
 from ..jobs.queue import SQLiteJobQueue
 from ..models import (
     AIUsageCall,
@@ -27,8 +34,11 @@ from ..models import (
     EncryptedSecret,
     GroupIntegration,
     InitialAnalysisRun,
+    MonitoredSource,
     OperationalProblem,
     Permission,
+    ProblemTransition,
+    ProblemVerification,
     ProductEvent,
     Report,
     ReportMetric,
@@ -52,7 +62,11 @@ router = APIRouter(prefix="/api/v1/client", tags=["tenant-client"])
 
 
 class ProblemPatch(BaseModel):
-    status: str = Field(pattern="^(open|acknowledged|in_progress|resolved|false_positive)$")
+    status: ProblemStatus
+    reason: str = Field(min_length=1, max_length=2000)
+    evidence: str | None = Field(default=None, max_length=4000)
+    responsible_employee_id: str | None = None
+    deadline_at: datetime | None = None
 
 
 class ClientSettingsPatch(BaseModel):
@@ -65,6 +79,11 @@ class ClientSettingsPatch(BaseModel):
     signal_report_threshold: int | None = Field(default=None, ge=0, le=100)
     signal_problem_threshold: int | None = Field(default=None, ge=0, le=100)
     signal_immediate_threshold: int | None = Field(default=None, ge=0, le=100)
+    manager_notification_threshold: int | None = Field(default=None, ge=0, le=100)
+    employee_notification_threshold: int | None = Field(default=None, ge=0, le=100)
+    group_notification_threshold: int | None = Field(default=None, ge=0, le=100)
+    notification_immediate_threshold: int | None = Field(default=None, ge=0, le=100)
+    critical_fast_lane_rules: list[dict[str, Any]] | None = Field(default=None, max_length=20)
     ai_daily_soft_limit: int | None = Field(default=None, ge=1)
     ai_daily_hard_limit: int | None = Field(default=None, ge=1)
     employee_notifications_enabled: bool | None = None
@@ -75,14 +94,88 @@ class ClientSettingsPatch(BaseModel):
     def normalize_settings_timezone(cls, value: str | None) -> str | None:
         return normalize_timezone(value) if value is not None else None
 
+    @field_validator("critical_fast_lane_rules")
+    @classmethod
+    def validate_fast_lane_rules(
+        cls, value: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+        normalized: list[dict[str, Any]] = []
+        for index, rule in enumerate(value):
+            any_terms = [str(item).strip().lower() for item in rule.get("contains_any", [])]
+            all_terms = [str(item).strip().lower() for item in rule.get("contains_all", [])]
+            any_terms = [item for item in any_terms if len(item) >= 3]
+            all_terms = [item for item in all_terms if len(item) >= 3]
+            has_metadata_match = any(
+                rule.get(key) for key in ("attachment_name_any", "mime_types", "extensions")
+            ) or bool(rule.get("requires_amount"))
+            if not any_terms and not all_terms and not has_metadata_match:
+                raise ValueError("fast lane rule requires contains_any or contains_all")
+            criticality = int(rule.get("criticality", 95))
+            if not 0 <= criticality <= 100:
+                raise ValueError("fast lane criticality must be between 0 and 100")
+            normalized.append(
+                {
+                    "id": str(rule.get("id") or f"rule-{index + 1}")[:64],
+                    "enabled": bool(rule.get("enabled", True)),
+                    "contains_any": any_terms[:20],
+                    "contains_all": all_terms[:20],
+                    "signal_types": [str(item)[:64] for item in rule.get("signal_types", [])][:20],
+                    "attachment_name_any": [
+                        str(item).strip().lower()[:100]
+                        for item in rule.get("attachment_name_any", [])
+                        if str(item).strip()
+                    ][:20],
+                    "mime_types": [
+                        str(item).strip().lower()[:100]
+                        for item in rule.get("mime_types", [])
+                        if str(item).strip()
+                    ][:20],
+                    "extensions": [
+                        str(item).strip().lower().lstrip(".")[:16]
+                        for item in rule.get("extensions", [])
+                        if str(item).strip()
+                    ][:20],
+                    "directions": [
+                        item
+                        for item in rule.get("directions", [])
+                        if item in {"incoming", "outgoing"}
+                    ],
+                    "source_types": [
+                        item
+                        for item in rule.get("source_types", [])
+                        if item in {"personal", "group", "channel"}
+                    ],
+                    "sender_roles": [
+                        item
+                        for item in rule.get("sender_roles", [])
+                        if item in {"account_owner", "employee", "customer", "external", "unknown"}
+                    ],
+                    "requires_amount": bool(rule.get("requires_amount", False)),
+                    "criticality": criticality,
+                }
+            )
+        return normalized
+
 
 class EmployeeCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=200)
     telegram_user_id: int | None = Field(default=None, gt=0)
     telegram_username: str | None = Field(default=None, max_length=64)
-    role: str = Field(default="employee", min_length=1, max_length=64)
+    role: Literal["manager", "employee", "observer"] = "employee"
     notifications_enabled: bool = True
     criticality_threshold: int = Field(default=85, ge=0, le=100)
+
+
+class EmployeePatch(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    telegram_user_id: int | None = Field(default=None, gt=0)
+    telegram_username: str | None = Field(default=None, max_length=64)
+    role: Literal["manager", "employee", "observer"] | None = None
+    status: Literal["active", "inactive"] | None = None
+    notifications_enabled: bool | None = None
+    criticality_threshold: int | None = Field(default=None, ge=0, le=100)
 
 
 class GroupIntegrationCreate(BaseModel):
@@ -91,6 +184,19 @@ class GroupIntegrationCreate(BaseModel):
     notifications_enabled: bool = True
     minimum_criticality: int = Field(default=85, ge=0, le=100)
     reminder_cooldown_minutes: int = Field(default=120, ge=1, le=10_080)
+
+
+class GroupIntegrationPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    status: Literal["pending", "active", "disabled"] | None = None
+    notifications_enabled: bool | None = None
+    minimum_criticality: int | None = Field(default=None, ge=0, le=100)
+    reminder_cooldown_minutes: int | None = Field(default=None, ge=1, le=10_080)
+
+
+class CommitmentPatch(BaseModel):
+    status: Literal["completed", "cancelled"]
+    reason: str = Field(min_length=1, max_length=2000)
 
 
 class TelegramLoginStart(BaseModel):
@@ -117,24 +223,45 @@ class TelegramConnectionScope(BaseModel):
     personal_dialogs_consent: bool = False
 
 
+class TelegramSourcePreview(BaseModel):
+    link: str = Field(min_length=5, max_length=500)
+
+
+class TelegramSourceConfirm(BaseModel):
+    preview_job_id: str
+    selected_peer_ids: list[str] = Field(min_length=1, max_length=100)
+    join: bool = False
+
+
 ClientOnboardingStep = Literal[
     "welcome",
+    "mini_guide",
     "telegram_connection",
-    "scope_selection",
-    "employees_review",
+    "monitoring_started",
+    "employees",
+    "notifications",
+    "reports",
+    "groups",
+    "final_review",
     "completed",
 ]
 
 
 class ClientOnboardingPatch(BaseModel):
     step: ClientOnboardingStep
+    status: Literal["completed", "skipped"] = "completed"
 
 
 CLIENT_ONBOARDING_STEPS: tuple[ClientOnboardingStep, ...] = (
     "welcome",
+    "mini_guide",
     "telegram_connection",
-    "scope_selection",
-    "employees_review",
+    "monitoring_started",
+    "employees",
+    "notifications",
+    "reports",
+    "groups",
+    "final_review",
     "completed",
 )
 
@@ -164,6 +291,120 @@ def require_permission(context: ClientAuthContext, permission: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
 
+ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
+    "manager": frozenset(
+        {
+            "problems.read_all",
+            "problems.manage",
+            "employees.read",
+            "employees.manage",
+            "groups.manage",
+            "reports.read",
+            "commitments.read_all",
+            "settings.read",
+            "settings.manage",
+        }
+    ),
+    "employee": frozenset(
+        {
+            "problems.read_own",
+            "problems.manage_own",
+            "commitments.read_own",
+            "commitments.manage_own",
+            "reports.read_own",
+        }
+    ),
+    "observer": frozenset({"reports.read"}),
+}
+
+
+async def sync_employee_membership(
+    session: AsyncSession,
+    employee: Employee,
+    *,
+    previous_telegram_user_id: int | None = None,
+) -> TenantMembership | None:
+    """Keep the employee access identity and its role permissions in lockstep."""
+    if previous_telegram_user_id and previous_telegram_user_id != employee.telegram_user_id:
+        previous = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == employee.tenant_id,
+                TenantMembership.employee_id == employee.id,
+                TenantMembership.telegram_user_id == previous_telegram_user_id,
+            )
+        )
+        if previous is not None:
+            previous.status = "inactive"
+
+    if employee.telegram_user_id is None:
+        linked = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == employee.tenant_id,
+                TenantMembership.employee_id == employee.id,
+            )
+        )
+        if linked is not None:
+            linked.status = "inactive"
+        return None
+
+    membership = await session.scalar(
+        select(TenantMembership).where(
+            TenantMembership.tenant_id == employee.tenant_id,
+            TenantMembership.telegram_user_id == employee.telegram_user_id,
+        )
+    )
+    if membership is not None and membership.employee_id not in {None, employee.id}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Telegram user already belongs to another employee in tenant",
+        )
+    if membership is None:
+        membership = TenantMembership(
+            tenant_id=employee.tenant_id,
+            telegram_user_id=employee.telegram_user_id,
+            employee_id=employee.id,
+            role=employee.role,
+            status=employee.status,
+        )
+        session.add(membership)
+        await session.flush()
+    else:
+        membership.employee_id = employee.id
+        membership.role = employee.role
+        membership.status = employee.status
+
+    await session.execute(delete(Permission).where(Permission.membership_id == membership.id))
+    session.add_all(
+        Permission(
+            tenant_id=employee.tenant_id,
+            membership_id=membership.id,
+            permission=permission,
+        )
+        for permission in ROLE_PERMISSIONS[employee.role]
+    )
+    return membership
+
+
+def can_read_problem(context: ClientAuthContext, problem: OperationalProblem) -> bool:
+    if context.membership.role in {"owner", "manager"} or context.allows("problems.read_all"):
+        return True
+    return bool(
+        context.membership.employee_id
+        and problem.responsible_employee_id == context.membership.employee_id
+        and context.allows("problems.read_own")
+    )
+
+
+def can_manage_problem(context: ClientAuthContext, problem: OperationalProblem) -> bool:
+    if context.membership.role in {"owner", "manager"} or context.allows("problems.manage"):
+        return True
+    return bool(
+        context.membership.employee_id
+        and problem.responsible_employee_id == context.membership.employee_id
+        and context.allows("problems.manage_own")
+    )
+
+
 def job_payload(job: BackgroundJob | None) -> dict[str, Any] | None:
     if job is None:
         return None
@@ -180,6 +421,7 @@ def job_payload(job: BackgroundJob | None) -> dict[str, Any] | None:
         "max_attempts": job.max_attempts,
         "delay_reason": job.delay_reason,
         "last_error": job.last_error,
+        "result": job.result_json,
     }
 
 
@@ -298,6 +540,8 @@ async def mini_app_dashboard_summary(
     session: AsyncSession, context: ClientAuthContext
 ) -> dict[str, Any]:
     tenant_id = context.tenant.id
+    employee_id = context.membership.employee_id
+    self_scoped = context.membership.role == "employee" and not context.allows("problems.read_all")
     settings = await session.scalar(
         select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)
     )
@@ -307,7 +551,12 @@ async def mini_app_dashboard_summary(
             await session.scalar(
                 select(func.count(OperationalProblem.id)).where(
                     OperationalProblem.tenant_id == tenant_id,
-                    OperationalProblem.status.not_in(("resolved", "false_positive")),
+                    OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                    *(
+                        (OperationalProblem.responsible_employee_id == employee_id,)
+                        if self_scoped
+                        else ()
+                    ),
                 )
             )
             or 0
@@ -317,6 +566,7 @@ async def mini_app_dashboard_summary(
                 select(func.count(Signal.id)).where(
                     Signal.tenant_id == tenant_id,
                     Signal.criticality >= critical_threshold,
+                    *((Signal.employee_id == employee_id,) if self_scoped else ()),
                 )
             )
             or 0
@@ -326,6 +576,7 @@ async def mini_app_dashboard_summary(
                 select(func.count(Commitment.id)).where(
                     Commitment.tenant_id == tenant_id,
                     Commitment.status == "open",
+                    *((Commitment.responsible_employee_id == employee_id,) if self_scoped else ()),
                 )
             )
             or 0
@@ -339,6 +590,7 @@ async def mini_app_dashboard_summary(
                 select(func.count(Employee.id)).where(
                     Employee.tenant_id == tenant_id,
                     Employee.status == "active",
+                    *((Employee.id == employee_id,) if self_scoped else ()),
                 )
             )
             or 0
@@ -383,7 +635,9 @@ async def mini_app_dashboard_summary(
 
 def client_onboarding_payload(settings: TenantSettings | None) -> dict[str, Any]:
     completed = bool(settings and settings.client_onboarding_completed_at)
-    step = "completed" if completed else (settings.client_onboarding_step if settings else "welcome")
+    step = (
+        "completed" if completed else (settings.client_onboarding_step if settings else "welcome")
+    )
     if step not in CLIENT_ONBOARDING_STEPS:
         step = "welcome"
     return {
@@ -391,6 +645,7 @@ def client_onboarding_payload(settings: TenantSettings | None) -> dict[str, Any]
         "completed": completed,
         "completed_at": settings.client_onboarding_completed_at if settings else None,
         "steps": list(CLIENT_ONBOARDING_STEPS),
+        "statuses": dict(settings.client_onboarding_json if settings else {}),
     }
 
 
@@ -453,8 +708,13 @@ async def update_client_onboarding(
             detail="Onboarding cannot move backwards",
         )
     settings.client_onboarding_step = payload.step
+    states = dict(settings.client_onboarding_json or {})
+    states[current] = payload.status
+    settings.client_onboarding_json = states
     if payload.step == "completed":
         settings.client_onboarding_completed_at = datetime.now(UTC)
+        states["completed"] = "completed"
+        settings.client_onboarding_json = states
     await session.commit()
     return client_onboarding_payload(settings)
 
@@ -470,8 +730,8 @@ def onboarding_state(connection: TelegramConnection | None) -> str:
         return "synchronization"
     if connection.status == "ready":
         return "ready"
-    if connection.selected_folder_id is None:
-        return "folder_selection"
+    if connection.progress_stage in {"personal_sources_enabled", "scope_selected"}:
+        return "synchronization"
     if connection.progress_stage == "scope_selected":
         return "chat_selection"
     return "connecting"
@@ -520,7 +780,7 @@ async def client_bootstrap(
             select(OperationalProblem)
             .where(
                 OperationalProblem.tenant_id == tenant.id,
-                OperationalProblem.status == "open",
+                OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
             )
             .order_by(OperationalProblem.occurred_at.desc())
             .limit(20)
@@ -592,9 +852,13 @@ async def client_bootstrap(
                 "evidence": problem.evidence,
                 "explanation": problem.explanation,
                 "recommended_action": problem.recommended_action,
+                "status": problem.status,
+                "responsible_employee_id": problem.responsible_employee_id,
+                "deadline_at": problem.deadline_at,
                 "occurred_at": problem.occurred_at,
             }
             for problem in problems
+            if can_read_problem(context, problem)
         ],
     }
 
@@ -616,7 +880,7 @@ async def dashboard(
             await session.scalar(
                 select(func.count(OperationalProblem.id)).where(
                     OperationalProblem.tenant_id == context.tenant.id,
-                    OperationalProblem.status != "resolved",
+                    OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
                 )
             )
             or 0
@@ -679,6 +943,7 @@ async def problems(
     rows = await repository.problems()
     if problem_status:
         rows = [item for item in rows if item.status == problem_status]
+    rows = [item for item in rows if can_read_problem(context, item)]
     return [
         {
             "id": item.id,
@@ -689,6 +954,8 @@ async def problems(
             "evidence": item.evidence,
             "explanation": item.explanation,
             "recommended_action": item.recommended_action,
+            "responsible_employee_id": item.responsible_employee_id,
+            "deadline_at": item.deadline_at,
             "occurred_at": item.occurred_at,
         }
         for item in rows
@@ -702,8 +969,28 @@ async def problem_detail(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
     item = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
-    if item is None:
+    if item is None or not can_read_problem(context, item):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    transitions = list(
+        await session.scalars(
+            select(ProblemTransition)
+            .where(
+                ProblemTransition.tenant_id == context.tenant.id,
+                ProblemTransition.problem_id == item.id,
+            )
+            .order_by(ProblemTransition.occurred_at)
+        )
+    )
+    verifications = list(
+        await session.scalars(
+            select(ProblemVerification)
+            .where(
+                ProblemVerification.tenant_id == context.tenant.id,
+                ProblemVerification.problem_id == item.id,
+            )
+            .order_by(ProblemVerification.checked_at.desc())
+        )
+    )
     await record_event(session, context, "problem_opened", {"problem_id": item.id})
     await session.commit()
     return {
@@ -715,7 +1002,34 @@ async def problem_detail(
         "evidence": item.evidence,
         "explanation": item.explanation,
         "recommended_action": item.recommended_action,
+        "responsible_employee_id": item.responsible_employee_id,
+        "deadline_at": item.deadline_at,
+        "closed_reason": item.closed_reason,
+        "resolution_evidence": item.resolution_evidence,
         "occurred_at": item.occurred_at,
+        "transitions": [
+            {
+                "from_status": transition.from_status,
+                "to_status": transition.to_status,
+                "actor_type": transition.actor_type,
+                "actor_id": transition.actor_id,
+                "reason": transition.reason,
+                "evidence": transition.evidence,
+                "occurred_at": transition.occurred_at,
+            }
+            for transition in transitions
+        ],
+        "verifications": [
+            {
+                "outcome": verification.outcome,
+                "confidence": verification.confidence,
+                "method": verification.method,
+                "reason": verification.reason,
+                "evidence_message_ids": verification.evidence_message_ids_json,
+                "checked_at": verification.checked_at,
+            }
+            for verification in verifications
+        ],
     }
 
 
@@ -725,16 +1039,49 @@ async def update_problem(
     payload: ProblemPatch,
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
-) -> dict[str, str]:
-    require_permission(context, "problems.manage")
+) -> dict[str, Any]:
     item = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
     if item is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
-    item.status = payload.status
-    event = "problem_false_positive" if payload.status == "false_positive" else "problem_resolved"
-    await record_event(session, context, event, {"problem_id": item.id})
-    await session.commit()
-    return {"id": item.id, "status": item.status}
+    if not can_manage_problem(context, item):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    if (
+        context.membership.role == "employee"
+        and payload.responsible_employee_id is not None
+        and payload.responsible_employee_id != context.membership.employee_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employee cannot reassign a problem to another employee",
+        )
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    lifecycle = ProblemLifecycleService(factory)
+    try:
+        updated = await lifecycle.transition(
+            context.tenant.id,
+            problem_id,
+            TransitionRequest(
+                target=payload.status,
+                actor_type="membership",
+                actor_id=context.membership.id,
+                reason=payload.reason,
+                evidence=payload.evidence,
+                responsible_employee_id=payload.responsible_employee_id,
+                deadline_at=payload.deadline_at,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    event = f"problem_{updated.status}"
+    async with factory() as event_session:
+        await record_event(event_session, context, event, {"problem_id": updated.id})
+        await event_session.commit()
+    return {
+        "id": updated.id,
+        "status": updated.status,
+        "responsible_employee_id": updated.responsible_employee_id,
+        "deadline_at": updated.deadline_at,
+    }
 
 
 @router.get("/reports")
@@ -742,6 +1089,8 @@ async def reports(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
+    if context.membership.role not in {"owner", "manager"} and not context.allows("reports.read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     rows = await TenantClientRepository(session, context.tenant.id).reports()
     return [
         {
@@ -764,6 +1113,8 @@ async def report_detail(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
+    if context.membership.role not in {"owner", "manager"} and not context.allows("reports.read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     repository = TenantClientRepository(session, context.tenant.id)
     report = await repository.report(report_id)
     if report is None:
@@ -893,6 +1244,18 @@ async def complete_connection_login(
             code=code,
             password=password,
         )
+        analysis_run_id = None
+        if connection.status == "connected":
+            connection = await connection_service.refresh_catalog(context.tenant.id, connection.id)
+            connection = await connection_service.activate_default_scope(
+                context.tenant.id,
+                history_days=7,
+                connection_id=connection.id,
+            )
+            run = await connection_service.start_initial_sync(
+                context.tenant.id, connection_id=connection.id
+            )
+            analysis_run_id = run.id
     except TelegramConnectionError as exc:
         raise HTTPException(status_code=409, detail="Login session is no longer available") from exc
     except Exception as exc:
@@ -907,6 +1270,7 @@ async def complete_connection_login(
         "account": connection.display_name or connection.phone_masked,
         "username": connection.username,
         "requires_2fa": connection.status == "awaiting_2fa",
+        "analysis_run_id": analysis_run_id,
     }
 
 
@@ -967,6 +1331,122 @@ async def configure_connection_scope(
     }
 
 
+async def tenant_connection(
+    session: AsyncSession, tenant_id: str, connection_id: str
+) -> TelegramConnection:
+    connection = await session.scalar(
+        select(TelegramConnection).where(
+            TelegramConnection.id == connection_id,
+            TelegramConnection.tenant_id == tenant_id,
+            TelegramConnection.deleted_at.is_(None),
+        )
+    )
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Telegram connection not found")
+    if connection.status not in {"connected", "syncing", "ready"}:
+        raise HTTPException(status_code=409, detail="Telegram connection is not ready")
+    return connection
+
+
+@router.get("/connections/{connection_id}/sources")
+async def list_connection_sources(
+    connection_id: str,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> list[dict[str, Any]]:
+    require_permission(context, "employees.manage")
+    await tenant_connection(session, context.tenant.id, connection_id)
+    rows = list(
+        await session.scalars(
+            select(MonitoredSource)
+            .where(
+                MonitoredSource.tenant_id == context.tenant.id,
+                MonitoredSource.connection_id == connection_id,
+            )
+            .order_by(MonitoredSource.created_at.asc())
+        )
+    )
+    return [
+        {
+            "id": item.id,
+            "canonical_peer_id": item.canonical_peer_id,
+            "type": item.source_type,
+            "title": item.title,
+            "enabled": item.enabled,
+            "added_via": item.added_via,
+            "metadata": item.metadata_json,
+        }
+        for item in rows
+    ]
+
+
+@router.post("/connections/{connection_id}/sources/preview", status_code=202)
+async def preview_connection_source(
+    connection_id: str,
+    payload: TelegramSourcePreview,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, str]:
+    require_permission(context, "employees.manage")
+    await tenant_connection(session, context.tenant.id, connection_id)
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    job_id = await SQLiteJobQueue(factory).enqueue(
+        "telegram.preview_source",
+        {"link": payload.link},
+        tenant_id=context.tenant.id,
+        telegram_account_id=connection_id,
+        priority=10,
+        category="telegram_rpc",
+        cost_class="light",
+        max_attempts=3,
+    )
+    return {"job_id": job_id}
+
+
+@router.post("/connections/{connection_id}/sources/confirm", status_code=202)
+async def confirm_connection_sources(
+    connection_id: str,
+    payload: TelegramSourceConfirm,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, str]:
+    require_permission(context, "employees.manage")
+    await tenant_connection(session, context.tenant.id, connection_id)
+    preview_job = await session.scalar(
+        select(BackgroundJob).where(
+            BackgroundJob.id == payload.preview_job_id,
+            BackgroundJob.tenant_id == context.tenant.id,
+            BackgroundJob.telegram_account_id == connection_id,
+            BackgroundJob.job_type == "telegram.preview_source",
+            BackgroundJob.status == "completed",
+        )
+    )
+    if preview_job is None or not preview_job.result_json:
+        raise HTTPException(status_code=409, detail="Source preview is not ready")
+    available = {
+        str(item.get("canonical_peer_id")) for item in preview_job.result_json.get("peers", [])
+    }
+    selected = list(dict.fromkeys(payload.selected_peer_ids))
+    if not set(selected).issubset(available):
+        raise HTTPException(status_code=422, detail="Unknown source selection")
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    job_id = await SQLiteJobQueue(factory).enqueue(
+        "telegram.confirm_sources",
+        {
+            "preview": preview_job.result_json,
+            "selected_peer_ids": selected,
+            "join": payload.join,
+        },
+        tenant_id=context.tenant.id,
+        telegram_account_id=connection_id,
+        priority=10,
+        category="telegram_rpc",
+        cost_class="light",
+        max_attempts=3,
+    )
+    return {"job_id": job_id}
+
+
 @router.post("/connections/{connection_id}/login/cancel")
 async def cancel_connection_login(
     connection_id: str,
@@ -985,6 +1465,8 @@ async def signals(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
     query = select(Signal).where(Signal.tenant_id == context.tenant.id)
+    if context.membership.role == "employee" and not context.allows("problems.read_all"):
+        query = query.where(Signal.employee_id == context.membership.employee_id)
     if signal_status:
         query = query.where(Signal.status == signal_status)
     rows = list(await session.scalars(query.order_by(Signal.detected_at.desc()).limit(200)))
@@ -1012,6 +1494,8 @@ async def commitments(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
     query = select(Commitment).where(Commitment.tenant_id == context.tenant.id)
+    if context.membership.role == "employee" and not context.allows("commitments.read_all"):
+        query = query.where(Commitment.responsible_employee_id == context.membership.employee_id)
     if commitment_status:
         query = query.where(Commitment.status == commitment_status)
     rows = list(await session.scalars(query.order_by(Commitment.deadline_at.asc()).limit(200)))
@@ -1025,9 +1509,61 @@ async def commitments(
             "employee_id": item.responsible_employee_id,
             "dialog_id": item.dialog_id,
             "confidence": item.confidence,
+            "linked_problem_id": await session.scalar(
+                select(OperationalProblem.id).where(
+                    OperationalProblem.tenant_id == context.tenant.id,
+                    OperationalProblem.commitment_id == item.id,
+                )
+            ),
         }
         for item in rows
     ]
+
+
+@router.patch("/commitments/{commitment_id}")
+async def update_commitment(
+    commitment_id: str,
+    payload: CommitmentPatch,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    item = await session.scalar(
+        select(Commitment).where(
+            Commitment.id == commitment_id,
+            Commitment.tenant_id == context.tenant.id,
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commitment not found")
+    can_manage_all = context.membership.role in {"owner", "manager"}
+    can_manage_own = bool(
+        context.membership.employee_id
+        and item.responsible_employee_id == context.membership.employee_id
+        and context.allows("commitments.manage_own")
+    )
+    if not can_manage_all and not can_manage_own:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    if item.status != "open":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Commitment is not open")
+    item.status = payload.status
+    item.completed_at = datetime.now(UTC) if payload.status == "completed" else None
+    item.metadata_json = {
+        **item.metadata_json,
+        "manual_resolution": {
+            "status": payload.status,
+            "reason": payload.reason,
+            "membership_id": context.membership.id,
+            "at": datetime.now(UTC).isoformat(),
+        },
+    }
+    await record_event(
+        session,
+        context,
+        "commitment_updated",
+        {"commitment_id": item.id, "status": item.status},
+    )
+    await session.commit()
+    return {"id": item.id, "status": item.status, "completed_at": item.completed_at}
 
 
 @router.get("/employees")
@@ -1035,11 +1571,14 @@ async def employees(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
+    if context.membership.role == "observer" and not context.allows("employees.read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    employee_filters = [Employee.tenant_id == context.tenant.id]
+    if context.membership.role == "employee":
+        employee_filters.append(Employee.id == context.membership.employee_id)
     rows = list(
         await session.scalars(
-            select(Employee)
-            .where(Employee.tenant_id == context.tenant.id)
-            .order_by(Employee.display_name)
+            select(Employee).where(*employee_filters).order_by(Employee.display_name)
         )
     )
     return [
@@ -1052,6 +1591,14 @@ async def employees(
             "status": item.status,
             "notifications_enabled": item.notifications_enabled,
             "criticality_threshold": item.criticality_threshold,
+            "access_status": (
+                await session.scalar(
+                    select(TenantMembership.status).where(
+                        TenantMembership.tenant_id == context.tenant.id,
+                        TenantMembership.employee_id == item.id,
+                    )
+                )
+            ),
         }
         for item in rows
     ]
@@ -1074,8 +1621,57 @@ async def create_employee(
         criticality_threshold=payload.criticality_threshold,
     )
     session.add(employee)
+    await session.flush()
+    membership = await sync_employee_membership(session, employee)
     await session.commit()
-    return {"id": employee.id, "name": employee.display_name}
+    return {
+        "id": employee.id,
+        "name": employee.display_name,
+        "membership_id": membership.id if membership else None,
+        "access_status": membership.status if membership else "unlinked",
+    }
+
+
+@router.patch("/employees/{employee_id}")
+async def update_employee(
+    employee_id: str,
+    payload: EmployeePatch,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    require_permission(context, "employees.manage")
+    employee = await session.scalar(
+        select(Employee).where(
+            Employee.id == employee_id,
+            Employee.tenant_id == context.tenant.id,
+        )
+    )
+    if employee is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found")
+    previous_telegram_user_id = employee.telegram_user_id
+    values = payload.model_dump(exclude_unset=True)
+    if "telegram_username" in values:
+        values["telegram_username"] = (values["telegram_username"] or "").lstrip("@") or None
+    for key, value in values.items():
+        setattr(employee, key, value)
+    membership = await sync_employee_membership(
+        session,
+        employee,
+        previous_telegram_user_id=previous_telegram_user_id,
+    )
+    await record_event(session, context, "employee_updated", {"employee_id": employee.id})
+    await session.commit()
+    return {
+        "id": employee.id,
+        "name": employee.display_name,
+        "telegram_user_id": employee.telegram_user_id,
+        "telegram_username": employee.telegram_username,
+        "role": employee.role,
+        "status": employee.status,
+        "notifications_enabled": employee.notifications_enabled,
+        "criticality_threshold": employee.criticality_threshold,
+        "access_status": membership.status if membership else "unlinked",
+    }
 
 
 @router.get("/group-integrations")
@@ -1133,6 +1729,34 @@ async def create_group_integration(
     session.add(group)
     await session.commit()
     return {"id": group.id, "status": group.status}
+
+
+@router.patch("/group-integrations/{group_id}")
+async def update_group_integration(
+    group_id: str,
+    payload: GroupIntegrationPatch,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    require_permission(context, "groups.manage")
+    group = await session.scalar(
+        select(GroupIntegration).where(
+            GroupIntegration.id == group_id,
+            GroupIntegration.tenant_id == context.tenant.id,
+        )
+    )
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    for key, value in payload.model_dump(exclude_none=True).items():
+        setattr(group, key, value)
+    await session.commit()
+    return {
+        "id": group.id,
+        "status": group.status,
+        "notifications_enabled": group.notifications_enabled,
+        "minimum_criticality": group.minimum_criticality,
+        "reminder_cooldown_minutes": group.reminder_cooldown_minutes,
+    }
 
 
 @router.get("/ai-usage")
@@ -1233,6 +1857,8 @@ async def get_client_settings(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
+    if context.membership.role not in {"owner", "manager"} and not context.allows("settings.read"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     settings = await session.scalar(
         select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
     )
@@ -1247,6 +1873,11 @@ async def get_client_settings(
         "signal_report_threshold": settings.signal_report_threshold,
         "signal_problem_threshold": settings.signal_problem_threshold,
         "signal_immediate_threshold": settings.signal_immediate_threshold,
+        "manager_notification_threshold": settings.manager_notification_threshold,
+        "employee_notification_threshold": settings.employee_notification_threshold,
+        "group_notification_threshold": settings.group_notification_threshold,
+        "notification_immediate_threshold": settings.notification_immediate_threshold,
+        "critical_fast_lane_rules": settings.critical_fast_lane_rules,
         "ai_daily_soft_limit": settings.ai_daily_soft_limit,
         "ai_daily_hard_limit": settings.ai_daily_hard_limit,
         "employee_notifications_enabled": settings.employee_notifications_enabled,

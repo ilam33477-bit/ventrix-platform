@@ -91,6 +91,17 @@ async def test_owner_api_endpoints(
         async def list_folders(self, tenant_id, connection_id):
             return [SimpleNamespace(telegram_folder_id=10, title="Работа", chat_count=12)]
 
+        async def activate_default_scope(self, tenant_id, **kwargs):
+            return SimpleNamespace(
+                id=kwargs["connection_id"],
+                status="connected",
+                display_name="Рабочий аккаунт",
+                phone_masked="+7••••••0011",
+                username="work_account",
+                selected_folder_title=None,
+                history_days=kwargs["history_days"],
+            )
+
         async def select_scope(self, tenant_id, folder_ids, **kwargs):
             return SimpleNamespace(
                 id=kwargs["connection_id"],
@@ -111,9 +122,14 @@ async def test_owner_api_endpoints(
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.get("/health")).json() == {"status": "ok"}
+        assert (await client.get("/health/live")).json() == {"status": "live"}
         ready = await client.get("/ready")
         assert ready.status_code == 200
         assert ready.json() == {"status": "ready"}
+        assert (await client.get("/health/ready")).json() == {"status": "ready"}
+        runtime_metrics = (await client.get("/metrics")).json()
+        assert runtime_metrics["queue"]["depth"] == 0
+        assert set(runtime_metrics["jobs"]["duration_ms"]) == {"p50", "p95", "p99"}
         unauthorized = await client.get("/api/v1/owner/tenants")
         assert unauthorized.status_code == 401
 
@@ -193,16 +209,27 @@ async def test_owner_api_endpoints(
             "completed_at": None,
             "steps": [
                 "welcome",
+                "mini_guide",
                 "telegram_connection",
-                "scope_selection",
-                "employees_review",
+                "monitoring_started",
+                "employees",
+                "notifications",
+                "reports",
+                "groups",
+                "final_review",
                 "completed",
             ],
+            "statuses": {},
         }
         for onboarding_step in (
+            "mini_guide",
             "telegram_connection",
-            "scope_selection",
-            "employees_review",
+            "monitoring_started",
+            "employees",
+            "notifications",
+            "reports",
+            "groups",
+            "final_review",
             "completed",
         ):
             onboarding = await client.patch(
@@ -241,6 +268,45 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees", headers={"Authorization": f"tma {init_data}"}
         )
         assert employees.json()[0]["telegram_user_id"] == 700001
+        updated_employee = await client.patch(
+            f"/api/v1/client/employees/{employee.json()['id']}",
+            headers={"Authorization": f"tma {init_data}"},
+            json={"role": "manager", "criticality_threshold": 92},
+        )
+        assert updated_employee.status_code == 200, updated_employee.text
+        assert updated_employee.json()["role"] == "manager"
+        assert updated_employee.json()["access_status"] == "active"
+        restored_employee = await client.patch(
+            f"/api/v1/client/employees/{employee.json()['id']}",
+            headers={"Authorization": f"tma {init_data}"},
+            json={"role": "employee"},
+        )
+        assert restored_employee.json()["role"] == "employee"
+        second_employee = await client.post(
+            "/api/v1/client/employees",
+            headers={"Authorization": f"tma {init_data}"},
+            json={"display_name": "Иван", "telegram_user_id": 700002},
+        )
+        assert second_employee.status_code == 201
+        employee_init_data = signed_init_data(
+            "mock-telegram-token-must-remain-secret", 700001, int(time.time())
+        )
+        employee_menu = await client.get(
+            "/api/v1/client/menu",
+            headers={"Authorization": f"tma {employee_init_data}"},
+        )
+        assert employee_menu.status_code == 200
+        assert "problems.read_own" in employee_menu.json()["permissions"]
+        employee_visible_staff = await client.get(
+            "/api/v1/client/employees",
+            headers={"Authorization": f"tma {employee_init_data}"},
+        )
+        assert [item["telegram_user_id"] for item in employee_visible_staff.json()] == [700001]
+        employee_reports = await client.get(
+            "/api/v1/client/reports",
+            headers={"Authorization": f"tma {employee_init_data}"},
+        )
+        assert employee_reports.status_code == 403
 
         group = await client.post(
             "/api/v1/client/group-integrations",
@@ -254,6 +320,13 @@ async def test_owner_api_endpoints(
                 headers={"Authorization": f"tma {init_data}"},
             )
         ).json()[0]["title"] == "Продажи"
+        updated_group = await client.patch(
+            f"/api/v1/client/group-integrations/{group.json()['id']}",
+            headers={"Authorization": f"tma {init_data}"},
+            json={"minimum_criticality": 93, "notifications_enabled": False},
+        )
+        assert updated_group.status_code == 200
+        assert updated_group.json()["minimum_criticality"] == 93
         assert (
             await client.get(
                 "/api/v1/client/ai-usage", headers={"Authorization": f"tma {init_data}"}

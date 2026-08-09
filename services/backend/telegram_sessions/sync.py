@@ -7,11 +7,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..database import SQLiteTransactionManager
-from ..jobs.queue import JobLease, SQLiteJobQueue
+from ..jobs.queue import JOB_PRIORITY, JobLease, SQLiteJobQueue
 from ..models import (
+    Employee,
+    EmployeeTelegramAccount,
     EncryptedSecret,
     InitialAnalysisRun,
-    OperationalProblem,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
@@ -47,6 +48,7 @@ class TelegramSyncHandlers:
         self.queue = SQLiteJobQueue(session_factory)
 
     async def sync_chat(self, job: JobLease) -> dict[str, object]:
+        """Legacy adapter kept for tests; production dispatches this RPC inside the account actor."""
         cursor_id = str(job.payload["cursor_id"])
         loaded = await self._load(cursor_id, job.tenant_id)
         if loaded is None:
@@ -74,6 +76,36 @@ class TelegramSyncHandlers:
         finally:
             session_string = ""
 
+        return await self.process_actor_batch(job, cursor, run, connection, dialog, batch)
+
+    async def load_actor_context(self, cursor_id: str, tenant_id: str | None):
+        """Load DB-only sync context without decrypting or exposing a StringSession."""
+        async with self.session_factory() as session:
+            cursor = await session.scalar(
+                select(TelegramSyncCursor).where(
+                    TelegramSyncCursor.id == cursor_id,
+                    TelegramSyncCursor.tenant_id == tenant_id,
+                )
+            )
+            if cursor is None:
+                return None
+            run = await session.get(InitialAnalysisRun, cursor.run_id)
+            connection = await session.get(TelegramConnection, cursor.connection_id)
+            dialog = await session.get(TelegramDialog, cursor.dialog_id)
+            return cursor, run, connection, dialog
+
+    async def process_actor_batch(
+        self,
+        job: JobLease,
+        cursor: TelegramSyncCursor,
+        run: InitialAnalysisRun,
+        connection: TelegramConnection,
+        dialog: TelegramDialog,
+        batch: MessageBatch,
+    ) -> dict[str, object]:
+        """Persist and advance a batch fetched by the sole Telethon session actor."""
+        cursor_id = cursor.id
+
         cutoff = datetime.now(UTC) - timedelta(days=run.history_days)
         accepted = [item for item in batch.messages if item.sent_at >= cutoff]
         reached_cutoff = any(item.sent_at < cutoff for item in batch.messages)
@@ -94,7 +126,10 @@ class TelegramSyncHandlers:
                 "telegram.sync_chat",
                 {"cursor_id": cursor_id},
                 tenant_id=job.tenant_id,
+                telegram_account_id=connection.id,
                 idempotency_key=f"telegram-sync:{cursor_id}:{batch.next_offset_id}",
+                category="telegram_rpc",
+                cost_class="light",
                 max_attempts=8,
             )
         else:
@@ -121,6 +156,7 @@ class TelegramSyncHandlers:
     async def _store_batch(self, cursor_id: str, messages: list, batch: MessageBatch) -> None:
         async def write(session: AsyncSession) -> None:
             cursor = await session.get(TelegramSyncCursor, cursor_id)
+            dialog = await session.get(TelegramDialog, cursor.dialog_id)
             existing_ids = (
                 set(
                     await session.scalars(
@@ -133,6 +169,22 @@ class TelegramSyncHandlers:
                 if messages
                 else set()
             )
+            sender_ids = {item.sender_id for item in messages if item.sender_id is not None}
+            employee_sender_ids = set(
+                await session.scalars(
+                    select(Employee.telegram_user_id).where(
+                        Employee.tenant_id == cursor.tenant_id,
+                        Employee.telegram_user_id.in_(sender_ids),
+                    )
+                )
+            ) | set(
+                await session.scalars(
+                    select(EmployeeTelegramAccount.telegram_user_id).where(
+                        EmployeeTelegramAccount.tenant_id == cursor.tenant_id,
+                        EmployeeTelegramAccount.telegram_user_id.in_(sender_ids),
+                    )
+                )
+            )
             for item in messages:
                 if item.id in existing_ids:
                     continue
@@ -144,6 +196,16 @@ class TelegramSyncHandlers:
                         telegram_message_id=item.id,
                         sender_id=item.sender_id,
                         sender_username=item.sender_username,
+                        sender_role=(
+                            "account_owner"
+                            if item.outgoing
+                            else "employee"
+                            if item.sender_id in employee_sender_ids
+                            else "external"
+                            if dialog.dialog_type == "group"
+                            else "customer"
+                        ),
+                        ingestion_source="history",
                         sent_at=item.sent_at,
                         edited_at=item.edited_at,
                         outgoing=item.outgoing,
@@ -158,7 +220,6 @@ class TelegramSyncHandlers:
             cursor.status = "running"
             cursor.last_batch_at = datetime.now(UTC)
             cursor.last_error_code = None
-            dialog = await session.get(TelegramDialog, cursor.dialog_id)
             if messages:
                 newest = max(messages, key=lambda item: item.id)
                 dialog.last_message_id = max(dialog.last_message_id, newest.id)
@@ -267,6 +328,7 @@ class TelegramSyncHandlers:
                 "calls_at_risk": 0,
                 "system_gaps": run.failed_dialogs,
                 "problems_created": 0,
+                "analysis_jobs_queued": 0,
                 "analyzed_dialogs": len(payload),
                 "working_groups": sum(dialog.dialog_type == "group" for dialog, _ in payload),
                 "working_channels": sum(dialog.dialog_type == "channel" for dialog, _ in payload),
@@ -302,15 +364,17 @@ class TelegramSyncHandlers:
                         dialog_db.classification = "personal_contact"
                         dialog_db.confidence = min(0.98, 0.7 + personal_hits * 0.08)
                         dialog_db.requires_user_confirmation = False
-                        dialog_db.selected = False
-                        dialog_db.excluded = True
+                        # Source policy monitors every personal dialog. Relevance is
+                        # decided per message downstream, not by silently removing a chat.
+                        dialog_db.selected = True
+                        dialog_db.excluded = False
                         continue
                     frequency_boost = 0.08 if len(messages) >= 10 else 0
                     dialog_db.confidence = min(0.96, 0.32 + hits * 0.14 + frequency_boost)
                     dialog_db.classification = classification if hits >= 2 else "unknown"
-                    dialog_db.requires_user_confirmation = hits < 3
-                    if dialog_db.requires_user_confirmation:
-                        continue
+                    dialog_db.requires_user_confirmation = False
+                    dialog_db.selected = True
+                    dialog_db.excluded = False
                     metrics["probable_business_personal_dialogs"] += 1
                 if not messages:
                     continue
@@ -331,32 +395,9 @@ class TelegramSyncHandlers:
                     metrics["promises"] += 1
                 if any(term in texts for term in ("цена", "стоимость", "коммерческое предложение")):
                     metrics["potential_deals"] += 1
-                for kind, priority, confidence in candidates:
-                    fingerprint = f"{dialog.id}:{latest.id}:{kind}"
-                    exists = await session.scalar(
-                        select(OperationalProblem.id).where(
-                            OperationalProblem.fingerprint == fingerprint
-                        )
-                    )
-                    if exists:
-                        continue
-                    session.add(
-                        OperationalProblem(
-                            tenant_id=run.tenant_id,
-                            connection_id=run.connection_id,
-                            dialog_id=dialog.id,
-                            source_message_id=latest.id,
-                            fingerprint=fingerprint,
-                            problem_type=kind,
-                            priority=priority,
-                            confidence=confidence,
-                            evidence=(latest.body_text or "")[:2000],
-                            explanation="Правило первичного анализа обнаружило рабочий риск.",
-                            recommended_action="Проверить диалог и назначить ответственное действие.",
-                            occurred_at=latest_sent_at,
-                        )
-                    )
-                    metrics["problems_created"] += 1
+                # Findings are intentionally not materialized here. Initial,
+                # incremental and scheduled ingestion all converge on the same
+                # Signal -> correlation -> Problem lifecycle below.
             run.metrics_json = metrics
             run.status = "completed"
             run.stage = "completed"
@@ -369,3 +410,40 @@ class TelegramSyncHandlers:
             connection.last_sync_at = datetime.now(UTC)
 
         await self.transactions.run(write)
+        async with self.session_factory() as session:
+            run = await session.get(InitialAnalysisRun, run_id)
+            message_ids = list(
+                await session.scalars(
+                    select(TelegramMessage.id)
+                    .where(
+                        TelegramMessage.tenant_id == run.tenant_id,
+                        TelegramMessage.connection_id == run.connection_id,
+                        TelegramMessage.sent_at
+                        >= datetime.now(UTC) - timedelta(days=run.history_days),
+                    )
+                    .order_by(TelegramMessage.sent_at.asc())
+                )
+            )
+        batches = [message_ids[index : index + 100] for index in range(0, len(message_ids), 100)]
+        for index, batch in enumerate(batches):
+            await self.queue.enqueue(
+                "signal.scan_batch",
+                {"message_ids": batch, "source": "initial_sync"},
+                tenant_id=run.tenant_id,
+                telegram_account_id=run.connection_id,
+                priority=JOB_PRIORITY["P3"],
+                idempotency_key=f"signal-history-batch:{run.id}:{index}",
+                correlation_id=run.id,
+                category="historical",
+                cost_class="light",
+                max_attempts=3,
+            )
+
+        async def update_queued_count(session: AsyncSession) -> None:
+            current = await session.get(InitialAnalysisRun, run_id)
+            current.metrics_json = {
+                **(current.metrics_json or {}),
+                "analysis_jobs_queued": len(batches),
+            }
+
+        await self.transactions.run(update_queued_count)

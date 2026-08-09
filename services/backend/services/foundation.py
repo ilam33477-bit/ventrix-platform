@@ -83,7 +83,7 @@ class FoundationService:
             owner.telegram_username = username
         return owner
 
-    async def create_tenant(self, payload: TenantCreate) -> Tenant:
+    async def create_tenant(self, payload: TenantCreate, *, commit: bool = True) -> Tenant:
         owner = await self.ensure_owner()
         tenant = Tenant(
             name=payload.name.strip(),
@@ -135,8 +135,11 @@ class FoundationService:
         await self._audit(
             owner, "tenant.created", "tenant", tenant.id, tenant.id, {"name": tenant.name}
         )
-        await self.session.commit()
-        return await self._require_tenant(tenant.id)
+        if commit:
+            await self.session.commit()
+            return await self._require_tenant(tenant.id)
+        await self.session.flush()
+        return tenant
 
     async def update_tenant(self, tenant_id: UUID | str, payload: TenantUpdate) -> Tenant:
         tenant = await self._require_tenant(tenant_id)

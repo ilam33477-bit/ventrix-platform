@@ -14,6 +14,12 @@ class TenantCreateStates(StatesGroup):
     confirm = State()
 
 
+class TenantAICreateStates(StatesGroup):
+    prompt = State()
+    confirm = State()
+    correction = State()
+
+
 class TenantEditStates(StatesGroup):
     value = State()
     confirm = State()

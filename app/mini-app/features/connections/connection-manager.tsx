@@ -1,21 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { VentrixClientApi } from "../../api/client";
-import type { Employee, Folder, OnboardingStep, TelegramConnection } from "../../types";
+import type { Employee, OnboardingStep, TelegramConnection, TelegramSource, TelegramSourcePreview } from "../../types";
 import { Card, EmptyState, SectionHeading, StatusBadge } from "../../components/ui";
 
-type ConnectStep = "phone" | "code" | "password" | "folders" | "syncing" | "done";
+type ConnectStep = "phone" | "code" | "password" | "syncing" | "done";
 
 function initialConnectStep(
   onboardingStep: OnboardingStep | undefined,
   connection: TelegramConnection | undefined,
 ): ConnectStep {
-  if (onboardingStep === "scope_selection") return "folders";
+  if (onboardingStep === "monitoring_started") return "done";
   if (connection?.status === "awaiting_code") return "code";
   if (connection?.status === "awaiting_2fa") return "password";
-  if (connection?.status === "connected") return "folders";
+  if (connection?.status === "connected") return "syncing";
   if (["syncing", "ready"].includes(connection?.status ?? "")) return "done";
   return "phone";
 }
@@ -36,39 +36,26 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const [step, setStep] = useState<ConnectStep>(
     initialConnectStep(onboardingStep, initialConnections[0]),
   );
-  const [folders, setFolders] = useState<Folder[]>([]);
-  const [folderId, setFolderId] = useState<number | null>(null);
-  const [historyDays, setHistoryDays] = useState(7);
-  const [personalConsent, setPersonalConsent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const resumedScope = useRef(false);
-
-  const loadFolders = useCallback(async (id: string) => {
-    const catalog = await api.folderCatalog(id);
-    setFolders(catalog.folders);
-    setFolderId(catalog.folders[0]?.id ?? null);
-    setStep("folders");
-    await onOnboardingStep?.("scope_selection");
-  }, [api, onOnboardingStep]);
-
+  const [sourceLink, setSourceLink] = useState("");
+  const [sourcePreview, setSourcePreview] = useState<TelegramSourcePreview | null>(null);
+  const [previewJobId, setPreviewJobId] = useState("");
+  const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
+  const [sources, setSources] = useState<TelegramSource[]>([]);
   useEffect(() => {
     let cancelled = false;
     Promise.all([api.employees(), api.connections()]).then(([employeeRows, connectionRows]) => {
-      if (!cancelled) { setEmployees(employeeRows); setConnections(connectionRows); }
+      if (!cancelled) {
+        setEmployees(employeeRows); setConnections(connectionRows);
+        const activeId = connectionRows[0]?.id;
+        if (activeId) void api.sources(activeId).then((rows) => !cancelled && setSources(rows));
+      }
     }).catch((reason: Error) => !cancelled && setError(reason.message));
-    let scopeTimer: number | undefined;
-    if (step === "folders" && connectionId && !resumedScope.current) {
-      resumedScope.current = true;
-      scopeTimer = window.setTimeout(() => {
-        void loadFolders(connectionId).catch((reason: Error) => setError(reason.message));
-      }, 0);
-    }
     return () => {
       cancelled = true;
-      if (scopeTimer !== undefined) window.clearTimeout(scopeTimer);
     };
-  }, [api, connectionId, loadFolders, step]);
+  }, [api]);
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true); setError("");
@@ -85,16 +72,10 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     const result = await api.completeTelegramLogin(connectionId, withPassword ? { password } : { code });
     setCode(""); setPassword("");
     if (result.requires_2fa) { setStep("password"); return; }
-    await loadFolders(result.id);
-  });
-
-  const startSync = () => run(async () => {
-    if (folderId === null) throw new Error("Выберите рабочую папку");
     setStep("syncing");
-    await api.selectScope(connectionId, folderId, historyDays, personalConsent);
     setConnections(await api.connections());
     setStep("done");
-    await onOnboardingStep?.("employees_review");
+    await onOnboardingStep?.("monitoring_started");
   });
 
   const cancel = () => run(async () => {
@@ -102,21 +83,52 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     setStep("phone"); setConnectionId(""); setError("");
   });
 
+  const waitForJob = async <T,>(jobId: string): Promise<T> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const job = await api.job<T>(jobId);
+      if (job.status === "completed" && job.result) return job.result;
+      if (["failed", "dead", "cancelled"].includes(job.status)) {
+        throw new Error(job.last_error ?? "Операция Telegram не выполнена");
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+    throw new Error("Telegram отвечает дольше обычного. Попробуйте ещё раз.");
+  };
+
+  const previewSource = () => run(async () => {
+    if (!connectionId) throw new Error("Сначала подключите Telegram-аккаунт");
+    const operation = await api.previewSource(connectionId, sourceLink);
+    const preview = await waitForJob<TelegramSourcePreview>(operation.job_id);
+    setPreviewJobId(operation.job_id);
+    setSourcePreview(preview);
+    setSelectedPeerIds(preview.peers.map((item) => item.canonical_peer_id));
+  });
+
+  const addSources = () => run(async () => {
+    if (!sourcePreview || !previewJobId) return;
+    const operation = await api.confirmSources(
+      connectionId, previewJobId, selectedPeerIds, sourcePreview.requires_join,
+    );
+    await waitForJob(operation.job_id);
+    setSources(await api.sources(connectionId));
+    setSourceLink(""); setSourcePreview(null); setPreviewJobId("");
+  });
+
   return <section className="connection-feature">
-    <SectionHeading eyebrow="TELEGRAM CONNECTIONS" title="Рабочие Telegram-аккаунты" description="Ventrix анализирует только выбранную рабочую папку и не сохраняет код подтверждения или пароль 2FA." />
+    <SectionHeading eyebrow="TELEGRAM CONNECTIONS" title="Рабочие Telegram-аккаунты" description="Личные диалоги подключаются автоматически. Группы добавляются отдельно и только после вашего подтверждения." />
     <div className="connection-layout">
       <Card className="connection-wizard">
-        <div className="step-dots"><span className={step === "phone" ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["folders", "syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={step === "folders" ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>3</span></div>
+        <div className="step-dots"><span className={step === "phone" ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
         {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Код придёт в официальный чат Telegram подключаемого аккаунта.</p><label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || phone.length < 8} onClick={startLogin}>{busy ? "Отправляем код…" : "Получить код"}</button></>}
         {step === "code" && <><h3>Код подтверждения</h3><p>Введите код из Telegram. Ventrix использует его один раз и не сохраняет.</p><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button></>}
         {step === "password" && <><h3>Пароль 2FA</h3><p>Пароль передаётся только для входа в Telegram и не сохраняется.</p><label>Облачный пароль<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary-action" disabled={busy || !password} onClick={() => completeLogin(true)}>Подключить аккаунт</button></>}
-        {step === "folders" && <><h3>Выберите рабочую папку</h3><p>Чаты вне выбранной папки не попадут в анализ.</p><div className="folder-list">{folders.map((folder) => <label className={folderId === folder.id ? "selected" : ""} key={folder.id}><input type="radio" checked={folderId === folder.id} onChange={() => setFolderId(folder.id)} /><span><strong>{folder.title}</strong><small>{folder.chat_count} чатов</small></span></label>)}</div><label>Глубина истории<select value={historyDays} onChange={(event) => setHistoryDays(Number(event.target.value))}>{[3, 7, 14, 30].map((days) => <option value={days} key={days}>{days} дней</option>)}</select></label><label className="inline-check"><input type="checkbox" checked={personalConsent} onChange={(event) => setPersonalConsent(event.target.checked)} />Включить выбранные личные рабочие диалоги</label><button className="primary-action" disabled={busy || folderId === null} onClick={startSync}>Начать анализ</button></>}
         {step === "syncing" && <><h3>Запускаем анализ</h3><div className="state-progress"><i /></div><p>Mini App можно закрыть — прогресс сохранится.</p></>}
-        {step === "done" && <div className="connection-done"><span>✓</span><h3>Аккаунт подключён</h3><p>Ventrix начал загружать выбранную рабочую историю.</p></div>}
+        {step === "done" && <div className="connection-done"><span>✓</span><h3>Аккаунт подключён</h3><p>Ventrix начал загружать последние 7 дней личных рабочих диалогов. Рабочие группы можно добавить по ссылке позже в разделе Telegram.</p>{onboardingStep === "monitoring_started" && <button className="primary-action" onClick={() => void onOnboardingStep?.("employees")}>Продолжить</button>}</div>}
         {error && <p className="form-error">{error}</p>}
-        {["code", "password", "folders"].includes(step) && <button className="text-action" disabled={busy} onClick={cancel}>Отменить подключение</button>}
+        {["code", "password"].includes(step) && <button className="text-action" disabled={busy} onClick={cancel}>Отменить подключение</button>}
       </Card>
       <Card className="managed-connections"><div className="card-title"><h3>Подключённые аккаунты</h3><StatusBadge tone="neutral">{connections.length}</StatusBadge></div>{connections.length ? connections.map((item) => <div className="connection-row" key={item.id}><span>{(item.account ?? "TG").slice(0, 2).toUpperCase()}</span><div><strong>{item.account ?? "Telegram account"}</strong><small>{item.folder ?? item.username ?? item.status}</small></div><StatusBadge tone={["connected", "ready", "syncing"].includes(item.status) ? "success" : "warning"}>{item.status}</StatusBadge></div>) : <EmptyState title="Аккаунтов пока нет" description="Первый аккаунт появится после подтверждения Telegram-кода." />}<p className="security-message">Данные рабочих сессий защищены шифрованием. Коды подтверждения и пароль 2FA не сохраняются.</p></Card>
+      {connections.length > 0 && <Card className="managed-sources"><div className="card-title"><h3>Рабочие группы</h3><StatusBadge tone="neutral">{sources.length}</StatusBadge></div><p>Личные диалоги уже включены. Вставьте ссылку на группу или общую папку Telegram — Ventrix сначала покажет содержимое и ничего не подключит без подтверждения.</p><label>Ссылка Telegram<input type="url" placeholder="https://t.me/+… или https://t.me/addlist/…" value={sourceLink} onChange={(event) => setSourceLink(event.target.value)} /></label><button className="primary-action" disabled={busy || sourceLink.length < 5} onClick={previewSource}>Проверить ссылку</button>{sourcePreview && <div className="folder-list">{sourcePreview.peers.map((peer) => <label className={selectedPeerIds.includes(peer.canonical_peer_id) ? "selected" : ""} key={peer.canonical_peer_id}><input type="checkbox" checked={selectedPeerIds.includes(peer.canonical_peer_id)} onChange={(event) => setSelectedPeerIds((current) => event.target.checked ? [...current, peer.canonical_peer_id] : current.filter((id) => id !== peer.canonical_peer_id))} /><span><strong>{peer.title}</strong><small>{peer.source_type}{peer.participants_count ? ` · ${peer.participants_count} участников` : ""}</small></span></label>)}</div>}{sourcePreview && <button className="primary-action" disabled={busy || selectedPeerIds.length === 0} onClick={addSources}>{sourcePreview.requires_join ? "Вступить и подключить" : "Подключить выбранное"}</button>}{sources.map((source) => <div className="connection-row" key={source.id}><span>#</span><div><strong>{source.title}</strong><small>{source.type} · {source.added_via}</small></div><StatusBadge tone={source.enabled ? "success" : "neutral"}>{source.enabled ? "анализируется" : "выключено"}</StatusBadge></div>)}</Card>}
     </div>
   </section>;
 }

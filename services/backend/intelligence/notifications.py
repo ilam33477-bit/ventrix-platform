@@ -47,28 +47,35 @@ class NotificationPolicyService:
         now: datetime,
     ) -> NotificationDecision:
         criticality = signal.criticality
+        triage = (signal.metadata_json or {}).get("triage") or {}
+        employee_requested = bool(triage.get("requires_employee_notification", True))
+        manager_requested = bool(triage.get("requires_manager_notification", True))
         employee_allowed = bool(
             settings.employee_notifications_enabled
             and employee
             and employee.notifications_enabled
             and employee.telegram_user_id
-            and criticality >= employee.criticality_threshold
+            and criticality
+            >= max(settings.employee_notification_threshold, employee.criticality_threshold)
+            and employee_requested
             and not self._quiet(employee, settings.timezone, now)
         )
-        manager_allowed = criticality >= settings.signal_problem_threshold
+        manager_allowed = bool(
+            criticality >= settings.manager_notification_threshold and manager_requested
+        )
         group_allowed = bool(
             settings.group_reminders_enabled
             and source_type == "group"
             and group
             and group.status == "active"
             and group.notifications_enabled
-            and criticality >= group.minimum_criticality
+            and criticality >= max(settings.group_notification_threshold, group.minimum_criticality)
         )
-        immediate = criticality >= settings.signal_immediate_threshold
+        immediate = criticality >= settings.notification_immediate_threshold
         return NotificationDecision(
-            notify_employee=employee_allowed and immediate,
+            notify_employee=employee_allowed,
             notify_manager=manager_allowed,
-            notify_group=group_allowed and immediate,
+            notify_group=group_allowed,
             immediate=immediate,
             reason="central policy thresholds, privacy, quiet hours and destination state",
         )
@@ -195,6 +202,7 @@ class NotificationOrchestrator:
                 destination_type,
                 destination_id,
                 employee_id,
+                bypass_cooldown=decision.immediate,
             )
             if notification_id:
                 notification_ids.append(notification_id)
@@ -220,6 +228,8 @@ class NotificationOrchestrator:
         destination_type: str,
         destination_id: str,
         employee_id: str | None,
+        *,
+        bypass_cooldown: bool,
     ) -> str | None:
         dedup_key = f"signal:{signal.id}:{destination_type}:{destination_id}"
 
@@ -229,20 +239,34 @@ class NotificationOrchestrator:
                 select(NotificationLog.id).where(NotificationLog.deduplication_key == dedup_key)
             ):
                 return None
-            if await session.scalar(
-                select(NotificationLog.id).where(
-                    NotificationLog.tenant_id == signal.tenant_id,
-                    NotificationLog.destination_type == destination_type,
-                    NotificationLog.destination_id == destination_id,
-                    NotificationLog.cooldown_until.is_not(None),
-                    NotificationLog.cooldown_until > now,
-                    NotificationLog.status.in_(("pending", "sent")),
+            severity_floor = (signal.criticality // 10) * 10
+            if not bypass_cooldown:
+                recent_equivalent = await session.scalar(
+                    select(NotificationLog.id)
+                    .join(Signal, Signal.id == NotificationLog.signal_id)
+                    .where(
+                        NotificationLog.tenant_id == signal.tenant_id,
+                        NotificationLog.destination_type == destination_type,
+                        NotificationLog.destination_id == destination_id,
+                        NotificationLog.cooldown_until.is_not(None),
+                        NotificationLog.cooldown_until > now,
+                        NotificationLog.status.in_(("pending", "sent")),
+                        Signal.dialog_id == signal.dialog_id,
+                        Signal.signal_type == signal.signal_type,
+                        NotificationLog.criticality >= severity_floor,
+                        NotificationLog.criticality < min(101, severity_floor + 10),
+                    )
                 )
-            ):
-                return None
+                if recent_equivalent:
+                    return None
             is_group = destination_type == "group"
             title = self._title(signal.signal_type)
-            text = f"⚠️ <b>{title}</b>\n\nКритичность: {signal.criticality}/100.\n" + (
+            provisional = bool(
+                (signal.metadata_json or {}).get("fast_lane")
+                and not (signal.metadata_json or {}).get("triage")
+            )
+            prefix = "Предварительный критический сигнал: " if provisional else ""
+            text = f"⚠️ <b>{prefix}{title}</b>\n\nКритичность: {signal.criticality}/100.\n" + (
                 "Откройте Ventrix для просмотра деталей."
                 if is_group
                 else f"Причина: {signal.reason}\nПроверьте соответствующий диалог."
@@ -257,7 +281,11 @@ class NotificationOrchestrator:
                 destination_id=destination_id,
                 deduplication_key=dedup_key,
                 criticality=signal.criticality,
-                payload_json={"text": text, "privacy_safe": is_group},
+                payload_json={
+                    "text": text,
+                    "privacy_safe": is_group,
+                    "provisional": provisional,
+                },
                 cooldown_until=now + timedelta(minutes=self.cooldown_minutes),
             )
             session.add(log)
@@ -265,6 +293,97 @@ class NotificationOrchestrator:
             return log.id
 
         return await self.transactions.run(write)
+
+    async def reconcile_provisional(
+        self,
+        signal_id: str,
+        *,
+        confirmed: bool,
+        confirmed_criticality: int,
+    ) -> list[str]:
+        """Update pending provisional alerts or issue a correction after delivery."""
+
+        async def write(session: AsyncSession) -> list[str]:
+            logs = list(
+                await session.scalars(
+                    select(NotificationLog).where(NotificationLog.signal_id == signal_id)
+                )
+            )
+            correction_ids: list[str] = []
+            for log in logs:
+                if not (log.payload_json or {}).get("provisional"):
+                    continue
+                if confirmed:
+                    log.criticality = confirmed_criticality
+                    log.payload_json = {
+                        **log.payload_json,
+                        "provisional": False,
+                        "confirmed": True,
+                        "text": str(log.payload_json["text"]).replace(
+                            "Предварительный критический сигнал: ", ""
+                        ),
+                    }
+                    continue
+                if log.status == "pending":
+                    log.status = "cancelled"
+                    log.payload_json = {**log.payload_json, "provisional": False, "cancelled": True}
+                    continue
+                if log.status != "sent":
+                    continue
+                correction_key = f"{log.deduplication_key}:correction"
+                exists = await session.scalar(
+                    select(NotificationLog.id).where(
+                        NotificationLog.deduplication_key == correction_key
+                    )
+                )
+                if exists:
+                    continue
+                correction = NotificationLog(
+                    tenant_id=log.tenant_id,
+                    signal_id=log.signal_id,
+                    problem_id=log.problem_id,
+                    employee_id=log.employee_id,
+                    group_integration_id=log.group_integration_id,
+                    destination_type=log.destination_type,
+                    destination_id=log.destination_id,
+                    deduplication_key=correction_key,
+                    criticality=confirmed_criticality,
+                    payload_json={
+                        "text": "ℹ️ Предварительный сигнал проверен: критическая ситуация не подтверждена.",
+                        "privacy_safe": log.destination_type == "group",
+                        "provisional": False,
+                        "correction": True,
+                    },
+                )
+                session.add(correction)
+                await session.flush()
+                correction_ids.append(correction.id)
+            return correction_ids
+
+        correction_ids = await self.transactions.run(write)
+        async with self.session_factory() as session:
+            corrections = (
+                list(
+                    await session.scalars(
+                        select(NotificationLog).where(NotificationLog.id.in_(correction_ids))
+                    )
+                )
+                if correction_ids
+                else []
+            )
+        for correction in corrections:
+            await self.queue.enqueue(
+                f"notification.{correction.destination_type}",
+                {"notification_id": correction.id},
+                tenant_id=correction.tenant_id,
+                priority=JOB_PRIORITY["P0"],
+                idempotency_key=f"notification-job:{correction.id}",
+                correlation_id=signal_id,
+                category="notification",
+                cost_class="light",
+                max_attempts=5,
+            )
+        return correction_ids
 
     @staticmethod
     def _title(signal_type: str) -> str:

@@ -10,12 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.ai_router import RouteName
 
 from ..database import SQLiteTransactionManager
+from ..intelligence.problem_lifecycle import initialize_problem_lifecycle
 from ..jobs.queue import JobDeferred, JobLease, SQLiteJobQueue
 from ..models import (
     AIUsageMetric,
     AnalysisBatch,
     AnalysisRun,
     Commitment,
+    DialogState,
     Employee,
     GroupIntegration,
     OperationalProblem,
@@ -88,21 +90,38 @@ class AnalysisPipelineService:
             raise ValueError("analysis pipeline requires tenant")
         if job.telegram_account_id is None:
             connections = await self._connections(job.tenant_id)
+            tenant_run = await self._get_or_create_tenant_run(job, connections)
             for connection in connections:
                 await self.queue.enqueue(
                     "analysis.connection",
-                    dict(job.payload),
+                    {**job.payload, "tenant_run_id": tenant_run.id},
                     tenant_id=job.tenant_id,
                     telegram_account_id=connection.id,
                     priority=job.attempts + 40,
                     idempotency_key=f"analysis-connection:{job.id}:{connection.id}",
                     correlation_id=job.correlation_id or job.id,
                     is_heavy=True,
-                    category="ai_heavy",
+                    category="analysis",
                     cost_class="heavy",
                     max_attempts=5,
                 )
-            return {"connections": len(connections), "fan_out": True}
+            await self.queue.enqueue(
+                "analysis.aggregate",
+                {"tenant_run_id": tenant_run.id},
+                tenant_id=job.tenant_id,
+                priority=80,
+                idempotency_key=f"analysis-aggregate:{tenant_run.id}",
+                correlation_id=tenant_run.correlation_id,
+                is_heavy=True,
+                category="report",
+                cost_class="heavy",
+                max_attempts=5,
+            )
+            return {
+                "tenant_run_id": tenant_run.id,
+                "connections": len(connections),
+                "fan_out": True,
+            }
         connection = await self._connection(job.tenant_id, job.telegram_account_id)
         if connection is None or connection.session_secret_id is None:
             raise RuntimeError("tenant Telegram connection is unavailable")
@@ -125,19 +144,20 @@ class AnalysisPipelineService:
                 cost_class="heavy",
                 max_attempts=3,
             )
-        await self.queue.enqueue(
-            "report_generation",
-            {"analysis_run_id": run.id},
-            tenant_id=job.tenant_id,
-            telegram_account_id=connection.id,
-            priority=80,
-            idempotency_key=f"report-generation:{run.id}",
-            correlation_id=run.correlation_id,
-            is_heavy=True,
-            category="report",
-            cost_class="heavy",
-            max_attempts=3,
-        )
+        if not job.payload.get("tenant_run_id"):
+            await self.queue.enqueue(
+                "report_generation",
+                {"analysis_run_id": run.id},
+                tenant_id=job.tenant_id,
+                telegram_account_id=connection.id,
+                priority=80,
+                idempotency_key=f"report-generation:{run.id}",
+                correlation_id=run.correlation_id,
+                is_heavy=True,
+                category="report",
+                cost_class="heavy",
+                max_attempts=3,
+            )
         return {"analysis_run_id": run.id, "batches": len(batch_ids)}
 
     async def process_batch(self, job: JobLease) -> dict[str, Any]:
@@ -237,6 +257,95 @@ class AnalysisPipelineService:
         )
         return result
 
+    async def aggregate_tenant_run(self, job: JobLease) -> dict[str, Any]:
+        tenant_run_id = str(job.payload["tenant_run_id"])
+        async with self.session_factory() as session:
+            tenant_run = await session.scalar(
+                select(AnalysisRun).where(
+                    AnalysisRun.id == tenant_run_id,
+                    AnalysisRun.tenant_id == job.tenant_id,
+                )
+            )
+            if tenant_run is None:
+                raise LookupError("tenant analysis run not found")
+            expected_connection_ids = set(
+                (tenant_run.metrics_json or {}).get("expected_connection_ids", [])
+            )
+            children = list(
+                await session.scalars(
+                    select(AnalysisRun).where(
+                        AnalysisRun.tenant_id == job.tenant_id,
+                        AnalysisRun.telegram_account_id.in_(expected_connection_ids),
+                    )
+                )
+            )
+            children = [
+                child
+                for child in children
+                if (child.metrics_json or {}).get("tenant_run_id") == tenant_run_id
+            ]
+            child_ids = [child.id for child in children]
+            batches = (
+                list(
+                    await session.scalars(
+                        select(AnalysisBatch).where(AnalysisBatch.run_id.in_(child_ids))
+                    )
+                )
+                if child_ids
+                else []
+            )
+        if len(children) < len(expected_connection_ids):
+            raise JobDeferred(2, "waiting_for_account_analysis_runs")
+        if any(item.status in {"pending", "running"} for item in batches):
+            raise JobDeferred(2, "waiting_for_account_ai_batches")
+        if any(item.status == "failed" for item in batches):
+            await self._fail_run(tenant_run_id, "required_account_ai_batch_failed")
+            raise RuntimeError("required account AI batch failed")
+
+        async def finish_children(session: AsyncSession) -> None:
+            current = await session.get(AnalysisRun, tenant_run_id)
+            current.required_batches = len(batches)
+            current.completed_batches = sum(item.status == "completed" for item in batches)
+            current.input_tokens = sum(item.input_tokens or 0 for item in batches)
+            current.output_tokens = sum(item.output_tokens or 0 for item in batches)
+            current.metrics_json = {
+                **(current.metrics_json or {}),
+                "processed_dialog_versions": {
+                    batch.dialog_id: int(
+                        (batch.payload_json or {}).get("dialog", {}).get("state_version", 0)
+                    )
+                    for batch in batches
+                },
+            }
+            for child in children:
+                stored = await session.get(AnalysisRun, child.id)
+                stored.status = "completed"
+                stored.stage = "aggregated"
+                stored.finished_at = datetime.now(UTC)
+
+        await self.transactions.run(finish_children)
+        result = await self._build_report(tenant_run_id)
+        report_id = str(result["report_id"])
+        await self.queue.enqueue(
+            "report_delivery",
+            {"report_id": report_id},
+            tenant_id=job.tenant_id,
+            priority=90,
+            idempotency_key=f"report-delivery:{report_id}",
+            correlation_id=tenant_run_id,
+            category="report",
+        )
+        await self.queue.enqueue(
+            "statistics_refresh",
+            {"report_id": report_id},
+            tenant_id=job.tenant_id,
+            priority=100,
+            idempotency_key=f"statistics-refresh:{report_id}",
+            correlation_id=tenant_run_id,
+            category="general",
+        )
+        return {**result, "connections": len(children), "consolidated": True}
+
     async def _connection(self, tenant_id: str, connection_id: str) -> TelegramConnection | None:
         async with self.session_factory() as session:
             return await session.scalar(
@@ -280,7 +389,8 @@ class AnalysisPipelineService:
                 started_at=datetime.now(UTC),
                 token_budget=self.token_budget,
                 metrics_json={
-                    "history_window_days": int(job.payload.get("history_window_days", 30))
+                    "history_window_days": int(job.payload.get("history_window_days", 30)),
+                    "tenant_run_id": job.payload.get("tenant_run_id"),
                 },
                 correlation_id=job.id,
             )
@@ -294,6 +404,41 @@ class AnalysisPipelineService:
                 else "manual_analysis_started",
                 metadata={"analysis_run_id": run.id},
             )
+            return run.id
+
+        run_id = await self.transactions.run(write)
+        async with self.session_factory() as session:
+            return await session.get(AnalysisRun, run_id)
+
+    async def _get_or_create_tenant_run(
+        self, job: JobLease, connections: list[TelegramConnection]
+    ) -> AnalysisRun:
+        correlation_id = job.correlation_id or job.id
+
+        async def write(session: AsyncSession) -> str:
+            existing = await session.scalar(
+                select(AnalysisRun).where(AnalysisRun.correlation_id == correlation_id)
+            )
+            if existing:
+                return existing.id
+            due = job.payload.get("report_due_at")
+            run = AnalysisRun(
+                tenant_id=job.tenant_id,
+                telegram_account_id=None,
+                trigger=str(job.payload.get("trigger") or "manual"),
+                status="running",
+                stage="account_fan_out",
+                report_due_at=datetime.fromisoformat(due) if due else None,
+                started_at=datetime.now(UTC),
+                token_budget=self.token_budget,
+                metrics_json={
+                    "history_window_days": int(job.payload.get("history_window_days", 30)),
+                    "expected_connection_ids": [item.id for item in connections],
+                },
+                correlation_id=correlation_id,
+            )
+            session.add(run)
+            await session.flush()
             return run.id
 
         run_id = await self.transactions.run(write)
@@ -354,6 +499,8 @@ class AnalysisPipelineService:
 
         async def write(session: AsyncSession) -> None:
             nonlocal created
+            connection = await session.get(TelegramConnection, dialog.connection_id)
+            dialog_connection_employee = connection.assigned_employee_id if connection else None
             for result in parsed.dialog_results:
                 for candidate in result.problems:
                     if not candidate.is_problem or not candidate.source_message_ids:
@@ -368,32 +515,75 @@ class AnalysisPipelineService:
                     )
                     if source is None:
                         continue
-                    digest = hashlib.sha256(
-                        f"{batch.tenant_id}:{batch.dialog_id}:{candidate.event_type}:"
-                        f"{','.join(map(str, candidate.source_message_ids))}".encode()
+                    signal_fingerprint = hashlib.sha256(
+                        f"{batch.tenant_id}:{source.id}:{candidate.event_type}".encode()
                     ).hexdigest()
+                    signal = await session.scalar(
+                        select(Signal).where(Signal.fingerprint == signal_fingerprint)
+                    )
+                    criticality = {
+                        "critical": 95,
+                        "high": 80,
+                        "medium": 65,
+                        "low": 40,
+                        "informational": 20,
+                    }.get(candidate.priority, round(candidate.confidence * 100))
+                    if signal is None:
+                        signal = Signal(
+                            tenant_id=batch.tenant_id,
+                            telegram_connection_id=dialog.connection_id,
+                            dialog_id=batch.dialog_id,
+                            source_message_id=source.id,
+                            employee_id=dialog_connection_employee,
+                            fingerprint=signal_fingerprint,
+                            signal_type=candidate.event_type,
+                            local_score=criticality,
+                            ai_score=criticality,
+                            criticality=criticality,
+                            status="problem_created",
+                            reason=candidate.summary,
+                            detected_at=source.sent_at,
+                            processed_at=datetime.now(UTC),
+                            metadata_json={
+                                "source": "scheduled_analysis",
+                                "batch_id": batch.id,
+                                "evidence": candidate.evidence,
+                            },
+                        )
+                        session.add(signal)
+                        await session.flush()
+                    problem_fingerprint = f"signal:{signal_fingerprint}"
                     exists = await session.scalar(
                         select(OperationalProblem.id).where(
-                            OperationalProblem.fingerprint == digest
+                            OperationalProblem.fingerprint == problem_fingerprint
                         )
                     )
                     if exists:
                         continue
-                    session.add(
-                        OperationalProblem(
-                            tenant_id=batch.tenant_id,
-                            connection_id=dialog.connection_id,
-                            dialog_id=batch.dialog_id,
-                            source_message_id=source.id,
-                            fingerprint=digest,
-                            problem_type=candidate.event_type,
-                            status="needs_confirmation" if candidate.requires_review else "open",
-                            priority=candidate.priority,
-                            confidence=candidate.confidence,
-                            evidence="\n".join(candidate.evidence)[:4000],
-                            explanation=candidate.summary,
-                            recommended_action=candidate.recommended_action,
-                            occurred_at=source.sent_at,
+                    problem = OperationalProblem(
+                        tenant_id=batch.tenant_id,
+                        connection_id=dialog.connection_id,
+                        dialog_id=batch.dialog_id,
+                        source_message_id=source.id,
+                        signal_id=signal.id,
+                        responsible_employee_id=dialog_connection_employee,
+                        fingerprint=problem_fingerprint,
+                        problem_type=candidate.event_type,
+                        priority=candidate.priority,
+                        confidence=candidate.confidence,
+                        evidence="\n".join(candidate.evidence)[:4000],
+                        explanation=candidate.summary,
+                        recommended_action=candidate.recommended_action,
+                        occurred_at=source.sent_at,
+                    )
+                    session.add(problem)
+                    await session.flush()
+                    session.add_all(
+                        initialize_problem_lifecycle(
+                            problem,
+                            responsible_employee_id=dialog_connection_employee,
+                            requires_confirmation=candidate.requires_review,
+                            reason="Ответственный определён для результата scheduled analysis.",
                         )
                     )
                     created += 1
@@ -559,6 +749,22 @@ class AnalysisPipelineService:
             current.finished_at = now
             current.delayed_reason = "completed_after_due_time" if delayed else None
             current.metrics_json = metrics
+            processed_versions = (run.metrics_json or {}).get("processed_dialog_versions", {})
+            if not processed_versions:
+                processed_versions = {
+                    batch.dialog_id: int(
+                        (batch.payload_json or {}).get("dialog", {}).get("state_version", 0)
+                    )
+                    for batch in await session.scalars(
+                        select(AnalysisBatch).where(AnalysisBatch.run_id == current.id)
+                    )
+                }
+            for dialog_id, version in processed_versions.items():
+                state = await session.scalar(
+                    select(DialogState).where(DialogState.dialog_id == dialog_id)
+                )
+                if state is not None:
+                    state.last_report_version = max(state.last_report_version, int(version))
             await add_system_event(
                 session,
                 tenant_id=current.tenant_id,

@@ -1,13 +1,21 @@
 import type {
   Bootstrap,
+  ClientSettings,
   ClientOnboarding,
+  Commitment,
   Employee,
   Folder,
   GroupIntegration,
   MiniAppAuth,
   OnboardingStep,
+  Problem,
+  ProblemDetail,
+  ProblemStatus,
+  ReportDetail,
   ReportSummary,
   TelegramConnection,
+  TelegramSource,
+  AsyncJob,
 } from "../types";
 
 export class ClientApiError extends Error {
@@ -52,10 +60,10 @@ export class VentrixClientApi {
     return { auth, bootstrap };
   }
 
-  updateOnboarding(step: OnboardingStep) {
+  updateOnboarding(step: OnboardingStep, status: "completed" | "skipped" = "completed") {
     return this.request<ClientOnboarding>("/onboarding", {
       method: "PATCH",
-      body: JSON.stringify({ step }),
+      body: JSON.stringify({ step, status }),
     });
   }
 
@@ -73,6 +81,96 @@ export class VentrixClientApi {
 
   reports() {
     return this.request<ReportSummary[]>("/reports");
+  }
+
+  report(reportId: string) {
+    return this.request<ReportDetail>(`/reports/${reportId}`);
+  }
+
+  problems(status?: string) {
+    const query = status ? `?status=${encodeURIComponent(status)}` : "";
+    return this.request<Problem[]>(`/problems${query}`);
+  }
+
+  problem(problemId: string) {
+    return this.request<ProblemDetail>(`/problems/${problemId}`);
+  }
+
+  transitionProblem(problemId: string, value: {
+    status: ProblemStatus;
+    reason: string;
+    evidence?: string;
+    responsible_employee_id?: string | null;
+    deadline_at?: string | null;
+  }) {
+    return this.request<{ id: string; status: ProblemStatus }>(`/problems/${problemId}`, {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    });
+  }
+
+  commitments() {
+    return this.request<Commitment[]>("/commitments");
+  }
+
+  updateCommitment(commitmentId: string, status: "completed" | "cancelled", reason: string) {
+    return this.request<{ id: string; status: string }>(`/commitments/${commitmentId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status, reason }),
+    });
+  }
+
+  createEmployee(value: {
+    display_name: string;
+    telegram_user_id?: number | null;
+    telegram_username?: string | null;
+    role: "manager" | "employee" | "observer";
+    notifications_enabled: boolean;
+    criticality_threshold: number;
+  }) {
+    return this.request<{ id: string }>("/employees", {
+      method: "POST",
+      body: JSON.stringify(value),
+    });
+  }
+
+  updateEmployee(employeeId: string, value: Partial<{
+    display_name: string;
+    telegram_user_id: number | null;
+    telegram_username: string | null;
+    role: "manager" | "employee" | "observer";
+    status: "active" | "inactive";
+    notifications_enabled: boolean;
+    criticality_threshold: number;
+  }>) {
+    return this.request<Employee>(`/employees/${employeeId}`, {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    });
+  }
+
+  settings() {
+    return this.request<ClientSettings>("/settings");
+  }
+
+  updateSettings(value: Partial<ClientSettings>) {
+    return this.request<ClientSettings>("/settings", {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    });
+  }
+
+  updateGroup(groupId: string, value: Partial<{
+    title: string;
+    status: "pending" | "active" | "disabled";
+    notifications_enabled: boolean;
+    minimum_criticality: number;
+    reminder_cooldown_minutes: number;
+  }>) {
+    return this.request<GroupIntegration>(`/group-integrations/${groupId}`, {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    });
   }
 
   startTelegramLogin(phone: string, employeeId: string | null) {
@@ -115,5 +213,31 @@ export class VentrixClientApi {
     return this.request<{ cancelled: boolean }>(`/connections/${connectionId}/login/cancel`, {
       method: "POST",
     });
+  }
+
+  sources(connectionId: string) {
+    return this.request<TelegramSource[]>(`/connections/${connectionId}/sources`);
+  }
+
+  previewSource(connectionId: string, link: string) {
+    return this.request<{ job_id: string }>(`/connections/${connectionId}/sources/preview`, {
+      method: "POST",
+      body: JSON.stringify({ link }),
+    });
+  }
+
+  confirmSources(connectionId: string, previewJobId: string, peerIds: string[], join: boolean) {
+    return this.request<{ job_id: string }>(`/connections/${connectionId}/sources/confirm`, {
+      method: "POST",
+      body: JSON.stringify({
+        preview_job_id: previewJobId,
+        selected_peer_ids: peerIds,
+        join,
+      }),
+    });
+  }
+
+  job<T = Record<string, unknown>>(jobId: string) {
+    return this.request<AsyncJob<T>>(`/sync/${jobId}`);
   }
 }

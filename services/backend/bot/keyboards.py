@@ -35,6 +35,58 @@ def cancel_flow() -> InlineKeyboardMarkup:
     )
 
 
+def tenant_create_mode() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✨ Описать клиента текстом", callback_data="owner:tenant_create:ai"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Заполнить вручную", callback_data="owner:tenant_create:manual"
+                )
+            ],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="owner:menu")],
+        ]
+    )
+
+
+def ai_draft_confirmation() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✓ Создать клиента", callback_data="flow:ai_draft:confirm")],
+            [InlineKeyboardButton(text="☷ Изменить поле", callback_data="flow:ai_draft:fields")],
+            [
+                InlineKeyboardButton(
+                    text="✎ Исправить текстом", callback_data="flow:ai_draft:correct"
+                )
+            ],
+            [InlineKeyboardButton(text="✕ Отменить", callback_data="flow:cancel")],
+        ]
+    )
+
+
+def ai_draft_field_selector() -> InlineKeyboardMarkup:
+    fields = (
+        ("Компания", "name"),
+        ("Telegram ID", "owner_telegram_user_id"),
+        ("Ниша", "niche"),
+        ("Продукты", "products_services"),
+        ("Аудитория", "target_audience"),
+        ("SLA", "response_sla_minutes"),
+        ("Отчёт", "daily_report_time"),
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"flow:ai_draft:field:{field}")]
+            for label, field in fields
+        ]
+        + [[InlineKeyboardButton(text="← К черновику", callback_data="flow:ai_draft:back")]]
+    )
+
+
 def optional_username() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

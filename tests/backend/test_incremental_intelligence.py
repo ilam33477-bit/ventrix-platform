@@ -8,15 +8,17 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from services.backend.intelligence.ai_triage import AITriageService
-from services.backend.intelligence.local_signals import LocalSignalEngine
+from services.backend.intelligence.local_signals import LocalSignalEngine, parse_deadline
 from services.backend.intelligence.notifications import NotificationOrchestrator
 from services.backend.intelligence.reconciliation import ReconciliationService
+from services.backend.intelligence.signals import SignalService
 from services.backend.intelligence.triage import parse_triage_result
-from services.backend.jobs.queue import JOB_PRIORITY, SQLiteJobQueue
+from services.backend.jobs.queue import JOB_PRIORITY, JobLease, SQLiteJobQueue
 from services.backend.models import (
     AIUsageCall,
     BackgroundJob,
     Commitment,
+    DialogState,
     Employee,
     GroupIntegration,
     NotificationLog,
@@ -114,6 +116,11 @@ class FakeTriageProvider:
         )
 
 
+class RejectedTriageProvider(FakeTriageProvider):
+    def __init__(self) -> None:
+        super().__init__(criticality=20)
+
+
 async def _tenant(session_factory, make_service, tenant_payload):
     async with session_factory() as session:
         return await make_service(session).create_tenant(tenant_payload)
@@ -155,6 +162,86 @@ async def test_tenant_supports_multiple_independent_telegram_connections(
     connections = await service.get_all(tenant.id)
     assert {item.id for item in connections} == {first.id, second.id}
     assert {item.telegram_user_id for item in connections} == {800_011, 800_022}
+
+
+@pytest.mark.asyncio
+async def test_dialog_sla_timer_is_durable_and_employee_reply_cancels_it(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    async with session_factory() as session:
+        incoming = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=100,
+            sender_id=77,
+            sender_role="customer",
+            sent_at=datetime.now(UTC),
+            outgoing=False,
+            body_text="Подскажите статус?",
+            attachments_json=[],
+        )
+        session.add(incoming)
+        await session.commit()
+    queue = SQLiteJobQueue(session_factory)
+    signals = SignalService(session_factory, queue)
+    lease = JobLease(
+        id="sla-incoming",
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+        dialog_id=dialog.id,
+        correlation_id=None,
+        job_type="signal.local_scan",
+        category="realtime",
+        cost_class="light",
+        payload={"message_id": incoming.id},
+        attempts=0,
+        max_attempts=3,
+        locked_by="sla-test",
+    )
+    await signals.local_scan_job(lease)
+
+    async with session_factory() as session:
+        state = await session.scalar(select(DialogState).where(DialogState.dialog_id == dialog.id))
+        assert state.response_expected_message_id == incoming.id
+        assert state.next_sla_check_at is not None
+        outgoing = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=101,
+            sender_id=connection.telegram_user_id,
+            sender_role="account_owner",
+            sent_at=datetime.now(UTC) + timedelta(seconds=1),
+            outgoing=True,
+            body_text="Да, отправлю сегодня.",
+            attachments_json=[],
+        )
+        session.add(outgoing)
+        await session.commit()
+    second = JobLease(
+        id="sla-outgoing",
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+        dialog_id=dialog.id,
+        correlation_id=None,
+        job_type="signal.local_scan",
+        category="realtime",
+        cost_class="light",
+        payload={"message_id": outgoing.id},
+        attempts=0,
+        max_attempts=3,
+        locked_by="sla-test",
+    )
+    await signals.local_scan_job(second)
+    async with session_factory() as session:
+        state = await session.scalar(select(DialogState).where(DialogState.dialog_id == dialog.id))
+        assert state.response_expected_message_id is None
+        assert state.next_sla_check_at is None
 
 
 @pytest.mark.asyncio
@@ -250,6 +337,32 @@ def test_local_signal_engine_filters_low_value_and_scores_commercial_context() -
         "payment_question",
     }
     assert min(item.score for item in candidates) >= 65
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("отправлю сегодня к 18:00", "2026-08-04T18:00:00+03:00"),
+        ("отправлю завтра", "2026-08-05T18:00:00+03:00"),
+        ("отправлю послезавтра", "2026-08-06T18:00:00+03:00"),
+        ("отправлю до пятницы", "2026-08-07T18:00:00+03:00"),
+        ("отправлю в пятницу к 12:30", "2026-08-07T12:30:00+03:00"),
+        ("отправлю 15.08", "2026-08-15T18:00:00+03:00"),
+        ("отправлю 15 августа", "2026-08-15T18:00:00+03:00"),
+        ("отправлю через два дня", "2026-08-06T18:00:00+03:00"),
+        ("сделаю на следующей неделе", "2026-08-10T18:00:00+03:00"),
+    ],
+)
+def test_deadline_parser_uses_tenant_timezone(phrase: str, expected: str) -> None:
+    sent_at = datetime.fromisoformat("2026-08-04T10:00:00+03:00")
+    deadline = parse_deadline(phrase, sent_at, "Europe/Moscow")
+    assert deadline is not None and deadline.isoformat() == expected
+
+
+def test_deadline_parser_rolls_time_and_year_forward() -> None:
+    sent_at = datetime.fromisoformat("2026-12-20T19:00:00+03:00")
+    assert parse_deadline("пришлю к 18:00", sent_at).isoformat() == ("2026-12-21T18:00:00+03:00")
+    assert parse_deadline("пришлю 15.08", sent_at).isoformat() == ("2027-08-15T18:00:00+03:00")
 
 
 def test_triage_json_is_strict_and_supports_one_controlled_repair() -> None:
@@ -360,6 +473,138 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
 
 
 @pytest.mark.asyncio
+async def test_configured_fast_lane_is_provisional_and_ai_can_cancel_it(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        settings.critical_fast_lane_rules = [
+            {
+                "id": "refund-claim",
+                "enabled": True,
+                "contains_all": ["возврат", "претенз"],
+                "contains_any": [],
+                "signal_types": ["complaint"],
+                "criticality": 97,
+            }
+        ]
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=77,
+            sender_id=90077,
+            sent_at=now,
+            outgoing=False,
+            body_text="Требую возврат, направляю официальную претензию.",
+            attachments_json=[],
+        )
+        session.add(message)
+        await session.commit()
+        message_id = message.id
+
+    queue = SQLiteJobQueue(session_factory)
+    local_job_id = await queue.enqueue(
+        "signal.local_scan",
+        {"message_id": message_id},
+        tenant_id=tenant.id,
+        category="general",
+    )
+    local_lease = await queue.claim_next("local", allowed_categories=frozenset({"general"}))
+    assert local_lease is not None and local_lease.id == local_job_id
+    await SignalService(session_factory, queue).local_scan_job(local_lease)
+    await queue.complete(local_lease)
+
+    async with session_factory() as session:
+        signal = await session.scalar(select(Signal).where(Signal.signal_type == "complaint"))
+        provisional = await session.scalar(
+            select(NotificationLog).where(NotificationLog.signal_id == signal.id)
+        )
+    assert signal.criticality == 97
+    assert provisional.payload_json["provisional"] is True
+
+    triage_lease = await queue.claim_next("ai", allowed_categories=frozenset({"ai_fast"}))
+    assert triage_lease is not None
+    await AITriageService(
+        session_factory,
+        queue,
+        RejectedTriageProvider(),
+        model="deepseek-test",
+    ).triage(triage_lease)
+    async with session_factory() as session:
+        provisional = await session.get(NotificationLog, provisional.id)
+    assert provisional.status == "cancelled"
+    assert provisional.payload_json["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        settings.notification_immediate_threshold = 95
+        signals: list[Signal] = []
+        for index, (signal_type, criticality) in enumerate(
+            (("complaint", 80), ("contract_question", 80), ("complaint", 82), ("complaint", 99)),
+            start=1,
+        ):
+            message = TelegramMessage(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                telegram_message_id=100 + index,
+                sent_at=now + timedelta(seconds=index),
+                outgoing=False,
+                body_text=f"Событие {index}",
+                attachments_json=[],
+            )
+            session.add(message)
+            await session.flush()
+            signal = Signal(
+                tenant_id=tenant.id,
+                telegram_connection_id=connection.id,
+                dialog_id=dialog.id,
+                source_message_id=message.id,
+                fingerprint=f"cooldown-{index}",
+                signal_type=signal_type,
+                local_score=criticality,
+                criticality=criticality,
+                reason="Проверка cooldown",
+                detected_at=message.sent_at,
+                metadata_json={},
+            )
+            session.add(signal)
+            signals.append(signal)
+        await session.commit()
+
+    orchestrator = NotificationOrchestrator(session_factory, SQLiteJobQueue(session_factory))
+    first = await orchestrator.plan_for_signal(signals[0].id)
+    different_problem = await orchestrator.plan_for_signal(signals[1].id)
+    equivalent = await orchestrator.plan_for_signal(signals[2].id)
+    critical = await orchestrator.plan_for_signal(signals[3].id)
+
+    assert len(first) == 1
+    assert len(different_problem) == 1
+    assert equivalent == []
+    assert len(critical) == 1
+
+
+@pytest.mark.asyncio
 async def test_hourly_reconciliation_creates_overdue_problem_once_and_then_resolves(
     session_factory, make_service, tenant_payload, encryption_key
 ) -> None:
@@ -369,6 +614,11 @@ async def test_hourly_reconciliation_creates_overdue_problem_once_and_then_resol
     )
     now = datetime.now(UTC)
     async with session_factory() as session:
+        employee = Employee(tenant_id=tenant.id, display_name="Менеджер")
+        session.add(employee)
+        await session.flush()
+        stored_connection = await session.get(type(connection), connection.id)
+        stored_connection.assigned_employee_id = employee.id
         source = TelegramMessage(
             tenant_id=tenant.id,
             connection_id=connection.id,
@@ -387,6 +637,7 @@ async def test_hourly_reconciliation_creates_overdue_problem_once_and_then_resol
             connection_id=connection.id,
             dialog_id=dialog.id,
             source_message_id=source.id,
+            responsible_employee_id=employee.id,
             fingerprint="overdue-commitment",
             commitment_type="employee_promise",
             expected_action="Отправить договор",
@@ -425,7 +676,7 @@ async def test_hourly_reconciliation_creates_overdue_problem_once_and_then_resol
         stored_commitment = await session.scalar(select(Commitment))
         problem = await session.scalar(select(OperationalProblem))
     assert completed["commitments_completed"] == 1
-    assert stored_commitment.status == "completed" and problem.status == "resolved"
+    assert stored_commitment.status == "completed" and problem.status == "auto_resolved"
 
 
 @pytest.mark.asyncio

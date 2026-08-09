@@ -34,18 +34,24 @@ yarn-error.log*
 .venv/
 *.db
 *.sqlite
+*.sqlite3
+*.session
+*.session-journal
 data/*
 !data/.gitkeep
 backups/*
 !backups/.gitkeep
 __pycache__/
 *.py[cod]
+logs/
+*.log
 
 # vercel
 .vercel
 
 # typescript
 next-env.d.ts
+*.tsbuildinfo
 /dist/
 /.wrangler/
 /outputs/
