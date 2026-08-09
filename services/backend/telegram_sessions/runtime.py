@@ -436,6 +436,14 @@ class TelegramSessionActor:
     async def catch_up(self) -> dict[str, int]:
         """Fetch only gaps after saved cursors; used after restart/reconnect and rarely by scheduler."""
         async with self.rpc_lock:
+            # StringSession does not persist Telethon's entity cache. Rebuild it once
+            # per catch-up pass and use InputPeer objects instead of unresolved raw IDs.
+            # The full iter_dialogs pass is also the recovery path for newly discovered chats.
+            input_entities: dict[int, Any] = {}
+            async for remote_dialog in self.client.iter_dialogs():
+                input_entities[int(remote_dialog.id)] = getattr(
+                    remote_dialog, "input_entity", remote_dialog.entity
+                )
             async with self.transactions.session_factory() as session:
                 rows = (
                     await session.execute(
@@ -453,9 +461,20 @@ class TelegramSessionActor:
                 ).all()
             seen = 0
             for dialog, cursor in rows:
+                input_entity = input_entities.get(dialog.telegram_dialog_id)
+                if input_entity is None:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_catchup_dialog_unavailable",
+                        tenant_id=self.connection.tenant_id,
+                        account_id=self.connection.id,
+                        dialog_id=dialog.id,
+                    )
+                    continue
                 after_id = cursor.last_message_id if cursor else dialog.last_message_id
                 async for message in self.client.iter_messages(
-                    dialog.telegram_dialog_id,
+                    input_entity,
                     min_id=after_id,
                     reverse=True,
                     limit=500,

@@ -1,6 +1,6 @@
 services:
   backend:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["api"]
     volumes: &ventrix-volumes
@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
 
   background-worker:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["worker"]
     volumes: *ventrix-volumes
@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   telegram-session-runtime:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["python", "-m", "services.backend.telegram_sessions.runtime"]
     volumes: *ventrix-volumes
@@ -34,7 +34,7 @@ services:
     restart: unless-stopped
 
   client-bots:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["client-bots"]
     volumes: *ventrix-volumes
@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
 
   owner-bot:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["bot"]
     volumes: *ventrix-volumes
@@ -50,7 +50,7 @@ services:
     restart: unless-stopped
 
   scheduler:
-    image: ventrix-app:20260809-hardening4
+    image: ventrix-app:20260809-hardening5
     env_file: .env
     command: ["scheduler"]
     volumes: *ventrix-volumes
