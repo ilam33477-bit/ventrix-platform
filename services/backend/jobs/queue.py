@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from ..database import SQLiteTransactionManager
 from ..models import BackgroundJob, TenantQueueState
@@ -161,6 +162,31 @@ class SQLiteJobQueue:
                 filters.append(BackgroundJob.category.in_(allowed_categories))
             if telegram_account_id is not None:
                 filters.append(BackgroundJob.telegram_account_id == telegram_account_id)
+            predecessor = aliased(BackgroundJob)
+            running_partition = aliased(BackgroundJob)
+            filters.append(
+                or_(
+                    BackgroundJob.partition_key.is_(None),
+                    (
+                        ~exists(
+                            select(running_partition.id).where(
+                                running_partition.partition_key
+                                == BackgroundJob.partition_key,
+                                running_partition.status == "running",
+                            )
+                        )
+                        & ~exists(
+                            select(predecessor.id).where(
+                                predecessor.partition_key == BackgroundJob.partition_key,
+                                predecessor.status.in_((*AVAILABLE_STATUSES, "running")),
+                                predecessor.partition_sequence.is_not(None),
+                                predecessor.partition_sequence
+                                < BackgroundJob.partition_sequence,
+                            )
+                        )
+                    ),
+                )
+            )
             candidates = list(
                 await session.scalars(
                     select(BackgroundJob)
@@ -216,50 +242,8 @@ class SQLiteJobQueue:
                     )
                 ).all()
             )
-            partition_keys = {item.partition_key for item in candidates if item.partition_key}
-            earliest_partition_sequence = (
-                dict(
-                    (
-                        await session.execute(
-                            select(
-                                BackgroundJob.partition_key,
-                                func.min(BackgroundJob.partition_sequence),
-                            )
-                            .where(
-                                BackgroundJob.partition_key.in_(partition_keys),
-                                BackgroundJob.status.in_((*AVAILABLE_STATUSES, "running")),
-                                BackgroundJob.partition_sequence.is_not(None),
-                            )
-                            .group_by(BackgroundJob.partition_key)
-                        )
-                    ).all()
-                )
-                if partition_keys
-                else {}
-            )
-            running_partitions = (
-                set(
-                    await session.scalars(
-                        select(BackgroundJob.partition_key).where(
-                            BackgroundJob.partition_key.in_(partition_keys),
-                            BackgroundJob.status == "running",
-                        )
-                    )
-                )
-                if partition_keys
-                else set()
-            )
             eligible = []
             for candidate in candidates:
-                if candidate.partition_key in running_partitions:
-                    continue
-                if (
-                    candidate.partition_key
-                    and candidate.partition_sequence is not None
-                    and earliest_partition_sequence.get(candidate.partition_key)
-                    != candidate.partition_sequence
-                ):
-                    continue
                 if candidate.tenant_id:
                     if (
                         candidate.category not in RESERVED_LANE_CATEGORIES

@@ -276,6 +276,30 @@ async def test_partitioned_jobs_are_claimed_in_sequence(session_factory) -> None
     assert second is not None and second.id == later
 
 
+@pytest.mark.asyncio
+async def test_partition_predecessor_is_not_hidden_beyond_candidate_limit(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    now = datetime.now(UTC)
+    for sequence in range(2, 103):
+        await queue.enqueue(
+            "system.echo",
+            {"order": sequence},
+            scheduled_at=now - timedelta(minutes=2),
+            partition_key="busy-dialog",
+            partition_sequence=sequence,
+        )
+    predecessor = await queue.enqueue(
+        "system.echo",
+        {"order": 1},
+        scheduled_at=now - timedelta(minutes=1),
+        partition_key="busy-dialog",
+        partition_sequence=1,
+    )
+
+    claimed = await queue.claim_next("ordered-worker")
+    assert claimed is not None and claimed.id == predecessor
+
+
 def test_consistent_backup_and_restore(tmp_path) -> None:
     source = tmp_path / "app.db"
     with sqlite3.connect(source) as connection:
