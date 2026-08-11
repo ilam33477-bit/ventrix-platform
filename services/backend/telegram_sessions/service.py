@@ -1005,6 +1005,7 @@ class TelegramConnectionService:
             if connection.session_secret_id is None:
                 connection.status = "disconnected"
                 connection.progress_stage = "not_started"
+                connection.deleted_at = datetime.now(UTC)
 
         await self.transactions.run(write)
 

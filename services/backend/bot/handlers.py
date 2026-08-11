@@ -49,6 +49,7 @@ from ..schemas import AIProfileUpdate, BotCreate, TenantCreate, TenantUpdate
 from ..services.client_drafts import ClientDraftData, OwnerClientDraftService
 from ..services.encryption import EncryptionService
 from ..services.foundation import BotAlreadyExistsError, FoundationService
+from ..services.onboarding_welcome import ensure_onboarding_welcome
 from ..services.product_events import ProductEventService
 from ..services.system_secrets import SystemSecretService, mask_secret
 from ..services.telegram import BotTokenVerificationError, TelegramBotVerifier
@@ -91,6 +92,36 @@ from .states import (
     TenantEditStates,
     TenantHistoryStates,
 )
+
+
+async def precompute_onboarding_welcome(
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    telegram_verifier: TelegramBotVerifier,
+    tenant_id: str,
+) -> None:
+    if not settings.deepseek_api_key:
+        return
+    try:
+        async with session_factory() as session:
+            tenant = await service_for(session, settings, telegram_verifier).get_tenant(tenant_id)
+            provider = DeepSeekProvider(
+                base_url=settings.deepseek_base_url,
+                timeout_seconds=min(30, settings.ai_request_timeout_seconds),
+                api_key_value=settings.deepseek_api_key.get_secret_value(),
+            )
+            await ensure_onboarding_welcome(
+                session,
+                tenant,
+                provider=provider,
+                model=settings.deepseek_fast_model,
+            )
+    except Exception as exc:  # noqa: BLE001 - tenant creation must not depend on AI availability
+        logger.warning(
+            "Could not precompute onboarding welcome tenant_id=%s error=%s",
+            tenant_id,
+            type(exc).__name__,
+        )
 
 router = Router(name="owner-admin-inline")
 logger = logging.getLogger(__name__)
@@ -719,6 +750,9 @@ async def tenant_ai_confirm(
             draft.confirmed_at = datetime.now(UTC)
             await session.commit()
             tenant = await foundation.get_tenant(tenant.id)
+    await precompute_onboarding_welcome(
+        session_factory, settings, telegram_verifier, tenant.id
+    )
     await state.clear()
     await render(
         query,
@@ -966,6 +1000,9 @@ async def tenant_create_confirm(
     )
     async with session_factory() as session:
         tenant = await service_for(session, settings, telegram_verifier).create_tenant(payload)
+    await precompute_onboarding_welcome(
+        session_factory, settings, telegram_verifier, tenant.id
+    )
     await state.clear()
     await render(
         query,

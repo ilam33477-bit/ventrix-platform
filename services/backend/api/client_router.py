@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -71,6 +72,10 @@ from ..telegram_sessions.service import (
 from ..timezones import normalize_timezone
 
 router = APIRouter(prefix="/api/v1/client", tags=["tenant-client"])
+logger = logging.getLogger(__name__)
+VISIBLE_CONNECTION_STATUSES = frozenset(
+    {"awaiting_code", "awaiting_2fa", "connected", "syncing", "ready", "reauthorization_required"}
+)
 
 
 class ProblemPatch(BaseModel):
@@ -814,6 +819,7 @@ async def client_bootstrap(
             .where(
                 TelegramConnection.tenant_id == tenant.id,
                 TelegramConnection.deleted_at.is_(None),
+                TelegramConnection.status.in_(VISIBLE_CONNECTION_STATUSES),
             )
             .order_by(TelegramConnection.created_at.desc())
         )
@@ -1268,6 +1274,7 @@ async def connections(
             .where(
                 TelegramConnection.tenant_id == context.tenant.id,
                 TelegramConnection.deleted_at.is_(None),
+                TelegramConnection.status.in_(VISIBLE_CONNECTION_STATUSES),
             )
             .order_by(TelegramConnection.created_at.desc())
         )
@@ -1415,22 +1422,6 @@ async def complete_connection_login(
             code=code,
             password=password,
         )
-        analysis_run_id = None
-        if connection.status == "connected":
-            tenant_settings = await session.scalar(
-                select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
-            )
-            connection = await connection_service.refresh_catalog(context.tenant.id, connection.id)
-            connection = await connection_service.activate_default_scope(
-                context.tenant.id,
-                history_days=tenant_settings.message_history_days if tenant_settings else 14,
-                connection_id=connection.id,
-            )
-            run = await connection_service.start_initial_sync(
-                context.tenant.id, connection_id=connection.id
-            )
-            analysis_run_id = run.id
-            await reconcile_connected_onboarding(session, tenant_settings, connection)
     except TelegramFloodWait as exc:
         raise HTTPException(
             status_code=429,
@@ -1460,13 +1451,40 @@ async def complete_connection_login(
         raise HTTPException(status_code=422, detail=detail) from exc
     finally:
         code = password = None
+    preparation_job_id = None
+    if connection.status == "connected":
+        tenant_settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
+        )
+        # Authorization is complete at this point. Catalog loading and initial
+        # analysis are retryable background work and must never be reported as
+        # an invalid Telegram code or 2FA password.
+        preparation_job_id = await connection_service.queue.enqueue(
+            "telegram.prepare_connection",
+            {"history_days": tenant_settings.message_history_days if tenant_settings else 14},
+            tenant_id=context.tenant.id,
+            telegram_account_id=connection.id,
+            idempotency_key=f"telegram-prepare:{connection.id}",
+            priority=5,
+            category="telegram_rpc",
+            cost_class="light",
+            max_attempts=8,
+        )
+        await reconcile_connected_onboarding(session, tenant_settings, connection)
+        logger.info(
+            "Telegram authorization completed tenant_id=%s connection_id=%s preparation_job_id=%s",
+            context.tenant.id,
+            connection.id,
+            preparation_job_id,
+        )
     return {
         "id": connection.id,
         "status": connection.status,
         "account": connection.display_name or connection.phone_masked,
         "username": connection.username,
         "requires_2fa": connection.status == "awaiting_2fa",
-        "analysis_run_id": analysis_run_id,
+        "analysis_run_id": None,
+        "preparation_job_id": preparation_job_id,
     }
 
 

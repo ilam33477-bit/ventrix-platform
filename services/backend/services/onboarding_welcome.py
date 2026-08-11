@@ -14,12 +14,16 @@ from ..models import AIUsageCall, Tenant
 logger = logging.getLogger(__name__)
 
 WELCOME_CACHE_KEY = "_welcome_copy"
+WELCOME_CACHE_VERSION_KEY = "_welcome_copy_version"
+WELCOME_PROMPT_VERSION = 2
 WELCOME_SYSTEM_PROMPT = """
 Ты продуктовый редактор Ventrix. Напиши тёплое, уверенное приветствие владельцу компании
 перед первым подключением Telegram. Объясни пользу простыми словами: Ventrix помогает
 не терять обращения, обещания и важные рабочие ситуации. Не показывай настройки,
 внутренние AI-инструкции, thresholds, SLA, технические параметры или длинное описание
-бизнеса. Не копируй входные данные дословно. Верни только JSON по schema. Русский язык.
+бизнеса. Текст должен ощущаться созданным именно для этой компании, но не превращаться
+в перечень полей анкеты. Не копируй входные данные дословно. Верни только JSON по schema.
+Русский язык, спокойный деловой тон без канцелярита и рекламных преувеличений.
 headline — короткий заголовок. message — 2–3 коротких предложения. benefits — ровно
 три коротких результата для бизнеса, без обещаний абсолютной точности.
 """.strip()
@@ -56,7 +60,10 @@ async def ensure_onboarding_welcome(
 ) -> OnboardingWelcomeCopy:
     onboarding = dict(tenant.settings.client_onboarding_json or {})
     cached = onboarding.get(WELCOME_CACHE_KEY)
-    if isinstance(cached, dict):
+    if (
+        isinstance(cached, dict)
+        and onboarding.get(WELCOME_CACHE_VERSION_KEY) == WELCOME_PROMPT_VERSION
+    ):
         try:
             return OnboardingWelcomeCopy.model_validate(cached)
         except ValueError:
@@ -89,6 +96,7 @@ async def ensure_onboarding_welcome(
         return fallback_welcome(tenant)
 
     onboarding[WELCOME_CACHE_KEY] = copy.model_dump(mode="json")
+    onboarding[WELCOME_CACHE_VERSION_KEY] = WELCOME_PROMPT_VERSION
     tenant.settings.client_onboarding_json = onboarding
     session.add(
         AIUsageCall(

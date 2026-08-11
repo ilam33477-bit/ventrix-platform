@@ -113,7 +113,13 @@ async def test_owner_api_endpoints(
     app.dependency_overrides[get_session] = session_override
     app.dependency_overrides[get_foundation_service] = service_override
 
+    class FakeQueue:
+        async def enqueue(self, *_args, **_kwargs):
+            return "prepare-job-1"
+
     class FakeConnectionService:
+        queue = FakeQueue()
+
         async def begin_login(self, tenant_id, phone, assigned_employee_id=None):
             return SimpleNamespace(
                 id="connection-1", status="awaiting_code", phone_masked="+7••••••0011"
@@ -407,6 +413,8 @@ async def test_owner_api_endpoints(
             json={"password": "temporary-test-password"},
         )
         assert password_result.json()["status"] == "connected"
+        assert password_result.json()["preparation_job_id"] == "prepare-job-1"
+        assert password_result.json()["analysis_run_id"] is None
         catalog = await client.post(
             "/api/v1/client/connections/connection-1/catalog",
             headers={"Authorization": f"tma {init_data}"},

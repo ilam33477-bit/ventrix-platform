@@ -88,10 +88,18 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
   }
 
   if (step === "mini_guide") {
-    const examples = tenant.monitoring_priorities.length ? tenant.monitoring_priorities.slice(0, 5) : ["Клиент написал и не получил ответ", "Сотрудник пропустил обещанный срок", "Клиент повторно напоминает о себе", "Появилась жалоба", "Сделка осталась без следующего шага"];
-    return <OnboardingFrame step={step} title="Что Ventrix будет замечать">
-      <div className="section-list">{examples.map((item, index) => <Card className="person-row" key={item}><span>{index + 1}</span><div><h3>{item}</h3></div></Card>)}</div>
-      <Card className="onboarding-note"><p>Ventrix анализирует контекст, время, историю диалога и роли участников. Ситуация создаётся только при достаточных основаниях.</p></Card>
+    const capabilities = [
+      ["!", "Риски и клиенты", "Жалобы, обращения без ответа, потерянный интерес и сделки без следующего шага."],
+      ["✓", "Обещания и сроки", "Фиксация обязательств, ответственных и просроченных договорённостей."],
+      ["↗", "Сигналы для команды", "Приоритетные уведомления сотруднику или руководителю с контекстом ситуации."],
+      ["◎", "Работа сотрудников", "Нагрузка, скорость реакции, повторяющиеся ошибки и динамика исправлений."],
+      ["▥", "Статистика и отчёты", "Итоги по клиентам, проблемам, обязательствам и результатам за выбранный период."],
+      ["◌", "Проверка исправления", "Ventrix смотрит последующие сообщения и не закрывает ситуацию без подтверждения."],
+    ];
+    return <OnboardingFrame step={step} title="Что будет под контролем">
+      <Card className="analysis-intro"><span className="onboarding-mark">V</span><h2>От сообщения — к управляемому результату</h2><p>Ventrix связывает события в диалогах с ответственными, сроками и дальнейшими действиями.</p></Card>
+      <div className="analysis-showcase">{capabilities.map(([icon, title, text]) => <Card className="analysis-capability" key={title}><span>{icon}</span><div><h3>{title}</h3><p>{text}</p></div></Card>)}</div>
+      <Card className="onboarding-note"><p>Учитываются контекст, история переписки, рабочее время и роли участников. Важные выводы сопровождаются evidence из диалога.</p></Card>
       <button className="primary-action onboarding-next" onClick={() => void onAdvance("employees")}>Продолжить</button>
     </OnboardingFrame>;
   }

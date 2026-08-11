@@ -31,6 +31,7 @@ from ..services.encryption import EncryptionService
 from ..services.system_secrets import load_runtime_secret_overrides
 from .gateway import MessageBatch, RemoteMessage, TelegramFloodWait, TelethonGateway
 from .leases import RuntimeOwnership, TelegramRuntimeLeaseStore
+from .service import TelegramConnectionService
 from .sync import TelegramSyncHandlers
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,7 @@ class TelegramSessionActor:
                 "telegram.logout": self._logout_job,
                 "telegram.sync_chat": self._sync_chat_job,
                 "telegram.refresh_catalog": self._refresh_catalog_job,
+                "telegram.prepare_connection": self._prepare_connection_job,
             },
             allowed_categories=frozenset({"telegram_rpc"}),
             telegram_account_id=self.connection.id,
@@ -360,6 +362,24 @@ class TelegramSessionActor:
 
         await self.transactions.run(write)
         return {"folders": len(folders), "dialogs": len(dialogs)}
+
+    async def _prepare_connection_job(self, job: JobLease) -> dict[str, Any]:
+        catalog = await self._refresh_catalog_job(job)
+        service = TelegramConnectionService(
+            self.sync_handlers.session_factory,
+            self.sync_handlers.encryption,
+            self.sync_handlers.gateway,
+        )
+        await service.activate_default_scope(
+            self.connection.tenant_id,
+            history_days=int(job.payload.get("history_days") or 14),
+            connection_id=self.connection.id,
+        )
+        run = await service.start_initial_sync(
+            self.connection.tenant_id,
+            connection_id=self.connection.id,
+        )
+        return {**catalog, "analysis_run_id": run.id}
 
     async def stop(self) -> None:
         self._stopping.set()
