@@ -739,11 +739,18 @@ class AnalysisPipelineService:
             run = await session.get(AnalysisRun, run_id)
             history_window_days = int((run.metrics_json or {}).get("history_window_days", 30))
             period_start = run.started_at - timedelta(days=history_window_days)
+            monitored_dialog_ids = select(TelegramDialog.id).where(
+                TelegramDialog.tenant_id == run.tenant_id,
+                TelegramDialog.selected.is_(True),
+                TelegramDialog.excluded.is_(False),
+            )
             problems = list(
                 await session.scalars(
                     select(OperationalProblem).where(
                         OperationalProblem.tenant_id == run.tenant_id,
                         OperationalProblem.occurred_at >= period_start,
+                        OperationalProblem.dialog_id.in_(monitored_dialog_ids),
+                        OperationalProblem.status != "false_positive",
                     )
                 )
             )
@@ -752,6 +759,8 @@ class AnalysisPipelineService:
                     select(Signal).where(
                         Signal.tenant_id == run.tenant_id,
                         Signal.detected_at >= period_start,
+                        Signal.dialog_id.in_(monitored_dialog_ids),
+                        Signal.status != "suppressed",
                     )
                 )
             )
@@ -760,6 +769,7 @@ class AnalysisPipelineService:
                     select(Commitment).where(
                         Commitment.tenant_id == run.tenant_id,
                         (Commitment.created_at >= period_start) | (Commitment.status == "open"),
+                        Commitment.dialog_id.in_(monitored_dialog_ids),
                     )
                 )
             )
@@ -768,7 +778,11 @@ class AnalysisPipelineService:
             )
             dialogs = list(
                 await session.scalars(
-                    select(TelegramDialog).where(TelegramDialog.tenant_id == run.tenant_id)
+                    select(TelegramDialog).where(
+                        TelegramDialog.tenant_id == run.tenant_id,
+                        TelegramDialog.selected.is_(True),
+                        TelegramDialog.excluded.is_(False),
+                    )
                 )
             )
             groups = list(
@@ -783,6 +797,7 @@ class AnalysisPipelineService:
                 await session.scalar(
                     select(func.count(TelegramMessage.id)).where(
                         TelegramMessage.tenant_id == run.tenant_id,
+                        TelegramMessage.dialog_id.in_(monitored_dialog_ids),
                         TelegramMessage.sent_at
                         >= run.started_at - timedelta(days=history_window_days),
                     )
