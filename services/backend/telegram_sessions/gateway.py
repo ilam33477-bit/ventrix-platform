@@ -199,12 +199,18 @@ class TelethonGateway:
         client = self.client(session_string)
         try:
             await client.connect()
-            sent = await client(
-                functions.auth.ResendCodeRequest(
-                    phone_number=phone,
-                    phone_code_hash=phone_code_hash,
+            try:
+                sent = await client(
+                    functions.auth.ResendCodeRequest(
+                        phone_number=phone,
+                        phone_code_hash=phone_code_hash,
+                    )
                 )
-            )
+            except errors.SendCodeUnavailableError:
+                # Telegram has exhausted the alternatives attached to the old
+                # hash. Start a fresh challenge in the same encrypted session
+                # instead of leaving the UI in an unrecoverable code screen.
+                sent = await client.send_code_request(phone)
             return self._login_challenge(client, sent, fallback_hash=phone_code_hash)
         except errors.FloodWaitError as exc:
             raise TelegramFloodWait(exc.seconds) from None
