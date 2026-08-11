@@ -174,10 +174,24 @@ export class VentrixClientApi {
   }
 
   startTelegramLogin(phone: string, employeeId: string | null) {
-    return this.request<{ id: string }>("/connections/login/start", {
+    return this.request<{
+      id: string;
+      code_delivery_method: string;
+      next_code_delivery_method: string | null;
+      resend_available_in: number;
+    }>("/connections/login/start", {
       method: "POST",
       body: JSON.stringify({ phone, employee_id: employeeId }),
     });
+  }
+
+  resendTelegramLogin(connectionId: string) {
+    return this.request<{
+      id: string;
+      code_delivery_method: string;
+      next_code_delivery_method: string | null;
+      resend_available_in: number;
+    }>(`/connections/${connectionId}/login/resend`, { method: "POST" });
   }
 
   completeTelegramLogin(connectionId: string, value: { code?: string; password?: string }) {

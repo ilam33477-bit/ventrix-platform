@@ -34,14 +34,11 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
     return <OnboardingFrame step={step} title={`Добро пожаловать, ${tenant.owner_name.split(" ")[0]}`}>
       <Card className="onboarding-hero onboarding-welcome">
         <span className="onboarding-mark">V</span>
-        <h2>Ventrix настроен под {tenant.name}</h2>
-        {tenant.owner_username && <p className="welcome-username">@{tenant.owner_username}</p>}
-        <div className="profile-summary">
-          <Summary label="Компания" value={tenant.name} />
-          <Summary label="Ниша" value={tenant.niche} />
-          <Summary label="Целевая аудитория" value={tenant.target_audience} />
-          <Summary label="Что отслеживаем" value={tenant.monitoring_priorities.slice(0, 3).join(" · ") || "Клиентов без ответа, обещания и важные ситуации"} />
-        </div>
+        <h2>{tenant.welcome.headline}</h2>
+        <p className="welcome-message">{tenant.welcome.message}</p>
+        <ul className="welcome-benefits">
+          {tenant.welcome.benefits.map((benefit) => <li key={benefit}>{benefit}</li>)}
+        </ul>
         <button className="primary-action" onClick={() => void onAdvance("telegram_connection")}>Начать настройку</button>
       </Card>
     </OnboardingFrame>;

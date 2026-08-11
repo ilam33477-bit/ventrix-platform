@@ -129,6 +129,9 @@ export type TelegramConnection = {
   last_health_check_at?: string | null;
   last_sync_at?: string | null;
   folder?: string | null;
+  code_delivery_method?: string;
+  next_code_delivery_method?: string | null;
+  resend_available_in?: number;
 };
 
 export type Employee = {
@@ -209,6 +212,11 @@ export type Bootstrap = {
     business_description: string;
     target_audience: string;
     monitoring_priorities: string[];
+    welcome: {
+      headline: string;
+      message: string;
+      benefits: string[];
+    };
   };
   role: string;
   permissions: string[];

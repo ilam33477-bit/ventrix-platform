@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.problems import ProblemStatus
+from services.api.deepseek import DeepSeekProvider
 
 from ..config import Settings, get_settings
 from ..database import get_session
@@ -54,6 +55,7 @@ from ..models import (
 from ..repositories.client_data import TenantClientRepository
 from ..scheduler.service import TenantAnalysisScheduler, next_analysis_time
 from ..services.encryption import EncryptionService
+from ..services.onboarding_welcome import ensure_onboarding_welcome, fallback_welcome
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.gateway import TelegramFloodWait, TelegramSessionRevoked, TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
@@ -643,7 +645,11 @@ def client_onboarding_payload(settings: TenantSettings | None) -> dict[str, Any]
         "completed": completed,
         "completed_at": settings.client_onboarding_completed_at if settings else None,
         "steps": list(CLIENT_ONBOARDING_STEPS),
-        "statuses": dict(settings.client_onboarding_json if settings else {}),
+        "statuses": {
+            key: value
+            for key, value in dict(settings.client_onboarding_json if settings else {}).items()
+            if key in CLIENT_ONBOARDING_STEPS and value in {"completed", "skipped"}
+        },
     }
 
 
@@ -768,8 +774,29 @@ def onboarding_state(connection: TelegramConnection | None) -> str:
 async def client_bootstrap(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    app_settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> dict[str, Any]:
     tenant = context.tenant
+    welcome_copy = fallback_welcome(tenant)
+    if (
+        tenant.settings.client_onboarding_completed_at is None
+        and tenant.settings.client_onboarding_step == "welcome"
+    ):
+        factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+        runtime_settings = await load_runtime_secret_overrides(factory, app_settings)
+        provider = None
+        if runtime_settings.deepseek_api_key:
+            provider = DeepSeekProvider(
+                base_url=runtime_settings.deepseek_base_url,
+                timeout_seconds=min(30, runtime_settings.ai_request_timeout_seconds),
+                api_key_value=runtime_settings.deepseek_api_key.get_secret_value(),
+            )
+        welcome_copy = await ensure_onboarding_welcome(
+            session,
+            tenant,
+            provider=provider,
+            model=runtime_settings.deepseek_fast_model,
+        )
     connections = list(
         await session.scalars(
             select(TelegramConnection)
@@ -859,6 +886,7 @@ async def client_bootstrap(
             "business_description": tenant.business_description,
             "target_audience": tenant.target_audience,
             "monitoring_priorities": list(tenant.ai_profile.critical_events or []),
+            "welcome": welcome_copy.model_dump(mode="json"),
         },
         "role": context.membership.role,
         "permissions": sorted(context.permissions),
@@ -1243,9 +1271,25 @@ async def connections(
             "last_health_check_at": item.last_health_check_at,
             "last_sync_at": item.last_sync_at,
             "folder": item.selected_folder_title,
+            **login_delivery_payload(item),
         }
         for item in rows
     ]
+
+
+def login_delivery_payload(connection: TelegramConnection) -> dict[str, Any]:
+    metadata = (getattr(connection, "progress_json", None) or {}).get("login_code", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "code_delivery_method": metadata.get("delivery_type") or "telegram_app",
+        "next_code_delivery_method": metadata.get("next_delivery_type"),
+        "resend_available_in": (
+            TelegramConnectionService.resend_available_in(connection)
+            if hasattr(connection, "progress_json")
+            else 0
+        ),
+    }
 
 
 @router.post("/connections/login/start", status_code=status.HTTP_201_CREATED)
@@ -1288,6 +1332,49 @@ async def start_connection_login(
         "status": connection.status,
         "phone_masked": connection.phone_masked,
         "employee_id": employee.id if employee else None,
+        **login_delivery_payload(connection),
+    }
+
+
+@router.post("/connections/{connection_id}/login/resend")
+async def resend_connection_login(
+    connection_id: str,
+    context: ClientContext,
+    connection_service: TelegramConnectionService = Depends(get_client_connection_service),  # noqa: B008
+) -> dict[str, Any]:
+    require_permission(context, "employees.manage")
+    try:
+        connection = await connection_service.resend_login(context.tenant.id, connection_id)
+    except TelegramFloodWait as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Telegram просит подождать {exc.retry_after_seconds} сек. перед новой попыткой.",
+        ) from exc
+    except TelegramConnectionError as exc:
+        message = str(exc)
+        if message.startswith("resend cooldown:"):
+            remaining = message.rsplit(":", 1)[-1]
+            raise HTTPException(
+                status_code=429,
+                detail=f"Новый код можно запросить через {remaining} сек.",
+            ) from exc
+        raise HTTPException(
+            status_code=409,
+            detail="Запрос кода уже завершён. Начните подключение заново.",
+        ) from exc
+    except Exception as exc:
+        error_name = type(exc).__name__
+        detail = {
+            "PhoneCodeExpiredError": "Предыдущий запрос истёк. Начните подключение заново.",
+            "PhoneNumberInvalidError": "Telegram не принял номер телефона.",
+            "SendCodeUnavailableError": "Telegram временно не может отправить новый код.",
+        }.get(error_name, "Telegram временно не отправил новый код. Попробуйте через 30 секунд.")
+        raise HTTPException(status_code=502, detail=detail) from exc
+    return {
+        "id": connection.id,
+        "status": connection.status,
+        "phone_masked": connection.phone_masked,
+        **login_delivery_payload(connection),
     }
 
 

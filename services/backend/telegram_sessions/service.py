@@ -23,9 +23,16 @@ from ..models import (
     TenantSettings,
 )
 from ..services.encryption import EncryptionService
-from .gateway import LoginResult, TelegramSessionRevoked, TelegramUserGateway, TelethonGateway
+from .gateway import (
+    LoginChallenge,
+    LoginResult,
+    TelegramSessionRevoked,
+    TelegramUserGateway,
+    TelethonGateway,
+)
 
 logger = logging.getLogger(__name__)
+LOGIN_RESEND_COOLDOWN_SECONDS = 30
 
 
 class TelegramConnectionError(RuntimeError):
@@ -142,6 +149,7 @@ class TelegramConnectionService:
             connection.phone_code_hash_secret_id = code_hash.id
             connection.phone_masked = masked
             connection.status = "awaiting_code"
+            connection.progress_json = self._code_delivery_progress(challenge)
             connection.consent_at = datetime.now(UTC)
             connection.consent_version = "2026-08-04"
             connection.last_error_code = None
@@ -150,6 +158,104 @@ class TelegramConnectionService:
         connection_id = await self.transactions.run(write)
         async with self.session_factory() as session:
             return await session.get(TelegramConnection, connection_id)
+
+    async def resend_login(self, tenant_id: str, connection_id: str) -> TelegramConnection:
+        async with self.session_factory() as session:
+            connection = await session.scalar(
+                select(TelegramConnection).where(
+                    TelegramConnection.id == connection_id,
+                    TelegramConnection.tenant_id == tenant_id,
+                    TelegramConnection.deleted_at.is_(None),
+                    TelegramConnection.status == "awaiting_code",
+                )
+            )
+            if connection is None or not all(
+                (
+                    connection.pending_session_secret_id,
+                    connection.phone_secret_id,
+                    connection.phone_code_hash_secret_id,
+                )
+            ):
+                raise TelegramConnectionError("login challenge is missing")
+            remaining = self.resend_available_in(connection)
+            if remaining > 0:
+                raise TelegramConnectionError(f"resend cooldown:{remaining}")
+            pending = await session.get(EncryptedSecret, connection.pending_session_secret_id)
+            phone = await session.get(EncryptedSecret, connection.phone_secret_id)
+            code_hash = await session.get(EncryptedSecret, connection.phone_code_hash_secret_id)
+            if pending is None or phone is None or code_hash is None:
+                raise TelegramConnectionError("login challenge secrets are missing")
+            session_string = self.encryption.decrypt(pending.ciphertext)
+            phone_value = self.encryption.decrypt(phone.ciphertext)
+            hash_value = self.encryption.decrypt(code_hash.ciphertext)
+
+        challenge = await self.gateway.resend_login(session_string, phone_value, hash_value)
+        session_string = phone_value = hash_value = ""
+
+        async def write(session: AsyncSession) -> str:
+            connection = await session.scalar(
+                select(TelegramConnection).where(
+                    TelegramConnection.id == connection_id,
+                    TelegramConnection.tenant_id == tenant_id,
+                    TelegramConnection.deleted_at.is_(None),
+                    TelegramConnection.status == "awaiting_code",
+                )
+            )
+            if connection is None:
+                raise TelegramConnectionError("login challenge disappeared")
+            pending_secret = await self._replace_secret(
+                session, tenant_id, "telegram_pending_session", challenge.session_string
+            )
+            code_hash_secret = await self._replace_secret(
+                session, tenant_id, "telegram_phone_code_hash", challenge.phone_code_hash
+            )
+            for old_id, new_id in (
+                (connection.pending_session_secret_id, pending_secret.id),
+                (connection.phone_code_hash_secret_id, code_hash_secret.id),
+            ):
+                if old_id and old_id != new_id:
+                    old = await session.get(EncryptedSecret, old_id)
+                    if old:
+                        old.deleted_at = datetime.now(UTC)
+            connection.pending_session_secret_id = pending_secret.id
+            connection.phone_code_hash_secret_id = code_hash_secret.id
+            connection.progress_json = self._code_delivery_progress(challenge)
+            connection.last_error_code = None
+            return connection.id
+
+        target_id = await self.transactions.run(write)
+        async with self.session_factory() as session:
+            return await session.get(TelegramConnection, target_id)
+
+    @staticmethod
+    def _code_delivery_progress(challenge: LoginChallenge) -> dict[str, object]:
+        sent_at = datetime.now(UTC)
+        return {
+            "login_code": {
+                "sent_at": sent_at.isoformat(),
+                "resend_available_at": (
+                    sent_at + timedelta(seconds=LOGIN_RESEND_COOLDOWN_SECONDS)
+                ).isoformat(),
+                "delivery_type": challenge.delivery_type,
+                "next_delivery_type": challenge.next_delivery_type,
+                "telegram_timeout_seconds": challenge.timeout_seconds,
+            }
+        }
+
+    @staticmethod
+    def resend_available_in(connection: TelegramConnection) -> int:
+        metadata = (connection.progress_json or {}).get("login_code", {})
+        raw_value = metadata.get("resend_available_at") if isinstance(metadata, dict) else None
+        if not isinstance(raw_value, str):
+            return 0
+        try:
+            available_at = datetime.fromisoformat(raw_value)
+            if available_at.tzinfo is None:
+                available_at = available_at.replace(tzinfo=UTC)
+        except ValueError:
+            return 0
+        remaining = (available_at - datetime.now(UTC)).total_seconds()
+        return max(0, int(remaining + 0.999))
 
     async def complete_login(
         self,

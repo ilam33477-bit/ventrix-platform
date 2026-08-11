@@ -26,7 +26,10 @@ from services.backend.telegram_sessions.gateway import (
     RemoteFolder,
     RemoteMessage,
 )
-from services.backend.telegram_sessions.service import TelegramConnectionService
+from services.backend.telegram_sessions.service import (
+    TelegramConnectionError,
+    TelegramConnectionService,
+)
 from services.backend.telegram_sessions.sync import TelegramSyncHandlers
 
 
@@ -35,10 +38,19 @@ class FakeTelegramGateway:
         self.require_2fa = require_2fa
         self.fetch_calls: list[tuple[int, int]] = []
         self.terminated_sessions: list[str] = []
+        self.resend_calls = 0
 
     async def begin_login(self, phone: str) -> LoginChallenge:
         assert phone.startswith("+")
-        return LoginChallenge("pending-session-a", "phone-code-hash")
+        return LoginChallenge("pending-session-a", "phone-code-hash", "telegram_app")
+
+    async def resend_login(
+        self, session_string: str, phone: str, phone_code_hash: str
+    ) -> LoginChallenge:
+        assert session_string == "pending-session-a"
+        assert phone_code_hash == "phone-code-hash"
+        self.resend_calls += 1
+        return LoginChallenge("pending-session-resend", "phone-code-hash-2", "sms")
 
     async def complete_login(
         self,
@@ -134,6 +146,36 @@ async def test_login_2fa_and_session_are_encrypted_without_secret_leaks(
     assert b"12345" not in combined
     assert b"not-stored" not in combined
     assert connection.phone_masked.endswith("1122") and "999000" not in connection.phone_masked
+
+
+@pytest.mark.asyncio
+async def test_login_code_resend_is_rate_limited_and_rotates_challenge(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    gateway = FakeTelegramGateway()
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    connection = await service.begin_login(tenant.id, "+79990001122")
+
+    with pytest.raises(TelegramConnectionError, match="resend cooldown"):
+        await service.resend_login(tenant.id, connection.id)
+
+    async with session_factory() as session:
+        row = await session.get(TelegramConnection, connection.id)
+        metadata = dict(row.progress_json)
+        metadata["login_code"] = {
+            **metadata["login_code"],
+            "resend_available_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        }
+        row.progress_json = metadata
+        await session.commit()
+
+    resent = await service.resend_login(tenant.id, connection.id)
+    assert resent.id == connection.id
+    assert resent.status == "awaiting_code"
+    assert resent.progress_json["login_code"]["delivery_type"] == "sms"
+    assert gateway.resend_calls == 1
 
 
 @pytest.mark.asyncio

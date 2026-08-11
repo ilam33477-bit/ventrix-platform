@@ -40,6 +40,12 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [resendAvailableIn, setResendAvailableIn] = useState(
+    initialConnections[0]?.resend_available_in ?? 0,
+  );
+  const [deliveryMethod, setDeliveryMethod] = useState(
+    initialConnections[0]?.code_delivery_method ?? "telegram_app",
+  );
   const [sourceLink, setSourceLink] = useState("");
   const [sourcePreview, setSourcePreview] = useState<TelegramSourcePreview | null>(null);
   const [previewJobId, setPreviewJobId] = useState("");
@@ -51,14 +57,24 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     Promise.all([api.employees(), api.connections()]).then(([employeeRows, connectionRows]) => {
       if (!cancelled) {
         setEmployees(employeeRows); setConnections(connectionRows);
-        const activeId = connectionRows[0]?.id;
-        if (activeId) void api.sources(activeId).then((rows) => !cancelled && setSources(rows));
+        const active = connectionRows.find((item) =>
+          ["connected", "syncing", "ready"].includes(item.status),
+        );
+        if (active) void api.sources(active.id).then((rows) => !cancelled && setSources(rows));
       }
     }).catch((reason: Error) => !cancelled && setError(reason.message));
     return () => {
       cancelled = true;
     };
   }, [api]);
+
+  useEffect(() => {
+    if (step !== "code" || resendAvailableIn <= 0) return;
+    const timer = window.setInterval(() => {
+      setResendAvailableIn((current) => Math.max(0, current - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [resendAvailableIn, step]);
 
   useEffect(() => {
     if (
@@ -86,7 +102,10 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
 
   const startLogin = () => run(async () => {
     const result = await api.startTelegramLogin(phone, employeeId || null);
-    setConnectionId(result.id); setStep("code");
+    setConnectionId(result.id);
+    setDeliveryMethod(result.code_delivery_method);
+    setResendAvailableIn(result.resend_available_in);
+    setStep("code");
   });
 
   const completeLogin = (withPassword = false) => run(async () => {
@@ -105,9 +124,11 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   });
 
   const resendCode = () => run(async () => {
-    if (connectionId) await api.cancelTelegramLogin(connectionId);
-    const result = await api.startTelegramLogin(phone, employeeId || null);
-    setConnectionId(result.id); setCode(""); setStep("code");
+    if (!connectionId) throw new Error("Начните подключение заново");
+    const result = await api.resendTelegramLogin(connectionId);
+    setDeliveryMethod(result.code_delivery_method);
+    setResendAvailableIn(result.resend_available_in);
+    setCode(""); setStep("code");
   });
 
   const waitForJob = async <T,>(jobId: string): Promise<T> => {
@@ -153,7 +174,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
       {showConnection && <Card className="connection-wizard">
         <div className="step-dots"><span className={step === "phone" ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
         {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Код придёт в официальный чат Telegram подключаемого аккаунта.</p>{mode === "manage" && <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || phone.length < 8} onClick={startLogin}>{busy ? "Отправляем код…" : "Получить код"}</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
-        {step === "code" && <><h3>Код подтверждения</h3><p>Введите код из Telegram. Ventrix использует его один раз и не сохраняет.</p><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Повторить ввод</button><button disabled={busy || phone.length < 8} onClick={resendCode}>Отправить новый код</button></div></>}
+        {step === "code" && <><h3>Код подтверждения</h3><p>{deliveryDescription(deliveryMethod)} Ventrix использует код один раз и не сохраняет.</p><div className="delivery-hint"><strong>Код запрошен</strong><span>Если уведомления выключены, откройте в Telegram чат «Telegram» со служебными сообщениями.</span></div><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Очистить код</button><button disabled={busy || resendAvailableIn > 0} onClick={resendCode}>{resendAvailableIn > 0 ? `Новый код через ${resendAvailableIn} сек.` : "Отправить новый код"}</button></div></>}
         {step === "password" && <><h3>Пароль 2FA</h3><p>Пароль передаётся только для входа в Telegram и не сохраняется.</p><label>Облачный пароль<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary-action" disabled={busy || !password} onClick={() => completeLogin(true)}>Подключить аккаунт</button><button className="text-action" disabled={busy} onClick={() => setPassword("")}>Попробовать ещё раз</button></>}
         {step === "syncing" && <><h3>Запускаем анализ</h3><div className="state-progress"><i /></div><p>Mini App можно закрыть — прогресс сохранится.</p></>}
         {step === "done" && <div className="connection-done"><span>✓</span><h3>Аккаунт подключён</h3><p>Ventrix начал загружать личные рабочие диалоги с глубиной истории, заданной владельцем платформы. Рабочие группы можно добавить позже.</p></div>}
@@ -164,4 +185,10 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
       {showSources && <Card className="managed-sources"><div className="card-title"><h3>Рабочие группы</h3><StatusBadge tone="neutral">{sources.length}</StatusBadge></div><p>Личные диалоги уже включены. Вставьте ссылку на группу или общую папку Telegram. Сначала Ventrix покажет preview.</p><label>Ссылка Telegram<input type="url" placeholder="https://t.me/+… или https://t.me/addlist/…" value={sourceLink} onChange={(event) => setSourceLink(event.target.value)} /></label><button className="primary-action" disabled={busy || sourceLink.length < 5} onClick={previewSource}>Проверить ссылку</button>{sourcePreview && <div className="folder-list">{sourcePreview.peers.map((peer) => <label className={selectedPeerIds.includes(peer.canonical_peer_id) ? "selected" : ""} key={peer.canonical_peer_id}><input type="checkbox" checked={selectedPeerIds.includes(peer.canonical_peer_id)} onChange={(event) => setSelectedPeerIds((current) => event.target.checked ? [...current, peer.canonical_peer_id] : current.filter((id) => id !== peer.canonical_peer_id))} /><span><strong>{peer.title}</strong><small>{peer.source_type}{peer.participants_count ? ` · ${peer.participants_count} участников` : ""}</small></span></label>)}</div>}{sourcePreview && <button className="primary-action" disabled={busy || selectedPeerIds.length === 0} onClick={addSources}>{sourcePreview.requires_join ? "Вступить и подключить" : "Подключить выбранное"}</button>}{sources.map((source) => <div className="connection-row" key={source.id}><span>#</span><div><strong>{source.title}</strong><small>{source.type} · {source.added_via}</small></div><StatusBadge tone={source.enabled ? "success" : "neutral"}>{source.enabled ? "анализируется" : "выключено"}</StatusBadge></div>)}</Card>}
     </div>
   </section>;
+}
+
+function deliveryDescription(method: string) {
+  if (method === "sms") return "Telegram отправил код по SMS на подключаемый номер.";
+  if (["call", "flash_call", "missed_call"].includes(method)) return "Telegram отправляет код через телефонный звонок.";
+  return "Код отправлен в официальный служебный чат Telegram на подключаемом аккаунте.";
 }

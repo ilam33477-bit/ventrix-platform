@@ -26,6 +26,9 @@ class TelegramSessionRevoked(RuntimeError):
 class LoginChallenge:
     session_string: str
     phone_code_hash: str
+    delivery_type: str = "telegram_app"
+    next_delivery_type: str | None = None
+    timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +78,9 @@ class MessageBatch:
 
 class TelegramUserGateway(Protocol):
     async def begin_login(self, phone: str) -> LoginChallenge: ...
+    async def resend_login(
+        self, session_string: str, phone: str, phone_code_hash: str
+    ) -> LoginChallenge: ...
     async def complete_login(
         self,
         session_string: str,
@@ -181,11 +187,57 @@ class TelethonGateway:
         try:
             await client.connect()
             sent = await client.send_code_request(phone)
-            return LoginChallenge(StringSession.save(client.session), sent.phone_code_hash)
+            return self._login_challenge(client, sent)
         except errors.FloodWaitError as exc:
             raise TelegramFloodWait(exc.seconds) from None
         finally:
             await client.disconnect()
+
+    async def resend_login(
+        self, session_string: str, phone: str, phone_code_hash: str
+    ) -> LoginChallenge:
+        client = self.client(session_string)
+        try:
+            await client.connect()
+            sent = await client(
+                functions.auth.ResendCodeRequest(
+                    phone_number=phone,
+                    phone_code_hash=phone_code_hash,
+                )
+            )
+            return self._login_challenge(client, sent, fallback_hash=phone_code_hash)
+        except errors.FloodWaitError as exc:
+            raise TelegramFloodWait(exc.seconds) from None
+        finally:
+            await client.disconnect()
+
+    @staticmethod
+    def _login_challenge(
+        client: TelegramClient, sent: object, *, fallback_hash: str = ""
+    ) -> LoginChallenge:
+        def delivery_name(value: object | None) -> str | None:
+            if value is None:
+                return None
+            name = type(value).__name__
+            return {
+                "SentCodeTypeApp": "telegram_app",
+                "SentCodeTypeSms": "sms",
+                "SentCodeTypeCall": "call",
+                "SentCodeTypeFlashCall": "flash_call",
+                "SentCodeTypeMissedCall": "missed_call",
+                "CodeTypeSms": "sms",
+                "CodeTypeCall": "call",
+                "CodeTypeFlashCall": "flash_call",
+                "CodeTypeMissedCall": "missed_call",
+            }.get(name, name)
+
+        return LoginChallenge(
+            StringSession.save(client.session),
+            str(getattr(sent, "phone_code_hash", None) or fallback_hash),
+            delivery_name(getattr(sent, "type", None)) or "telegram_app",
+            delivery_name(getattr(sent, "next_type", None)),
+            getattr(sent, "timeout", None),
+        )
 
     async def complete_login(
         self,
