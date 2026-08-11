@@ -616,21 +616,17 @@ async def mini_app_dashboard_summary(
         ),
     }
     day_start = datetime.combine(datetime.now(UTC).date(), datetime.min.time(), UTC)
-    input_tokens, output_tokens, calls = (
-        await session.execute(
-            select(
-                func.coalesce(func.sum(AIUsageCall.input_tokens), 0),
-                func.coalesce(func.sum(AIUsageCall.output_tokens), 0),
-                func.count(AIUsageCall.id),
-            ).where(
+    calls = int(
+        await session.scalar(
+            select(func.count(AIUsageCall.id)).where(
                 AIUsageCall.tenant_id == tenant_id,
                 AIUsageCall.occurred_at >= day_start,
             )
         )
-    ).one()
+        or 0
+    )
     counts["ai_usage"] = {
-        "tokens_today": int(input_tokens or 0) + int(output_tokens or 0),
-        "calls_today": int(calls or 0),
+        "calls_today": calls,
     }
     return counts
 

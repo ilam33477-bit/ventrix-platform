@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -143,14 +144,28 @@ class SignalService:
                 f"{message.tenant_id}:{logical_source}:{candidate.signal_type}".encode()
             ).hexdigest()
             exists = await session.scalar(select(Signal).where(Signal.fingerprint == fingerprint))
+            provenance = {
+                "connection_id": message.connection_id,
+                "dialog_id": message.dialog_id,
+                "message_id": message.id,
+                "telegram_message_id": message.telegram_message_id,
+            }
             if exists is not None:
-                exists.local_score = candidate.score
+                metadata = dict(exists.metadata_json or {})
+                sources = list(metadata.get("source_provenance") or [])
+                if not any(
+                    item.get("connection_id") == message.connection_id
+                    and item.get("telegram_message_id") == message.telegram_message_id
+                    for item in sources
+                ):
+                    sources.append(provenance)
+                exists.local_score = max(exists.local_score, candidate.score)
                 exists.criticality = max(exists.criticality, candidate.score)
                 exists.reason = candidate.reason
-                exists.status = "candidate"
                 exists.metadata_json = {
-                    **(exists.metadata_json or {}),
+                    **metadata,
                     "features": candidate.features,
+                    "source_provenance": sources,
                     "re_evaluated_at": datetime.now(UTC).isoformat(),
                 }
                 created.append(exists)
@@ -187,6 +202,7 @@ class SignalService:
                 detected_at=message.sent_at,
                 metadata_json={
                     "features": candidate.features,
+                    "source_provenance": [provenance],
                     **(
                         {
                             "fast_lane": {
@@ -262,6 +278,14 @@ class SignalService:
                 )
 
     async def enqueue_triage(self, signals: list[Signal]) -> list[str]:
+        source_ids = {signal.source_message_id for signal in signals}
+        async with self.session_factory() as session:
+            source_messages = {
+                item.id: item
+                for item in await session.scalars(
+                    select(TelegramMessage).where(TelegramMessage.id.in_(source_ids))
+                )
+            }
         job_ids: list[str] = []
         for signal in signals:
             settings, threshold = await self._triage_policy(signal)
@@ -276,15 +300,17 @@ class SignalService:
                 if signal.local_score >= settings.signal_problem_threshold
                 else JOB_PRIORITY["P2"]
             )
+            source = source_messages.get(signal.source_message_id)
+            source_version = self._triage_source_version(source)
             job_ids.append(
                 await self.queue.enqueue(
                     "signal.ai_triage",
-                    {"signal_id": signal.id},
+                    {"signal_id": signal.id, "source_version": source_version},
                     tenant_id=signal.tenant_id,
                     telegram_account_id=signal.telegram_connection_id,
                     dialog_id=signal.dialog_id,
                     priority=priority,
-                    idempotency_key=f"signal-ai-triage:{signal.id}",
+                    idempotency_key=f"signal-ai-triage:{signal.id}:{source_version}",
                     correlation_id=signal.id,
                     is_heavy=False,
                     category="ai_fast",
@@ -293,6 +319,19 @@ class SignalService:
                 )
             )
         return job_ids
+
+    @staticmethod
+    def _triage_source_version(message: TelegramMessage | None) -> str:
+        if message is None:
+            return "source-missing"
+        payload = {
+            "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+            "body_text": message.body_text,
+            "attachments": message.attachments_json,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest()[:20]
 
     @staticmethod
     def _fast_lane_match(

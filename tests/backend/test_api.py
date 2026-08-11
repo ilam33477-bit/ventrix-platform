@@ -229,6 +229,10 @@ async def test_owner_api_endpoints(
         )
         assert mini_app_auth.json()["permissions"] == ["*"]
         assert "dashboard_summary" in mini_app_auth.json()
+        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {
+            "calls_today": 0
+        }
+        assert "tokens_today" not in mini_app_auth.json()["dashboard_summary"]["ai_usage"]
         assert mini_app_auth.json()["project_context"]["onboarding"] == {
             "step": "welcome",
             "completed": False,

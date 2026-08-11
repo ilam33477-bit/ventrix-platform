@@ -34,6 +34,7 @@ from .leases import RuntimeOwnership, TelegramRuntimeLeaseStore
 from .sync import TelegramSyncHandlers
 
 logger = logging.getLogger(__name__)
+CATCH_UP_PAGE_SIZE = 500
 
 
 class TelegramSessionActor:
@@ -445,50 +446,117 @@ class TelegramSessionActor:
 
     async def catch_up(self) -> dict[str, int]:
         """Fetch only gaps after saved cursors; used after restart/reconnect and rarely by scheduler."""
-        async with self.rpc_lock:
-            # StringSession does not persist Telethon's entity cache. Rebuild it once
-            # per catch-up pass and use InputPeer objects instead of unresolved raw IDs.
-            # The full iter_dialogs pass is also the recovery path for newly discovered chats.
-            input_entities: dict[int, Any] = {}
-            async for remote_dialog in self.client.iter_dialogs():
-                input_entities[int(remote_dialog.id)] = getattr(
-                    remote_dialog, "input_entity", remote_dialog.entity
+        # StringSession does not persist Telethon's entity cache. Rebuild it once
+        # per catch-up pass and use InputPeer objects instead of unresolved raw IDs.
+        # The full iter_dialogs pass is also the recovery path for newly discovered
+        # personal chats. Groups/channels remain explicit opt-in sources.
+        remote_catalog: dict[int, dict[str, Any]] = {}
+        try:
+            async with self.rpc_lock:
+                async for remote_dialog in self.client.iter_dialogs():
+                    entity = remote_dialog.entity
+                    source_type = (
+                        "personal"
+                        if remote_dialog.is_user
+                        else "channel"
+                        if remote_dialog.is_channel and getattr(entity, "broadcast", False)
+                        else "group"
+                    )
+                    remote_id = int(remote_dialog.id)
+                    remote_catalog[remote_id] = {
+                        "input_entity": getattr(
+                            remote_dialog, "input_entity", remote_dialog.entity
+                        ),
+                        "title": str(remote_dialog.name or "Telegram dialog")[:300],
+                        "username": getattr(entity, "username", None),
+                        "source_type": source_type,
+                        "last_message_at": getattr(remote_dialog.message, "date", None),
+                    }
+        except errors.FloodWaitError as exc:
+            await self._rate_limited(int(exc.seconds))
+            raise TelegramFloodWait(int(exc.seconds)) from None
+
+        async def discover_personal_dialogs(session: AsyncSession) -> int:
+            existing_remote_ids = set(
+                await session.scalars(
+                    select(TelegramDialog.telegram_dialog_id).where(
+                        TelegramDialog.connection_id == self.connection.id
+                    )
                 )
-            async with self.transactions.session_factory() as session:
-                rows = (
-                    await session.execute(
-                        select(TelegramDialog, TelegramIncrementalCursor)
-                        .outerjoin(
-                            TelegramIncrementalCursor,
-                            TelegramIncrementalCursor.dialog_id == TelegramDialog.id,
-                        )
-                        .where(
-                            TelegramDialog.connection_id == self.connection.id,
-                            TelegramDialog.selected.is_(True),
-                            TelegramDialog.excluded.is_(False),
-                        )
-                    )
-                ).all()
-            seen = 0
-            for dialog, cursor in rows:
-                input_entity = input_entities.get(dialog.telegram_dialog_id)
-                if input_entity is None:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "telegram_catchup_dialog_unavailable",
-                        tenant_id=self.connection.tenant_id,
-                        account_id=self.connection.id,
-                        dialog_id=dialog.id,
-                    )
+            )
+            discovered = 0
+            for remote_id, remote in remote_catalog.items():
+                if remote_id in existing_remote_ids or remote["source_type"] != "personal":
                     continue
-                after_id = cursor.last_message_id if cursor else dialog.last_message_id
-                async for message in self.client.iter_messages(
-                    input_entity,
-                    min_id=after_id,
-                    reverse=True,
-                    limit=500,
-                ):
+                session.add(
+                    TelegramDialog(
+                        tenant_id=self.connection.tenant_id,
+                        connection_id=self.connection.id,
+                        telegram_dialog_id=remote_id,
+                        canonical_peer_id=str(remote_id),
+                        title=remote["title"],
+                        username=remote["username"],
+                        dialog_type="personal",
+                        source="recovery",
+                        classification="auto_personal",
+                        confidence=1.0,
+                        requires_user_confirmation=False,
+                        selected=True,
+                        excluded=False,
+                        last_message_at=remote["last_message_at"],
+                    )
+                )
+                discovered += 1
+            return discovered
+
+        discovered = await self.transactions.run(discover_personal_dialogs)
+        async with self.transactions.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(TelegramDialog, TelegramIncrementalCursor)
+                    .outerjoin(
+                        TelegramIncrementalCursor,
+                        TelegramIncrementalCursor.dialog_id == TelegramDialog.id,
+                    )
+                    .where(
+                        TelegramDialog.connection_id == self.connection.id,
+                        TelegramDialog.selected.is_(True),
+                        TelegramDialog.excluded.is_(False),
+                    )
+                )
+            ).all()
+        seen = 0
+        for dialog, cursor in rows:
+            remote = remote_catalog.get(dialog.telegram_dialog_id)
+            input_entity = remote["input_entity"] if remote else None
+            if input_entity is None:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "telegram_catchup_dialog_unavailable",
+                    tenant_id=self.connection.tenant_id,
+                    account_id=self.connection.id,
+                    dialog_id=dialog.id,
+                )
+                continue
+            page_after_id = cursor.last_message_id if cursor else dialog.last_message_id
+            while True:
+                page: list[Any] = []
+                try:
+                    async with self.rpc_lock:
+                        async for message in self.client.iter_messages(
+                            input_entity,
+                            min_id=page_after_id,
+                            reverse=True,
+                            limit=CATCH_UP_PAGE_SIZE,
+                        ):
+                            page.append(message)
+                except errors.FloodWaitError as exc:
+                    await self._rate_limited(int(exc.seconds))
+                    raise TelegramFloodWait(int(exc.seconds)) from None
+                if not page:
+                    break
+                for message in page:
                     attachments: list[dict[str, Any]] = []
                     if message.media:
                         file = getattr(message, "file", None)
@@ -540,15 +608,19 @@ class TelegramSessionActor:
                         partition_sequence=int(message.id) * 1_000_000_000,
                     )
                     seen += 1
-            if seen:
+                page_after_id = max(int(message.id) for message in page)
+                if len(page) < CATCH_UP_PAGE_SIZE:
+                    break
 
-                async def write(session: AsyncSession) -> None:
-                    connection = await session.get(TelegramConnection, self.connection.id)
-                    if connection:
-                        connection.catchup_events += seen
+        if seen:
 
-                await self.transactions.run(write)
-            return {"events": seen}
+            async def write(session: AsyncSession) -> None:
+                connection = await session.get(TelegramConnection, self.connection.id)
+                if connection:
+                    connection.catchup_events += seen
+
+            await self.transactions.run(write)
+        return {"events": seen, "discovered_dialogs": discovered}
 
     async def preview_source(self, link: str) -> dict[str, Any]:
         async with self.rpc_lock:

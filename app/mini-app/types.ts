@@ -43,7 +43,7 @@ export type DashboardSummary = {
   employees: number;
   connections: number;
   groups: number;
-  ai_usage: { tokens_today: number; calls_today: number };
+  ai_usage: { calls_today: number };
 };
 
 export type MiniAppAuth = {

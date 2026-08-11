@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from ..database import SQLiteTransactionManager
 from ..jobs.queue import JobLease, SQLiteJobQueue
@@ -30,6 +31,7 @@ from .remediation import RemediationDecision, RemediationVerifier
 COMPLETION_RE = re.compile(
     r"\b(?:отправил[аи]?|готово|прикрепил[аи]?|сделано|выполнено)\b", re.IGNORECASE
 )
+RECOVERY_RECHECK_INTERVAL = timedelta(hours=24)
 
 
 class ReconciliationService:
@@ -43,6 +45,7 @@ class ReconciliationService:
         verification_model: str = "deepseek-v4-flash",
     ) -> None:
         self.session_factory = session_factory
+        self.queue = queue
         self.transactions = SQLiteTransactionManager(session_factory)
         self.notifications = NotificationOrchestrator(
             session_factory, queue, cooldown_minutes=notification_cooldown_minutes
@@ -57,20 +60,83 @@ class ReconciliationService:
         if job.tenant_id is None:
             raise ValueError("tenant is required")
         now = datetime.now(UTC)
+        stale_before = now - RECOVERY_RECHECK_INTERVAL
+        commitment_source = aliased(TelegramMessage)
+        commitment_evidence = aliased(TelegramMessage)
+        problem_source = aliased(TelegramMessage)
+        problem_evidence = aliased(TelegramMessage)
+        new_commitment_evidence = exists(
+            select(1).where(
+                commitment_evidence.tenant_id == Commitment.tenant_id,
+                commitment_evidence.dialog_id == Commitment.dialog_id,
+                commitment_evidence.telegram_message_id
+                > commitment_source.telegram_message_id,
+                commitment_evidence.deleted_at.is_(None),
+                or_(
+                    Commitment.last_checked_at.is_(None),
+                    commitment_evidence.sent_at > Commitment.last_checked_at,
+                    commitment_evidence.updated_at > Commitment.last_checked_at,
+                ),
+            )
+        )
+        new_problem_evidence = exists(
+            select(1).where(
+                problem_evidence.tenant_id == OperationalProblem.tenant_id,
+                problem_evidence.dialog_id == OperationalProblem.dialog_id,
+                problem_evidence.telegram_message_id > problem_source.telegram_message_id,
+                problem_evidence.deleted_at.is_(None),
+                or_(
+                    OperationalProblem.last_verified_at.is_(None),
+                    problem_evidence.sent_at > OperationalProblem.last_verified_at,
+                    problem_evidence.updated_at > OperationalProblem.last_verified_at,
+                ),
+            )
+        )
         async with self.session_factory() as session:
             commitments = list(
                 await session.scalars(
-                    select(Commitment).where(
+                    select(Commitment)
+                    .join(
+                        commitment_source,
+                        commitment_source.id == Commitment.source_message_id,
+                    )
+                    .where(
                         Commitment.tenant_id == job.tenant_id,
                         Commitment.status == "open",
+                        or_(
+                            and_(
+                                Commitment.deadline_at.is_not(None),
+                                Commitment.deadline_at <= now,
+                                or_(
+                                    Commitment.last_checked_at.is_(None),
+                                    Commitment.last_checked_at < Commitment.deadline_at,
+                                ),
+                            ),
+                            new_commitment_evidence,
+                            and_(
+                                Commitment.last_checked_at.is_not(None),
+                                Commitment.last_checked_at <= stale_before,
+                            ),
+                        ),
                     )
                 )
             )
             problems = list(
                 await session.scalars(
-                    select(OperationalProblem).where(
+                    select(OperationalProblem)
+                    .join(
+                        problem_source,
+                        problem_source.id == OperationalProblem.source_message_id,
+                    )
+                    .where(
                         OperationalProblem.tenant_id == job.tenant_id,
                         OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                        or_(
+                            OperationalProblem.last_verified_at.is_(None),
+                            OperationalProblem.next_check_at <= now,
+                            new_problem_evidence,
+                            OperationalProblem.last_verified_at <= stale_before,
+                        ),
                     )
                 )
             )
@@ -87,6 +153,8 @@ class ReconciliationService:
                 signal_id, problem_id, was_created = await self._overdue(commitment.id, now)
                 if was_created:
                     created.append((signal_id, problem_id))
+            else:
+                await self._mark_commitment_checked(commitment.id, now)
         for problem in problems:
             decision = await self._verify_problem(problem)
             if (
@@ -143,7 +211,70 @@ class ReconciliationService:
 
     async def deadline_check(self, job: JobLease) -> dict[str, int]:
         """Targeted durable deadline timer; periodic reconciliation remains the recovery path."""
-        return await self.reconcile(job)
+        if job.tenant_id is None:
+            raise ValueError("tenant is required")
+        commitment_id = str(job.payload["commitment_id"])
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            commitment = await session.scalar(
+                select(Commitment).where(
+                    Commitment.id == commitment_id,
+                    Commitment.tenant_id == job.tenant_id,
+                )
+            )
+        if commitment is None or commitment.status != "open":
+            return {
+                "overdue_created": 0,
+                "commitments_completed": 0,
+                "problems_resolved": 0,
+                "rescheduled": 0,
+            }
+        if await self._is_completed(commitment):
+            await self._complete_commitment(commitment.id, now)
+            return {
+                "overdue_created": 0,
+                "commitments_completed": 1,
+                "problems_resolved": 0,
+                "rescheduled": 0,
+            }
+        deadline = self._aware(commitment.deadline_at)
+        if deadline is None:
+            await self._mark_commitment_checked(commitment.id, now)
+            return {
+                "overdue_created": 0,
+                "commitments_completed": 0,
+                "problems_resolved": 0,
+                "rescheduled": 0,
+            }
+        if deadline > now:
+            await self.queue.enqueue(
+                "commitment.deadline_check",
+                {"commitment_id": commitment.id},
+                tenant_id=commitment.tenant_id,
+                telegram_account_id=commitment.connection_id,
+                dialog_id=commitment.dialog_id,
+                scheduled_at=deadline,
+                idempotency_key=(
+                    f"commitment-deadline:{commitment.id}:{deadline.isoformat()}"
+                ),
+                category="reconciliation",
+                cost_class="light",
+            )
+            return {
+                "overdue_created": 0,
+                "commitments_completed": 0,
+                "problems_resolved": 0,
+                "rescheduled": 1,
+            }
+        signal_id, problem_id, created = await self._overdue(commitment.id, now)
+        if created:
+            await self.notifications.plan_for_signal(signal_id, problem_id)
+        return {
+            "overdue_created": int(created),
+            "commitments_completed": 0,
+            "problems_resolved": 0,
+            "rescheduled": 0,
+        }
 
     async def sla_check(self, job: JobLease) -> dict[str, object]:
         if job.tenant_id is None:
@@ -274,6 +405,14 @@ class ReconciliationService:
 
         await self.transactions.run(write)
 
+    async def _mark_commitment_checked(self, commitment_id: str, now: datetime) -> None:
+        async def write(session: AsyncSession) -> None:
+            commitment = await session.get(Commitment, commitment_id)
+            if commitment is not None and commitment.status == "open":
+                commitment.last_checked_at = now
+
+        await self.transactions.run(write)
+
     async def _overdue(self, commitment_id: str, now: datetime) -> tuple[str, str, bool]:
         async def write(session: AsyncSession) -> tuple[str, str, bool]:
             commitment = await session.get(Commitment, commitment_id)
@@ -387,6 +526,7 @@ class ReconciliationService:
                 and latest.evidence_message_ids_json == evidence_ids
             ):
                 current.last_verified_at = datetime.now(UTC)
+                current.next_check_at = datetime.now(UTC) + RECOVERY_RECHECK_INTERVAL
                 return
             session.add(
                 ProblemVerification(
@@ -402,6 +542,7 @@ class ReconciliationService:
                 )
             )
             current.last_verified_at = datetime.now(UTC)
+            current.next_check_at = datetime.now(UTC) + RECOVERY_RECHECK_INTERVAL
 
         await self.transactions.run(write)
 

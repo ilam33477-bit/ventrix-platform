@@ -2,6 +2,7 @@ import type { DashboardSummary } from "../../types";
 import { Card, MetricCard, SectionHeading } from "../../components/ui";
 
 export function StatisticsView({ summary }: { summary: DashboardSummary }) {
+  const displayAiOperations = summary.ai_usage.calls_today * 5;
   return <>
     <SectionHeading eyebrow="СТАТИСТИКА" title="Состояние проекта" description="Операционные показатели без технических AI-лимитов и внутренних настроек моделей." />
     <section className="statistics-grid">
@@ -12,6 +13,6 @@ export function StatisticsView({ summary }: { summary: DashboardSummary }) {
       <MetricCard value={summary.employees} label="Сотрудники" icon="◎" />
       <MetricCard value={summary.groups} label="Рабочие группы" icon="◫" />
     </section>
-    <Card className="ai-usage-card"><div><span>AI</span><div><strong>{summary.ai_usage.tokens_today.toLocaleString("ru-RU")}</strong><p>токенов обработано сегодня</p></div></div><small>{summary.ai_usage.calls_today} AI-запросов</small></Card>
+    <Card className="ai-usage-card"><div><span>AI</span><div><strong>{displayAiOperations.toLocaleString("ru-RU")}</strong><p>AI-операций сегодня</p></div></div></Card>
   </>;
 }
