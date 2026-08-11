@@ -364,22 +364,31 @@ class TelegramSessionActor:
         return {"folders": len(folders), "dialogs": len(dialogs)}
 
     async def _prepare_connection_job(self, job: JobLease) -> dict[str, Any]:
-        catalog = await self._refresh_catalog_job(job)
-        service = TelegramConnectionService(
-            self.sync_handlers.session_factory,
-            self.sync_handlers.encryption,
-            self.sync_handlers.gateway,
-        )
-        await service.activate_default_scope(
-            self.connection.tenant_id,
-            history_days=int(job.payload.get("history_days") or 14),
-            connection_id=self.connection.id,
-        )
-        run = await service.start_initial_sync(
-            self.connection.tenant_id,
-            connection_id=self.connection.id,
-        )
-        return {**catalog, "analysis_run_id": run.id}
+        try:
+            catalog = await self._refresh_catalog_job(job)
+            service = TelegramConnectionService(
+                self.sync_handlers.session_factory,
+                self.sync_handlers.encryption,
+                self.sync_handlers.gateway,
+            )
+            await service.activate_default_scope(
+                self.connection.tenant_id,
+                history_days=int(job.payload.get("history_days") or 14),
+                connection_id=self.connection.id,
+            )
+            run = await service.start_initial_sync(
+                self.connection.tenant_id,
+                connection_id=self.connection.id,
+            )
+            return {**catalog, "analysis_run_id": run.id}
+        except Exception:
+            logger.exception(
+                "Telegram connection preparation failed tenant_id=%s connection_id=%s job_id=%s",
+                self.connection.tenant_id,
+                self.connection.id,
+                job.id,
+            )
+            raise
 
     async def stop(self) -> None:
         self._stopping.set()

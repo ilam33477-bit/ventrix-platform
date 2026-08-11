@@ -199,6 +199,34 @@ def test_phone_normalization_supports_russian_and_e164_inputs(value, expected) -
 
 
 @pytest.mark.asyncio
+async def test_default_scope_accepts_naive_sqlite_dialog_timestamps(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    tenant, _, service = await connected_service(
+        session_factory, make_service, tenant_payload, encryption_key
+    )
+    await service.refresh_catalog(tenant.id)
+    async with session_factory() as session:
+        dialog = await session.scalar(
+            select(TelegramDialog).where(
+                TelegramDialog.tenant_id == tenant.id,
+                TelegramDialog.dialog_type == "personal",
+            )
+        )
+        dialog.last_message_at = (datetime.now(UTC) - timedelta(hours=1)).replace(tzinfo=None)
+        await session.commit()
+
+    connection = await service.activate_default_scope(
+        tenant.id, history_days=14
+    )
+
+    async with session_factory() as session:
+        dialog = await session.get(TelegramDialog, dialog.id)
+    assert connection.progress_stage == "personal_sources_enabled"
+    assert dialog.selected is True
+
+
+@pytest.mark.asyncio
 async def test_new_login_supersedes_previous_pending_challenge_for_same_scope(
     session_factory, make_service, tenant_payload, encryption_key
 ) -> None:

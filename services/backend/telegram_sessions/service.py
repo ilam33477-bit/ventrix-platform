@@ -39,6 +39,11 @@ class TelegramConnectionError(RuntimeError):
     pass
 
 
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns timezone columns as naive datetimes; compare them safely in UTC."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def mask_phone(phone: str) -> str:
     digits = normalize_phone_number(phone).lstrip("+")
     if len(digits) < 7:
@@ -602,12 +607,14 @@ class TelegramConnectionService:
             raise ValueError("history_days must be between 0 and 180")
 
         async def write(session: AsyncSession) -> None:
+            query = select(TelegramConnection).where(
+                TelegramConnection.tenant_id == tenant_id,
+                TelegramConnection.deleted_at.is_(None),
+            )
+            if connection_id is not None:
+                query = query.where(TelegramConnection.id == connection_id)
             connection = await session.scalar(
-                select(TelegramConnection).where(
-                    TelegramConnection.id == connection_id,
-                    TelegramConnection.tenant_id == tenant_id,
-                    TelegramConnection.deleted_at.is_(None),
-                )
+                query.order_by(TelegramConnection.created_at.desc()).limit(1)
             )
             if connection is None:
                 raise TelegramConnectionError("connected session is required")
@@ -632,7 +639,7 @@ class TelegramConnectionService:
                 if dialog.dialog_type == "personal":
                     dialog.selected = bool(
                         dialog.last_message_at is not None
-                        and dialog.last_message_at >= active_cutoff
+                        and _as_utc(dialog.last_message_at) >= active_cutoff
                     )
                     dialog.excluded = False
                     dialog.classification = "auto_personal"
