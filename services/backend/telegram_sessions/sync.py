@@ -415,9 +415,13 @@ class TelegramSyncHandlers:
             message_ids = list(
                 await session.scalars(
                     select(TelegramMessage.id)
+                    .join(TelegramDialog, TelegramDialog.id == TelegramMessage.dialog_id)
                     .where(
                         TelegramMessage.tenant_id == run.tenant_id,
                         TelegramMessage.connection_id == run.connection_id,
+                        TelegramDialog.selected.is_(True),
+                        TelegramDialog.excluded.is_(False),
+                        TelegramDialog.classification != "automated_account",
                         TelegramMessage.sent_at
                         >= datetime.now(UTC) - timedelta(days=run.history_days),
                     )

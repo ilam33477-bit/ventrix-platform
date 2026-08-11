@@ -176,7 +176,7 @@ class NotificationOrchestrator:
     async def plan_for_signal(self, signal_id: str, problem_id: str | None = None) -> list[str]:
         async with self.session_factory() as session:
             signal = await session.get(Signal, signal_id)
-            if signal is None:
+            if signal is None or signal.status == "suppressed":
                 return []
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == signal.tenant_id)
@@ -186,6 +186,8 @@ class NotificationOrchestrator:
                 await session.get(Employee, signal.employee_id) if signal.employee_id else None
             )
             dialog = await session.get(TelegramDialog, signal.dialog_id)
+            if dialog is None or dialog.excluded or dialog.classification == "automated_account":
+                return []
             source_message = (
                 await session.get(TelegramMessage, signal.source_message_id)
                 if signal.source_message_id

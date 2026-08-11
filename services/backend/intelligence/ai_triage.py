@@ -59,7 +59,7 @@ class AITriageService:
             raise RuntimeError("AI provider is not configured")
         signal_id = str(job.payload["signal_id"])
         payload, signal, settings = await self._payload(signal_id, job.tenant_id)
-        if signal.status in {"triaged", "problem_created", "history"}:
+        if signal.status in {"triaged", "problem_created", "history", "suppressed"}:
             return {"signal_id": signal.id, "status": signal.status, "deduplicated": True}
         await self._enforce_budget(signal, settings)
         started = time.perf_counter()

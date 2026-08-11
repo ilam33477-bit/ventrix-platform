@@ -636,7 +636,10 @@ class TelegramConnectionService:
                 )
             )
             for dialog in dialogs:
-                if dialog.dialog_type == "personal":
+                if (
+                    dialog.dialog_type == "personal"
+                    and dialog.classification != "automated_account"
+                ):
                     dialog.selected = bool(
                         dialog.last_message_at is not None
                         and _as_utc(dialog.last_message_at) >= active_cutoff
@@ -646,6 +649,8 @@ class TelegramConnectionService:
                     dialog.requires_user_confirmation = False
                 else:
                     dialog.selected = False
+                    if dialog.classification == "automated_account":
+                        dialog.excluded = True
 
         await self.transactions.run(write)
         result = await self.get(tenant_id, connection_id)
@@ -720,7 +725,10 @@ class TelegramConnectionService:
             )
             for dialog in dialogs:
                 in_work_folder = dialog.folder_id in folder_ids
-                personal_candidate = dialog.dialog_type == "personal"
+                personal_candidate = (
+                    dialog.dialog_type == "personal"
+                    and dialog.classification != "automated_account"
+                )
                 dialog.selected = (in_work_folder or personal_candidate) and not dialog.excluded
                 if personal_candidate:
                     dialog.requires_user_confirmation = False

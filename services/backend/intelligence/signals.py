@@ -42,13 +42,18 @@ class SignalService:
 
         async def write(session: AsyncSession) -> list[str]:
             message = await session.scalar(
-                select(TelegramMessage).where(
+                select(TelegramMessage)
+                .join(TelegramDialog, TelegramDialog.id == TelegramMessage.dialog_id)
+                .where(
                     TelegramMessage.id == message_id,
                     TelegramMessage.tenant_id == job.tenant_id,
+                    TelegramDialog.selected.is_(True),
+                    TelegramDialog.excluded.is_(False),
+                    TelegramDialog.classification != "automated_account",
                 )
             )
             if message is None:
-                raise LookupError("message not found in tenant")
+                return []
             previous = list(
                 await session.scalars(
                     select(TelegramMessage)
@@ -79,9 +84,13 @@ class SignalService:
             messages = list(
                 await session.scalars(
                     select(TelegramMessage)
+                    .join(TelegramDialog, TelegramDialog.id == TelegramMessage.dialog_id)
                     .where(
                         TelegramMessage.tenant_id == job.tenant_id,
                         TelegramMessage.id.in_(message_ids),
+                        TelegramDialog.selected.is_(True),
+                        TelegramDialog.excluded.is_(False),
+                        TelegramDialog.classification != "automated_account",
                     )
                     .order_by(TelegramMessage.dialog_id, TelegramMessage.telegram_message_id)
                 )

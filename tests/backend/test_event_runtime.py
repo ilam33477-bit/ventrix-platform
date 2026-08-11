@@ -8,11 +8,14 @@ import pytest
 from sqlalchemy import func, select
 
 from services.backend.intelligence.local_signals import LocalSignalEngine
+from services.backend.intelligence.signals import SignalService
 from services.backend.jobs.queue import JobLease, SQLiteJobQueue
 from services.backend.models import (
     BackgroundJob,
     MonitoredSource,
+    Signal,
     TelegramConnection,
+    TelegramDialog,
     TelegramMessage,
 )
 from services.backend.services.client_drafts import OwnerClientDraftService
@@ -138,6 +141,63 @@ def test_telegram_private_entity_classifier_rejects_non_humans() -> None:
     assert is_automated_private_entity(SimpleNamespace(deleted=True, username=None))
     assert is_automated_private_entity(SimpleNamespace(is_self=True, username="me"))
     assert not is_automated_private_entity(SimpleNamespace(username="real_customer"))
+
+
+@pytest.mark.asyncio
+async def test_historical_bot_message_is_not_scanned_even_if_previously_selected(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.flush()
+        dialog = TelegramDialog(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            telegram_dialog_id=178220800,
+            canonical_peer_id="178220800",
+            title="Spam Info Bot",
+            dialog_type="personal",
+            source="history",
+            classification="automated_account",
+            selected=True,
+            excluded=False,
+        )
+        session.add(dialog)
+        await session.flush()
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=1,
+            sender_role="customer",
+            sent_at=datetime.now(UTC),
+            outgoing=False,
+            body_text="Ваш аккаунт свободен от ограничений.",
+        )
+        session.add(message)
+        await session.commit()
+    queue = SQLiteJobQueue(session_factory)
+    result = await SignalService(session_factory, queue).scan_batch_job(
+        JobLease(
+            id="bot-history-scan",
+            tenant_id=tenant.id,
+            telegram_account_id=connection.id,
+            dialog_id=dialog.id,
+            correlation_id=None,
+            job_type="signal.scan_batch",
+            category="historical",
+            cost_class="light",
+            payload={"message_ids": [message.id]},
+            attempts=0,
+            max_attempts=3,
+            locked_by="test",
+        )
+    )
+    assert result == {"signals": 0, "triage_jobs": 0}
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(Signal.id))) == 0
 
 
 def test_invoice_fast_lane_needs_invoice_metadata() -> None:
