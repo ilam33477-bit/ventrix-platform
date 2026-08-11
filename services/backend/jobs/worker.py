@@ -300,9 +300,18 @@ async def run() -> None:
     )
 
     async def worker_loop(worker: BackgroundWorker) -> None:
+        idle_delay = settings.worker_poll_interval_seconds
+        max_idle_delay = max(idle_delay, min(5.0, idle_delay * 4))
         while True:
-            if not await worker.run_once():
-                await asyncio.sleep(settings.worker_poll_interval_seconds)
+            if await worker.run_once():
+                idle_delay = settings.worker_poll_interval_seconds
+                # Give SQLite and the event loop a scheduling point between jobs.
+                # This prevents a large historical backlog from monopolising a
+                # single-core host while preserving the configured concurrency.
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(idle_delay)
+            idle_delay = min(max_idle_delay, idle_delay * 2)
 
     async def maintenance_loop() -> None:
         while True:

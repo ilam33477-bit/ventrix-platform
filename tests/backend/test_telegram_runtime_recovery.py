@@ -139,9 +139,12 @@ async def test_catch_up_paginates_entire_1200_message_gap_without_duplicates(
             or 0
         )
     assert first["events"] == 1200
-    assert second["events"] == 1200
-    assert client.min_ids[1001] == [10, 510, 1010, 10, 510, 1010]
+    assert second["events"] == 0
+    assert client.min_ids[1001] == [10, 510, 1010, 1210]
     assert queued == 1200
+    async with session_factory() as session:
+        cursor = await session.scalar(select(TelegramIncrementalCursor))
+        assert cursor is not None and cursor.last_message_id == 1210
 
 
 @pytest.mark.asyncio

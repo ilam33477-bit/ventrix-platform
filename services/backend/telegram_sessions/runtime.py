@@ -156,9 +156,14 @@ class TelegramSessionActor:
             allowed_categories=frozenset({"telegram_rpc"}),
             telegram_account_id=self.connection.id,
         )
+        idle_delay = 0.25
         while not self._stopping.is_set():
-            if not await worker.run_once():
-                await asyncio.sleep(0.15)
+            if await worker.run_once():
+                idle_delay = 0.25
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(idle_delay)
+            idle_delay = min(2.0, idle_delay * 2)
 
     async def _lease_loop(self) -> None:
         while not self._stopping.is_set():
@@ -674,6 +679,45 @@ class TelegramSessionActor:
                     )
                     seen += 1
                 page_after_id = max(int(message.id) for message in page)
+                # The queue write above is durable. Checkpoint the highest
+                # enqueued message now instead of waiting for the downstream
+                # ingestion backlog to drain. A crash before this checkpoint
+                # only causes idempotent re-enqueues; a successful checkpoint
+                # prevents every 30-second reconciliation pass from walking the
+                # same Telegram history and querying thousands of idempotency keys.
+                checkpoint_message_id = page_after_id
+
+                async def checkpoint(
+                    session: AsyncSession,
+                    dialog_id: str = dialog.id,
+                    message_id: int = checkpoint_message_id,
+                ) -> None:
+                    current = await session.scalar(
+                        select(TelegramIncrementalCursor).where(
+                            TelegramIncrementalCursor.connection_id == self.connection.id,
+                            TelegramIncrementalCursor.dialog_id == dialog_id,
+                        )
+                    )
+                    now = datetime.now(UTC)
+                    if current is None:
+                        session.add(
+                            TelegramIncrementalCursor(
+                                tenant_id=self.connection.tenant_id,
+                                connection_id=self.connection.id,
+                                dialog_id=dialog_id,
+                                last_message_id=message_id,
+                                last_sync_at=now,
+                                status="queued",
+                            )
+                        )
+                    else:
+                        current.last_message_id = max(
+                            current.last_message_id or 0, message_id
+                        )
+                        current.last_sync_at = now
+                        current.status = "queued"
+
+                await self.transactions.run(checkpoint)
                 if len(page) < CATCH_UP_PAGE_SIZE:
                     break
 
