@@ -171,7 +171,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const visibleConnections = connections.filter((item) =>
     ["connected", "syncing", "ready", "reauthorization_required"].includes(item.status),
   );
-  const showSources = mode !== "onboarding_connection" && connections.length > 0;
+  const showSources = mode !== "onboarding_connection" && visibleConnections.length > 0;
   const heading = mode === "onboarding_groups"
     ? ["РАБОЧИЕ ГРУППЫ", "Добавьте группы", "Вставьте ссылку на группу или общую папку Telegram. Можно добавить несколько групп."]
     : ["TELEGRAM", "Рабочий Telegram", "Личные диалоги подключаются автоматически. Дополнительные аккаунты можно добавить позже."];
