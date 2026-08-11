@@ -176,6 +176,7 @@ export class VentrixClientApi {
   startTelegramLogin(phone: string, employeeId: string | null) {
     return this.request<{
       id: string;
+      phone_masked: string;
       code_delivery_method: string;
       next_code_delivery_method: string | null;
       resend_available_in: number;
@@ -188,6 +189,7 @@ export class VentrixClientApi {
   resendTelegramLogin(connectionId: string) {
     return this.request<{
       id: string;
+      phone_masked: string;
       code_delivery_method: string;
       next_code_delivery_method: string | null;
       resend_available_in: number;

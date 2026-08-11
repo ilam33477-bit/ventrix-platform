@@ -46,6 +46,9 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const [deliveryMethod, setDeliveryMethod] = useState(
     initialConnections[0]?.code_delivery_method ?? "telegram_app",
   );
+  const [codePhoneMasked, setCodePhoneMasked] = useState(
+    initialConnections[0]?.account ?? "",
+  );
   const [sourceLink, setSourceLink] = useState("");
   const [sourcePreview, setSourcePreview] = useState<TelegramSourcePreview | null>(null);
   const [previewJobId, setPreviewJobId] = useState("");
@@ -103,6 +106,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const startLogin = () => run(async () => {
     const result = await api.startTelegramLogin(phone, employeeId || null);
     setConnectionId(result.id);
+    setCodePhoneMasked(result.phone_masked);
     setDeliveryMethod(result.code_delivery_method);
     setResendAvailableIn(result.resend_available_in);
     setStep("code");
@@ -126,6 +130,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const resendCode = () => run(async () => {
     if (!connectionId) throw new Error("Начните подключение заново");
     const result = await api.resendTelegramLogin(connectionId);
+    setCodePhoneMasked(result.phone_masked);
     setDeliveryMethod(result.code_delivery_method);
     setResendAvailableIn(result.resend_available_in);
     setCode(""); setStep("code");
@@ -174,7 +179,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
       {showConnection && <Card className="connection-wizard">
         <div className="step-dots"><span className={step === "phone" ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
         {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Код придёт в официальный чат Telegram подключаемого аккаунта.</p>{mode === "manage" && <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || phone.length < 8} onClick={startLogin}>{busy ? "Отправляем код…" : "Получить код"}</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
-        {step === "code" && <><h3>Код подтверждения</h3><p>{deliveryDescription(deliveryMethod)} Ventrix использует код один раз и не сохраняет.</p><div className="delivery-hint"><strong>Код запрошен</strong><span>Если уведомления выключены, откройте в Telegram чат «Telegram» со служебными сообщениями.</span></div><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Очистить код</button><button disabled={busy || resendAvailableIn > 0} onClick={resendCode}>{resendAvailableIn > 0 ? `Новый код через ${resendAvailableIn} сек.` : "Отправить новый код"}</button></div></>}
+        {step === "code" && <><h3>Код подтверждения</h3><p>{deliveryDescription(deliveryMethod)} Ventrix использует код один раз и не сохраняет.</p><div className="delivery-hint"><strong>Код запрошен{codePhoneMasked ? ` для ${codePhoneMasked}` : ""}</strong><span>Если уведомления выключены, откройте на этом аккаунте чат «Telegram» со служебными сообщениями. Старые коды после повторной отправки не действуют.</span></div><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Очистить код</button><button disabled={busy || resendAvailableIn > 0} onClick={resendCode}>{resendAvailableIn > 0 ? `Новый код через ${resendAvailableIn} сек.` : "Отправить новый код"}</button></div></>}
         {step === "password" && <><h3>Пароль 2FA</h3><p>Пароль передаётся только для входа в Telegram и не сохраняется.</p><label>Облачный пароль<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary-action" disabled={busy || !password} onClick={() => completeLogin(true)}>Подключить аккаунт</button><button className="text-action" disabled={busy} onClick={() => setPassword("")}>Попробовать ещё раз</button></>}
         {step === "syncing" && <><h3>Запускаем анализ</h3><div className="state-progress"><i /></div><p>Mini App можно закрыть — прогресс сохранится.</p></>}
         {step === "done" && <div className="connection-done"><span>✓</span><h3>Аккаунт подключён</h3><p>Ventrix начал загружать личные рабочие диалоги с глубиной истории, заданной владельцем платформы. Рабочие группы можно добавить позже.</p></div>}

@@ -156,6 +156,12 @@ class TelegramConnectionService:
             return connection.id
 
         connection_id = await self.transactions.run(write)
+        logger.info(
+            "Telegram login code accepted tenant_id=%s connection_id=%s delivery_type=%s",
+            tenant_id,
+            connection_id,
+            challenge.delivery_type,
+        )
         async with self.session_factory() as session:
             return await session.get(TelegramConnection, connection_id)
 
@@ -224,6 +230,12 @@ class TelegramConnectionService:
             return connection.id
 
         target_id = await self.transactions.run(write)
+        logger.info(
+            "Telegram login code resent tenant_id=%s connection_id=%s delivery_type=%s",
+            tenant_id,
+            target_id,
+            challenge.delivery_type,
+        )
         async with self.session_factory() as session:
             return await session.get(TelegramConnection, target_id)
 
