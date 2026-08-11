@@ -137,6 +137,7 @@ class TelegramConnectionService:
     ) -> TelegramConnection:
         phone = normalize_phone_number(phone)
         masked = mask_phone(phone)
+        await self._cancel_pending_login_clients(tenant_id, assigned_employee_id)
         challenge = await self.gateway.begin_login(phone)
 
         async def write(session: AsyncSession) -> str:
@@ -194,7 +195,7 @@ class TelegramConnectionService:
             connection.phone_code_hash_secret_id = code_hash.id
             connection.phone_masked = masked
             connection.status = "awaiting_code"
-            connection.progress_json = self._code_delivery_progress(challenge)
+            connection.progress_json = self._login_progress(challenge)
             connection.consent_at = datetime.now(UTC)
             connection.consent_version = "2026-08-04"
             connection.last_error_code = None
@@ -209,6 +210,64 @@ class TelegramConnectionService:
         )
         async with self.session_factory() as session:
             return await session.get(TelegramConnection, connection_id)
+
+    async def _cancel_pending_login_clients(
+        self, tenant_id: str, assigned_employee_id: str | None
+    ) -> None:
+        cancel = getattr(self.gateway, "cancel_login", None)
+        async with self.session_factory() as session:
+            query = select(TelegramConnection).where(
+                TelegramConnection.tenant_id == tenant_id,
+                TelegramConnection.deleted_at.is_(None),
+                TelegramConnection.status.in_(("awaiting_code", "awaiting_2fa")),
+            )
+            query = (
+                query.where(TelegramConnection.assigned_employee_id.is_(None))
+                if assigned_employee_id is None
+                else query.where(TelegramConnection.assigned_employee_id == assigned_employee_id)
+            )
+            pending_rows = list(await session.scalars(query))
+            session_values: list[str] = []
+            for row in pending_rows:
+                if not row.pending_session_secret_id:
+                    continue
+                secret = await session.get(EncryptedSecret, row.pending_session_secret_id)
+                if secret and secret.deleted_at is None:
+                    session_values.append(self.encryption.decrypt(secret.ciphertext))
+        for value in session_values:
+            try:
+                if cancel is not None:
+                    await cancel(value)
+            finally:
+                value = ""
+
+        async def clear_superseded(session: AsyncSession) -> None:
+            query = select(TelegramConnection).where(
+                TelegramConnection.tenant_id == tenant_id,
+                TelegramConnection.deleted_at.is_(None),
+                TelegramConnection.status.in_(("awaiting_code", "awaiting_2fa")),
+            )
+            query = (
+                query.where(TelegramConnection.assigned_employee_id.is_(None))
+                if assigned_employee_id is None
+                else query.where(TelegramConnection.assigned_employee_id == assigned_employee_id)
+            )
+            for previous in await session.scalars(query):
+                for attribute in (
+                    "pending_session_secret_id",
+                    "phone_secret_id",
+                    "phone_code_hash_secret_id",
+                ):
+                    secret_id = getattr(previous, attribute)
+                    if secret_id:
+                        secret = await session.get(EncryptedSecret, secret_id)
+                        if secret:
+                            secret.deleted_at = datetime.now(UTC)
+                    setattr(previous, attribute, None)
+                previous.status = "disconnected"
+                previous.last_error_code = "login_superseded"
+
+        await self.transactions.run(clear_superseded)
 
     async def resend_login(self, tenant_id: str, connection_id: str) -> TelegramConnection:
         async with self.session_factory() as session:
@@ -270,7 +329,7 @@ class TelegramConnectionService:
                         old.deleted_at = datetime.now(UTC)
             connection.pending_session_secret_id = pending_secret.id
             connection.phone_code_hash_secret_id = code_hash_secret.id
-            connection.progress_json = self._code_delivery_progress(challenge)
+            connection.progress_json = self._login_progress(challenge)
             connection.last_error_code = None
             return connection.id
 
@@ -298,6 +357,13 @@ class TelegramConnectionService:
                 "telegram_timeout_seconds": challenge.timeout_seconds,
             }
         }
+
+    def _login_progress(self, challenge: LoginChallenge) -> dict[str, object]:
+        progress = self._code_delivery_progress(challenge)
+        profile = getattr(self.gateway, "login_profile", None)
+        if isinstance(profile, dict):
+            progress["login_profile"] = profile
+        return progress
 
     @staticmethod
     def resend_available_in(connection: TelegramConnection) -> int:
@@ -902,6 +968,17 @@ class TelegramConnectionService:
         await self.transactions.run(write)
 
     async def cancel_login(self, tenant_id: str, connection_id: str | None = None) -> None:
+        target = await self.get(tenant_id, connection_id)
+        if target is not None and target.pending_session_secret_id:
+            async with self.session_factory() as session:
+                secret = await session.get(EncryptedSecret, target.pending_session_secret_id)
+                if secret and secret.deleted_at is None:
+                    value = self.encryption.decrypt(secret.ciphertext)
+                    cancel = getattr(self.gateway, "cancel_login", None)
+                    if cancel is not None:
+                        await cancel(value)
+                    value = ""
+
         async def write(session: AsyncSession) -> None:
             query = select(TelegramConnection).where(
                 TelegramConnection.tenant_id == tenant_id,

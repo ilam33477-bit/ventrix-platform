@@ -57,7 +57,12 @@ from ..scheduler.service import TenantAnalysisScheduler, next_analysis_time
 from ..services.encryption import EncryptionService
 from ..services.onboarding_welcome import ensure_onboarding_welcome, fallback_welcome
 from ..services.system_secrets import load_runtime_secret_overrides
-from ..telegram_sessions.gateway import TelegramFloodWait, TelegramSessionRevoked, TelethonGateway
+from ..telegram_sessions.gateway import (
+    TelegramFloodWait,
+    TelegramLoginRestarted,
+    TelegramSessionRevoked,
+    TelethonGateway,
+)
 from ..telegram_sessions.service import (
     TelegramConnectionError,
     TelegramConnectionService,
@@ -287,6 +292,11 @@ async def get_client_connection_service(
         TelethonGateway(
             settings.telegram_api_id,
             settings.telegram_api_hash.get_secret_value(),
+            device_model=settings.telegram_device_model,
+            system_version=settings.telegram_system_version,
+            app_version=settings.telegram_app_version,
+            lang_code=settings.telegram_lang_code,
+            system_lang_code=settings.telegram_system_lang_code,
         ),
     )
 
@@ -1325,8 +1335,14 @@ async def start_connection_login(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Проверьте формат номера телефона.") from exc
     except Exception as exc:
+        error_name = type(exc).__name__
+        detail = {
+            "PhoneNumberInvalidError": "Telegram не принял номер телефона.",
+            "PhoneNumberBannedError": "Этот Telegram-аккаунт заблокирован.",
+            "TimeoutError": "Telegram не ответил вовремя. Проверьте сеть и попробуйте ещё раз.",
+        }.get(error_name, "Telegram временно не принял запрос. Попробуйте позже.")
         raise HTTPException(
-            status_code=502, detail="Telegram временно не принял запрос. Попробуйте позже."
+            status_code=502, detail=detail
         ) from exc
     return {
         "id": connection.id,
@@ -1423,6 +1439,11 @@ async def complete_connection_login(
     except TelegramSessionRevoked as exc:
         raise HTTPException(
             status_code=409, detail="Сессия Telegram отозвана. Подключите аккаунт заново."
+        ) from exc
+    except TelegramLoginRestarted as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Сервис перезапускался во время входа. Начните подключение заново.",
         ) from exc
     except TelegramConnectionError as exc:
         raise HTTPException(

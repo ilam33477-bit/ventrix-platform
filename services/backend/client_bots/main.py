@@ -32,6 +32,11 @@ async def run() -> None:
             TelethonGateway(
                 settings.telegram_api_id,
                 settings.telegram_api_hash.get_secret_value(),
+                device_model=settings.telegram_device_model,
+                system_version=settings.telegram_system_version,
+                app_version=settings.telegram_app_version,
+                lang_code=settings.telegram_lang_code,
+                system_lang_code=settings.telegram_system_lang_code,
             ),
         )
 

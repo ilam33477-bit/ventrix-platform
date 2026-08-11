@@ -956,7 +956,15 @@ async def run() -> None:
     runtime = TelegramSessionRuntime(
         session_factory,
         EncryptionService(settings.app_encryption_key.get_secret_value()),
-        TelethonGateway(settings.telegram_api_id, settings.telegram_api_hash.get_secret_value()),
+        TelethonGateway(
+            settings.telegram_api_id,
+            settings.telegram_api_hash.get_secret_value(),
+            device_model=settings.telegram_device_model,
+            system_version=settings.telegram_system_version,
+            app_version=settings.telegram_app_version,
+            lang_code=settings.telegram_lang_code,
+            system_lang_code=settings.telegram_system_lang_code,
+        ),
         SQLiteJobQueue(session_factory),
         f"{socket.gethostname()}:{uuid4()}",
     )

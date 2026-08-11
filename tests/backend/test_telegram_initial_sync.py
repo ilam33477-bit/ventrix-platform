@@ -41,6 +41,7 @@ class FakeTelegramGateway:
         self.terminated_sessions: list[str] = []
         self.resend_calls = 0
         self.requested_phones: list[str] = []
+        self.cancelled_logins: list[str] = []
 
     async def begin_login(self, phone: str) -> LoginChallenge:
         assert phone.startswith("+")
@@ -54,6 +55,9 @@ class FakeTelegramGateway:
         assert phone_code_hash == "phone-code-hash"
         self.resend_calls += 1
         return LoginChallenge("pending-session-resend", "phone-code-hash-2", "sms")
+
+    async def cancel_login(self, session_string: str) -> None:
+        self.cancelled_logins.append(session_string)
 
     async def complete_login(
         self,
@@ -215,6 +219,7 @@ async def test_new_login_supersedes_previous_pending_challenge_for_same_scope(
     assert first.phone_code_hash_secret_id is None
     assert second.status == "awaiting_code"
     assert gateway.requested_phones == ["+79990001122", "+79099412079"]
+    assert gateway.cancelled_logins == ["pending-session-a"]
 
 
 @pytest.mark.asyncio

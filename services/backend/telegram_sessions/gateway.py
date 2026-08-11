@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
@@ -20,6 +20,10 @@ class TelegramFloodWait(RuntimeError):
 
 class TelegramSessionRevoked(RuntimeError):
     pass
+
+
+class TelegramLoginRestarted(RuntimeError):
+    """The in-memory login client was lost after an application restart."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,7 @@ class TelegramUserGateway(Protocol):
         code: str | None = None,
         password: str | None = None,
     ) -> LoginResult: ...
+    async def cancel_login(self, session_string: str) -> None: ...
     async def list_folders(self, session_string: str) -> list[RemoteFolder]: ...
     async def list_dialogs(self, session_string: str) -> list[RemoteDialog]: ...
     async def fetch_messages(
@@ -113,13 +118,48 @@ class TelegramUserGateway(Protocol):
 
 
 class TelethonGateway:
-    def __init__(self, api_id: int, api_hash: str, *, idle_ttl_seconds: float = 300) -> None:
+    # Login must continue on the exact TelegramClient which requested the code.
+    # API dependencies create lightweight gateway objects per request, therefore
+    # the temporary clients are process-owned rather than instance-owned.
+    _login_clients: ClassVar[dict[str, TelegramClient]] = {}
+
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        *,
+        idle_ttl_seconds: float = 300,
+        device_model: str = "Ventrix Server",
+        system_version: str = "Linux",
+        app_version: str = "Ventrix 0.1",
+        lang_code: str = "ru",
+        system_lang_code: str = "ru-RU",
+    ) -> None:
         self.api_id = api_id
         self.api_hash = api_hash
         self.idle_ttl_seconds = idle_ttl_seconds
+        self.device_model = device_model
+        self.system_version = system_version
+        self.app_version = app_version
+        self.lang_code = lang_code
+        self.system_lang_code = system_lang_code
         self._clients: dict[str, TelegramClient] = {}
         self._client_locks: dict[str, asyncio.Lock] = {}
         self._last_used: dict[str, float] = {}
+
+    @property
+    def login_profile(self) -> dict[str, object]:
+        """Non-secret identity parameters that must stay stable for a session."""
+        return {
+            "api_id": self.api_id,
+            "api_hash_fingerprint": hashlib.sha256(self.api_hash.encode()).hexdigest(),
+            "device_model": self.device_model,
+            "system_version": self.system_version,
+            "app_version": self.app_version,
+            "lang_code": self.lang_code,
+            "system_lang_code": self.system_lang_code,
+            "proxy_configured": False,
+        }
 
     def client(
         self, session: str | None = None, *, receive_updates: bool = False
@@ -128,6 +168,11 @@ class TelethonGateway:
             StringSession(session or ""),
             self.api_id,
             self.api_hash,
+            device_model=self.device_model,
+            system_version=self.system_version,
+            app_version=self.app_version,
+            lang_code=self.lang_code,
+            system_lang_code=self.system_lang_code,
             receive_updates=receive_updates,
             flood_sleep_threshold=0,
             request_retries=2,
@@ -181,24 +226,68 @@ class TelethonGateway:
     async def close(self) -> None:
         for key in list(self._clients):
             await self._discard_client(key)
+        for key in list(type(self)._login_clients):
+            await self._discard_login_client(key)
+
+    @classmethod
+    def _login_key(cls, session_string: str) -> str:
+        return cls._session_key(session_string)
+
+    async def _discard_login_client(self, key: str) -> None:
+        client = type(self)._login_clients.pop(key, None)
+        if client is not None and client.is_connected():
+            await client.disconnect()
+
+    async def cancel_login(self, session_string: str) -> None:
+        await self._discard_login_client(self._login_key(session_string))
+
+    def _active_login_client(self, session_string: str) -> tuple[str, TelegramClient]:
+        key = self._login_key(session_string)
+        client = type(self)._login_clients.get(key)
+        if client is None or not client.is_connected():
+            raise TelegramLoginRestarted(
+                "temporary Telegram login client is unavailable; start login again"
+            )
+        return key, client
+
+    async def _store_login_client(self, client: TelegramClient) -> str:
+        session_string = StringSession.save(client.session)
+        key = self._login_key(session_string)
+        previous = type(self)._login_clients.pop(key, None)
+        if previous is not None and previous is not client and previous.is_connected():
+            await previous.disconnect()
+        type(self)._login_clients[key] = client
+        return session_string
+
+    async def _rekey_login_client(self, old_key: str, client: TelegramClient) -> str:
+        session_string = StringSession.save(client.session)
+        new_key = self._login_key(session_string)
+        if new_key != old_key:
+            type(self)._login_clients.pop(old_key, None)
+        type(self)._login_clients[new_key] = client
+        return session_string
 
     async def begin_login(self, phone: str) -> LoginChallenge:
         client = self.client()
         try:
             await client.connect()
             sent = await client.send_code_request(phone)
+            await self._store_login_client(client)
             return self._login_challenge(client, sent)
         except errors.FloodWaitError as exc:
+            if client.is_connected():
+                await client.disconnect()
             raise TelegramFloodWait(exc.seconds) from None
-        finally:
-            await client.disconnect()
+        except Exception:
+            if client.is_connected():
+                await client.disconnect()
+            raise
 
     async def resend_login(
         self, session_string: str, phone: str, phone_code_hash: str
     ) -> LoginChallenge:
-        client = self.client(session_string)
+        key, client = self._active_login_client(session_string)
         try:
-            await client.connect()
             try:
                 sent = await client(
                     functions.auth.ResendCodeRequest(
@@ -211,11 +300,13 @@ class TelethonGateway:
                 # hash. Start a fresh challenge in the same encrypted session
                 # instead of leaving the UI in an unrecoverable code screen.
                 sent = await client.send_code_request(phone)
+            await self._rekey_login_client(key, client)
             return self._login_challenge(client, sent, fallback_hash=phone_code_hash)
         except errors.FloodWaitError as exc:
             raise TelegramFloodWait(exc.seconds) from None
-        finally:
-            await client.disconnect()
+        except errors.PhoneCodeExpiredError:
+            await self._discard_login_client(key)
+            raise
 
     @staticmethod
     def _login_challenge(
@@ -254,29 +345,37 @@ class TelethonGateway:
         code: str | None = None,
         password: str | None = None,
     ) -> LoginResult:
-        client = self.client(session_string)
+        key, client = self._active_login_client(session_string)
         try:
-            await client.connect()
             try:
                 if password is not None:
                     await client.sign_in(password=password)
                 else:
-                    await client.sign_in(phone, code=code, phone_code_hash=phone_code_hash)
+                    normalized_code = (code or "").strip().replace(" ", "").replace("-", "")
+                    await client.sign_in(
+                        phone,
+                        code=normalized_code,
+                        phone_code_hash=phone_code_hash,
+                    )
             except errors.SessionPasswordNeededError:
-                return LoginResult("awaiting_2fa", StringSession.save(client.session))
+                refreshed = await self._rekey_login_client(key, client)
+                return LoginResult("awaiting_2fa", refreshed)
             me = await client.get_me()
             display_name = " ".join(part for part in (me.first_name, me.last_name) if part)
+            authorized_session = StringSession.save(client.session)
+            await self._discard_login_client(key)
             return LoginResult(
                 "connected",
-                StringSession.save(client.session),
+                authorized_session,
                 int(me.id),
                 me.username,
                 display_name or None,
             )
         except errors.FloodWaitError as exc:
             raise TelegramFloodWait(exc.seconds) from None
-        finally:
-            await client.disconnect()
+        except (errors.PhoneCodeExpiredError, errors.PhoneNumberBannedError):
+            await self._discard_login_client(key)
+            raise
 
     async def list_folders(self, session_string: str) -> list[RemoteFolder]:
         try:

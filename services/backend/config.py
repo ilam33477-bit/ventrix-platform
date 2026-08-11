@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_api_id: int | None = Field(default=None, gt=0)
     telegram_api_hash: SecretStr | None = None
+    telegram_device_model: str = "Ventrix Server"
+    telegram_system_version: str = "Linux"
+    telegram_app_version: str = "Ventrix 0.1"
+    telegram_lang_code: str = "ru"
+    telegram_system_lang_code: str = "ru-RU"
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_fast_model: str = "deepseek-v4-flash"
