@@ -40,10 +40,25 @@ class TelegramConnectionError(RuntimeError):
 
 
 def mask_phone(phone: str) -> str:
-    digits = "".join(char for char in phone if char.isdigit())
+    digits = normalize_phone_number(phone).lstrip("+")
     if len(digits) < 7:
         raise ValueError("phone number is invalid")
     return f"+{digits[:2]}***{digits[-4:]}"
+
+
+def normalize_phone_number(value: str) -> str:
+    raw = value.strip()
+    digits = "".join(character for character in raw if character in "0123456789")
+    if raw.startswith("00"):
+        digits = digits[2:]
+    elif not raw.startswith("+"):
+        if len(digits) == 10:
+            digits = "7" + digits
+        elif len(digits) == 11 and digits.startswith("8"):
+            digits = "7" + digits[1:]
+    if not 8 <= len(digits) <= 15 or digits.startswith("0"):
+        raise ValueError("phone number must be in E.164 format")
+    return "+" + digits
 
 
 class TelegramConnectionService:
@@ -120,6 +135,7 @@ class TelegramConnectionService:
         phone: str,
         assigned_employee_id: str | None = None,
     ) -> TelegramConnection:
+        phone = normalize_phone_number(phone)
         masked = mask_phone(phone)
         challenge = await self.gateway.begin_login(phone)
 
@@ -131,6 +147,35 @@ class TelegramConnectionService:
                 )
             ):
                 raise LookupError("employee does not belong to tenant")
+            pending_query = select(TelegramConnection).where(
+                TelegramConnection.tenant_id == tenant_id,
+                TelegramConnection.deleted_at.is_(None),
+                TelegramConnection.status.in_(("awaiting_code", "awaiting_2fa")),
+            )
+            if assigned_employee_id is None:
+                pending_query = pending_query.where(
+                    TelegramConnection.assigned_employee_id.is_(None)
+                )
+            else:
+                pending_query = pending_query.where(
+                    TelegramConnection.assigned_employee_id == assigned_employee_id
+                )
+            previous_connections = list(await session.scalars(pending_query))
+            for previous in previous_connections:
+                for secret_id in (
+                    previous.pending_session_secret_id,
+                    previous.phone_secret_id,
+                    previous.phone_code_hash_secret_id,
+                ):
+                    if secret_id:
+                        secret = await session.get(EncryptedSecret, secret_id)
+                        if secret:
+                            secret.deleted_at = datetime.now(UTC)
+                previous.pending_session_secret_id = None
+                previous.phone_secret_id = None
+                previous.phone_code_hash_secret_id = None
+                previous.status = "disconnected"
+                previous.last_error_code = "login_superseded"
             connection = TelegramConnection(
                 tenant_id=tenant_id,
                 assigned_employee_id=assigned_employee_id,

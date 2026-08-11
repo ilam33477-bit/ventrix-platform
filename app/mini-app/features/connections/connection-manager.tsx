@@ -6,7 +6,7 @@ import type { VentrixClientApi } from "../../api/client";
 import type { Employee, OnboardingStep, TelegramConnection, TelegramSource, TelegramSourcePreview } from "../../types";
 import { Card, EmptyState, SectionHeading, StatusBadge } from "../../components/ui";
 
-type ConnectStep = "phone" | "code" | "password" | "syncing" | "done";
+type ConnectStep = "phone" | "confirm_phone" | "code" | "password" | "syncing" | "done";
 
 function initialConnectStep(
   onboardingStep: OnboardingStep | undefined,
@@ -177,8 +177,9 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     {mode === "manage" && <SectionHeading eyebrow={heading[0]} title={heading[1]} description={heading[2]} />}
     <div className="connection-layout">
       {showConnection && <Card className="connection-wizard">
-        <div className="step-dots"><span className={step === "phone" ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
-        {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Код придёт в официальный чат Telegram подключаемого аккаунта.</p>{mode === "manage" && <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || phone.length < 8} onClick={startLogin}>{busy ? "Отправляем код…" : "Получить код"}</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
+        <div className="step-dots"><span className={["phone", "confirm_phone"].includes(step) ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
+        {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Укажите номер именно того Telegram-аккаунта, рабочие диалоги которого нужно анализировать.</p>{mode === "manage" && <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || !normalizePhoneInput(phone)} onClick={() => { const normalized = normalizePhoneInput(phone); if (normalized) { setPhone(normalized); setStep("confirm_phone"); } }}>Продолжить</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
+        {step === "confirm_phone" && <><h3>Проверьте номер</h3><p>Telegram отправит код для этого аккаунта:</p><div className="phone-confirmation">{phone}</div><p>Обычно код приходит в служебный чат «Telegram» на уже авторизованных устройствах. Способ доставки выбирает Telegram.</p><button className="primary-action" disabled={busy} onClick={startLogin}>{busy ? "Отправляем код…" : "Да, отправить код"}</button><button className="text-action" disabled={busy} onClick={() => setStep("phone")}>Изменить номер</button></>}
         {step === "code" && <><h3>Код подтверждения</h3><p>{deliveryDescription(deliveryMethod)} Ventrix использует код один раз и не сохраняет.</p><div className="delivery-hint"><strong>Код запрошен{codePhoneMasked ? ` для ${codePhoneMasked}` : ""}</strong><span>Если уведомления выключены, откройте на этом аккаунте чат «Telegram» со служебными сообщениями. Старые коды после повторной отправки не действуют.</span></div><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Очистить код</button><button disabled={busy || resendAvailableIn > 0} onClick={resendCode}>{resendAvailableIn > 0 ? `Новый код через ${resendAvailableIn} сек.` : "Отправить новый код"}</button></div></>}
         {step === "password" && <><h3>Пароль 2FA</h3><p>Пароль передаётся только для входа в Telegram и не сохраняется.</p><label>Облачный пароль<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary-action" disabled={busy || !password} onClick={() => completeLogin(true)}>Подключить аккаунт</button><button className="text-action" disabled={busy} onClick={() => setPassword("")}>Попробовать ещё раз</button></>}
         {step === "syncing" && <><h3>Запускаем анализ</h3><div className="state-progress"><i /></div><p>Mini App можно закрыть — прогресс сохранится.</p></>}
@@ -196,4 +197,16 @@ function deliveryDescription(method: string) {
   if (method === "sms") return "Telegram отправил код по SMS на подключаемый номер.";
   if (["call", "flash_call", "missed_call"].includes(method)) return "Telegram отправляет код через телефонный звонок.";
   return "Код отправлен в официальный служебный чат Telegram на подключаемом аккаунте.";
+}
+
+function normalizePhoneInput(value: string) {
+  const raw = value.trim();
+  let digits = raw.replace(/\D/g, "");
+  if (raw.startsWith("00")) digits = digits.slice(2);
+  else if (!raw.startsWith("+")) {
+    if (digits.length === 10) digits = `7${digits}`;
+    else if (digits.length === 11 && digits.startsWith("8")) digits = `7${digits.slice(1)}`;
+  }
+  if (digits.length < 8 || digits.length > 15 || digits.startsWith("0")) return "";
+  return `+${digits}`;
 }

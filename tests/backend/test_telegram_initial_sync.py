@@ -29,6 +29,7 @@ from services.backend.telegram_sessions.gateway import (
 from services.backend.telegram_sessions.service import (
     TelegramConnectionError,
     TelegramConnectionService,
+    normalize_phone_number,
 )
 from services.backend.telegram_sessions.sync import TelegramSyncHandlers
 
@@ -39,9 +40,11 @@ class FakeTelegramGateway:
         self.fetch_calls: list[tuple[int, int]] = []
         self.terminated_sessions: list[str] = []
         self.resend_calls = 0
+        self.requested_phones: list[str] = []
 
     async def begin_login(self, phone: str) -> LoginChallenge:
         assert phone.startswith("+")
+        self.requested_phones.append(phone)
         return LoginChallenge("pending-session-a", "phone-code-hash", "telegram_app")
 
     async def resend_login(
@@ -176,6 +179,42 @@ async def test_login_code_resend_is_rate_limited_and_rotates_challenge(
     assert resent.status == "awaiting_code"
     assert resent.progress_json["login_code"]["delivery_type"] == "sms"
     assert gateway.resend_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("+7 909 941-20-79", "+79099412079"),
+        ("8 (909) 941-20-79", "+79099412079"),
+        ("9099412079", "+79099412079"),
+        ("0044 7700 900123", "+447700900123"),
+    ],
+)
+def test_phone_normalization_supports_russian_and_e164_inputs(value, expected) -> None:
+    assert normalize_phone_number(value) == expected
+
+
+@pytest.mark.asyncio
+async def test_new_login_supersedes_previous_pending_challenge_for_same_scope(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    gateway = FakeTelegramGateway()
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+
+    first = await service.begin_login(tenant.id, "8 999 000-11-22")
+    second = await service.begin_login(tenant.id, "+7 909 941-20-79")
+
+    async with session_factory() as session:
+        first = await session.get(TelegramConnection, first.id)
+        second = await session.get(TelegramConnection, second.id)
+    assert first.status == "disconnected"
+    assert first.last_error_code == "login_superseded"
+    assert first.pending_session_secret_id is None
+    assert first.phone_code_hash_secret_id is None
+    assert second.status == "awaiting_code"
+    assert gateway.requested_phones == ["+79990001122", "+79099412079"]
 
 
 @pytest.mark.asyncio

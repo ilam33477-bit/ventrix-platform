@@ -58,7 +58,11 @@ from ..services.encryption import EncryptionService
 from ..services.onboarding_welcome import ensure_onboarding_welcome, fallback_welcome
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.gateway import TelegramFloodWait, TelegramSessionRevoked, TelethonGateway
-from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
+from ..telegram_sessions.service import (
+    TelegramConnectionError,
+    TelegramConnectionService,
+    normalize_phone_number,
+)
 from ..timezones import normalize_timezone
 
 router = APIRouter(prefix="/api/v1/client", tags=["tenant-client"])
@@ -209,10 +213,7 @@ class TelegramLoginStart(BaseModel):
     @field_validator("phone")
     @classmethod
     def normalize_phone(cls, value: str) -> str:
-        normalized = "+" + "".join(character for character in value if character.isdigit())
-        if len(normalized) < 9:
-            raise ValueError("Invalid phone number")
-        return normalized
+        return normalize_phone_number(value)
 
 
 class TelegramLoginComplete(BaseModel):
