@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     notification_cooldown_minutes: int = Field(default=120, ge=1, le=10_080)
     signal_context_message_limit: int = Field(default=8, ge=3, le=20)
     client_mini_app_url: str | None = None
+    cors_allowed_origins: str | None = None
     platform_support_contact: str | None = None
     log_level: str = "INFO"
 

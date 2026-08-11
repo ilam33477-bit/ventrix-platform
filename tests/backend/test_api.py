@@ -43,6 +43,31 @@ def test_webapp_init_data_signature_and_age_are_checked() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preview_origin_can_be_allowed_without_changing_mini_app_url(monkeypatch) -> None:
+    app_module = importlib.import_module("services.backend.api.app")
+    monkeypatch.setattr(
+        app_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            client_mini_app_url="https://production.example",
+            cors_allowed_origins="https://preview.example, invalid",
+        ),
+    )
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.options(
+            "/health",
+            headers={
+                "Origin": "https://preview.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://preview.example"
+
+
+@pytest.mark.asyncio
 async def test_connected_telegram_session_recovers_stranded_onboarding() -> None:
     class Session:
         commits = 0

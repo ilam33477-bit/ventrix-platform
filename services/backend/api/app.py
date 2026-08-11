@@ -30,13 +30,23 @@ def create_app() -> FastAPI:
         docs_url="/api/docs" if os.getenv("ENVIRONMENT", "development") != "production" else None,
         lifespan=lifespan,
     )
-    mini_app_url = get_settings().client_mini_app_url
+    settings = get_settings()
+    mini_app_url = settings.client_mini_app_url
+    allowed_origins: list[str] = []
     if mini_app_url:
         parsed = urlsplit(mini_app_url)
-        mini_app_origin = f"{parsed.scheme}://{parsed.netloc}"
+        allowed_origins.append(f"{parsed.scheme}://{parsed.netloc}")
+    cors_allowed_origins = getattr(settings, "cors_allowed_origins", None)
+    if cors_allowed_origins:
+        for candidate in cors_allowed_origins.split(","):
+            parsed = urlsplit(candidate.strip())
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                allowed_origins.append(f"{parsed.scheme}://{parsed.netloc}")
+    allowed_origins = list(dict.fromkeys(allowed_origins))
+    if allowed_origins:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=[mini_app_origin],
+            allow_origins=allowed_origins,
             allow_credentials=False,
             allow_methods=["GET", "POST", "PATCH"],
             allow_headers=["Authorization", "Content-Type"],
