@@ -12,6 +12,7 @@ from services.backend.intelligence.signals import SignalService
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
     BackgroundJob,
+    MonitoredSource,
     Signal,
     TelegramConnection,
     TelegramDialog,
@@ -81,6 +82,33 @@ def actor_for(connection, client, queue, session_factory) -> TelegramSessionActo
     actor.transactions = SQLiteTransactionManager(session_factory)
     actor.rpc_lock = asyncio.Lock()
     return actor
+
+
+@pytest.mark.asyncio
+async def test_live_group_filter_uses_only_explicit_monitored_sources(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.flush()
+        session.add(
+            MonitoredSource(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                canonical_peer_id="-100123",
+                source_type="group",
+                title="Opted in",
+                added_via="test",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+    actor = actor_for(connection, object(), SQLiteJobQueue(session_factory), session_factory)
+    assert await actor._is_monitored_source("-100123")
+    assert not await actor._is_monitored_source("-100999")
 
 
 @pytest.mark.asyncio

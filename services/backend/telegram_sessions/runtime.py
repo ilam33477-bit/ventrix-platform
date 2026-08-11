@@ -76,6 +76,7 @@ class TelegramSessionActor:
         self.sync_handlers = sync_handlers
         self._updates_received = 0
         self._edited_received = 0
+        self._monitored_peer_ids: set[str] | None = None
 
     async def run(self) -> None:
         try:
@@ -436,6 +437,14 @@ class TelegramSessionActor:
             else "group"
         )
         peer_id = str(event.chat_id)
+        if source_type == "personal" and is_automated_private_entity(chat):
+            return
+        if source_type != "personal" and not await self._is_monitored_source(peer_id):
+            # Telethon can replay a large difference for every group/channel on
+            # reconnect. Only explicitly opted-in sources belong in the durable
+            # application queue; dropping the rest here avoids thousands of
+            # jobs that ingestion would immediately ignore anyway.
+            return
         attachments: list[dict[str, Any]] = []
         if message.media:
             file = getattr(message, "file", None)
@@ -499,6 +508,21 @@ class TelegramSessionActor:
             partition_sequence=int(message.id) * 1_000_000_000 + version_order,
         )
         await self._increment_update(edited=event_type == "edited")
+
+    async def _is_monitored_source(self, peer_id: str) -> bool:
+        cached = getattr(self, "_monitored_peer_ids", None)
+        if cached is None:
+            async with self.transactions.session_factory() as session:
+                cached = set(
+                    await session.scalars(
+                        select(MonitoredSource.canonical_peer_id).where(
+                            MonitoredSource.connection_id == self.connection.id,
+                            MonitoredSource.enabled.is_(True),
+                        )
+                    )
+                )
+            self._monitored_peer_ids = cached
+        return peer_id in cached
 
     async def catch_up(self) -> dict[str, int]:
         """Fetch only gaps after saved cursors; used after restart/reconnect and rarely by scheduler."""
@@ -891,7 +915,9 @@ class TelegramSessionActor:
                         )
                 return added
 
-            return {"added": await self.transactions.run(write), "requires_join": False}
+            added = await self.transactions.run(write)
+            self._monitored_peer_ids = None
+            return {"added": added, "requires_join": False}
 
     async def _increment_update(self, *, edited: bool = False) -> None:
         self._updates_received += 1
