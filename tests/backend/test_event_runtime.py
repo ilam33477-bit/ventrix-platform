@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
@@ -22,9 +23,17 @@ from services.backend.services.system_secrets import (
     mask_secret,
 )
 from services.backend.telegram_sessions.event_ingestion import TelegramEventIngestion
+from services.backend.telegram_sessions.runtime import is_automated_private_entity
 
 
-def event_lease(tenant_id: str, connection_id: str, peer_id: str, source_type: str) -> JobLease:
+def event_lease(
+    tenant_id: str,
+    connection_id: str,
+    peer_id: str,
+    source_type: str,
+    *,
+    is_automated: bool = False,
+) -> JobLease:
     return JobLease(
         id=f"event-{peer_id}",
         tenant_id=tenant_id,
@@ -40,6 +49,7 @@ def event_lease(tenant_id: str, connection_id: str, peer_id: str, source_type: s
             "telegram_dialog_id": int(peer_id),
             "dialog_title": "Рабочий чат",
             "source_type": source_type,
+            "is_automated": is_automated,
             "telegram_message_id": 10,
             "sender_id": 700,
             "sent_at": datetime.now(UTC).isoformat(),
@@ -93,6 +103,41 @@ async def test_personal_live_event_is_default_and_group_requires_opt_in(
             )
         )
         assert len(scans) == 2
+
+
+@pytest.mark.asyncio
+async def test_private_bot_event_is_excluded_before_message_analysis(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.commit()
+    ingestion = TelegramEventIngestion(session_factory, SQLiteJobQueue(session_factory))
+
+    result = await ingestion.ingest(
+        event_lease(
+            tenant.id,
+            connection.id,
+            "178220800",
+            "personal",
+            is_automated=True,
+        )
+    )
+
+    assert result == {"ignored": True, "reason": "automated_account"}
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(TelegramMessage.id))) == 0
+        assert await session.scalar(select(func.count(BackgroundJob.id))) == 0
+
+
+def test_telegram_private_entity_classifier_rejects_non_humans() -> None:
+    assert is_automated_private_entity(SimpleNamespace(bot=True, username="SpamBot"))
+    assert is_automated_private_entity(SimpleNamespace(support=True, username=None))
+    assert is_automated_private_entity(SimpleNamespace(deleted=True, username=None))
+    assert is_automated_private_entity(SimpleNamespace(is_self=True, username="me"))
+    assert not is_automated_private_entity(SimpleNamespace(username="real_customer"))
 
 
 def test_invoice_fast_lane_needs_invoice_metadata() -> None:

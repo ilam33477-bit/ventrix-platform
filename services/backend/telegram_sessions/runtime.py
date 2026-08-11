@@ -38,6 +38,18 @@ logger = logging.getLogger(__name__)
 CATCH_UP_PAGE_SIZE = 500
 
 
+def is_automated_private_entity(entity: Any) -> bool:
+    """Exclude Telegram bots, service/support users, deleted users and Saved Messages."""
+    username = str(getattr(entity, "username", None) or "").lower()
+    return bool(
+        getattr(entity, "bot", False)
+        or getattr(entity, "support", False)
+        or getattr(entity, "deleted", False)
+        or getattr(entity, "is_self", False)
+        or username.endswith("bot")
+    )
+
+
 class TelegramSessionActor:
     """The sole lifecycle owner of one active Telethon session in this runtime."""
 
@@ -294,6 +306,9 @@ class TelegramSessionActor:
                         "folder_id": getattr(raw, "folder_id", None),
                         "participants_count": getattr(entity, "participants_count", None),
                         "last_message_at": getattr(dialog.message, "date", None),
+                        "is_automated": bool(
+                            kind == "personal" and is_automated_private_entity(entity)
+                        ),
                     }
                 )
 
@@ -342,14 +357,18 @@ class TelegramSessionActor:
                 row.last_message_at = remote["last_message_at"]
                 row.source = "personal" if remote["kind"] == "personal" else "folder"
                 if remote["kind"] == "personal":
-                    row.classification = "auto_personal"
+                    row.classification = (
+                        "automated_account" if remote["is_automated"] else "auto_personal"
+                    )
                     row.confidence = 1.0
                     row.requires_user_confirmation = False
                     row.selected = bool(
+                        not remote["is_automated"]
+                        and
                         remote["last_message_at"] is not None
                         and remote["last_message_at"] >= active_cutoff
                     )
-                    row.excluded = False
+                    row.excluded = remote["is_automated"]
             connection = await session.get(TelegramConnection, self.connection.id)
             connection.progress_stage = "catalog_ready"
             connection.progress_percent = 25
@@ -447,6 +466,9 @@ class TelegramSessionActor:
                 ),
                 "dialog_username": getattr(chat, "username", None),
                 "source_type": source_type,
+                "is_automated": bool(
+                    source_type == "personal" and is_automated_private_entity(chat)
+                ),
                 "telegram_message_id": int(message.id),
                 "sender_id": int(message.sender_id) if message.sender_id else None,
                 "sender_username": None,
@@ -500,22 +522,36 @@ class TelegramSessionActor:
                         "username": getattr(entity, "username", None),
                         "source_type": source_type,
                         "last_message_at": getattr(remote_dialog.message, "date", None),
+                        "is_automated": bool(
+                            source_type == "personal"
+                            and is_automated_private_entity(entity)
+                        ),
                     }
         except errors.FloodWaitError as exc:
             await self._rate_limited(int(exc.seconds))
             raise TelegramFloodWait(int(exc.seconds)) from None
 
         async def discover_personal_dialogs(session: AsyncSession) -> int:
-            existing_remote_ids = set(
-                await session.scalars(
-                    select(TelegramDialog.telegram_dialog_id).where(
+            existing = {
+                item.telegram_dialog_id: item
+                for item in await session.scalars(
+                    select(TelegramDialog).where(
                         TelegramDialog.connection_id == self.connection.id
                     )
                 )
-            )
+            }
             discovered = 0
             for remote_id, remote in remote_catalog.items():
-                if remote_id in existing_remote_ids or remote["source_type"] != "personal":
+                current = existing.get(remote_id)
+                if remote["source_type"] != "personal":
+                    continue
+                if remote["is_automated"]:
+                    if current is not None:
+                        current.classification = "automated_account"
+                        current.selected = False
+                        current.excluded = True
+                    continue
+                if current is not None:
                     continue
                 session.add(
                     TelegramDialog(

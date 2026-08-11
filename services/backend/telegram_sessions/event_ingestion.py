@@ -73,6 +73,18 @@ class TelegramEventIngestion:
         if connection is None:
             raise LookupError("Telegram connection not found")
         source_type = str(job.payload.get("source_type") or "personal")
+        if source_type == "personal" and bool(job.payload.get("is_automated")):
+            dialog = await session.scalar(
+                select(TelegramDialog).where(
+                    TelegramDialog.connection_id == connection.id,
+                    TelegramDialog.canonical_peer_id == peer_id,
+                )
+            )
+            if dialog is not None:
+                dialog.classification = "automated_account"
+                dialog.selected = False
+                dialog.excluded = True
+            return {"ignored": True, "reason": "automated_account"}
         monitored = source_type == "personal"
         if source_type != "personal":
             monitored = bool(
