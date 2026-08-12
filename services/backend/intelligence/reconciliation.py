@@ -17,9 +17,11 @@ from ..models import (
     ProblemVerification,
     Signal,
     TelegramConnection,
+    TelegramDialog,
     TelegramMessage,
     TenantSettings,
 )
+from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
 from .problem_lifecycle import (
     ACTIVE_PROBLEM_STATUSES,
@@ -300,6 +302,21 @@ class ReconciliationService:
                 return None, None
             source = await session.get(TelegramMessage, expected_message_id)
             if source is None:
+                return None, None
+            dialog = await session.get(TelegramDialog, dialog_id)
+            relevance = classify_message_relevance(
+                source.body_text,
+                dialog_classification=dialog.classification if dialog else None,
+            )
+            if (
+                dialog is None
+                or not dialog.selected
+                or dialog.excluded
+                or not relevance.business_relevant
+            ):
+                state.awaiting_employee_since = None
+                state.response_expected_message_id = None
+                state.next_sla_check_at = None
                 return None, None
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == job.tenant_id)

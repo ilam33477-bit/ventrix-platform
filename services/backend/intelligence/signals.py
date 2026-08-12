@@ -22,6 +22,7 @@ from ..models import (
     TenantSettings,
 )
 from .local_signals import LocalSignalCandidate, LocalSignalEngine
+from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
 
 
@@ -129,6 +130,14 @@ class SignalService:
         settings = await session.scalar(
             select(TenantSettings).where(TenantSettings.tenant_id == message.tenant_id)
         )
+        dialog = await session.get(TelegramDialog, message.dialog_id)
+        relevance = classify_message_relevance(
+            message.body_text,
+            dialog_classification=dialog.classification if dialog else None,
+        )
+        if not relevance.business_relevant:
+            await self._clear_non_business_state(session, message)
+            return []
         candidates = self.engine.scan(
             message,
             previous,
@@ -142,7 +151,6 @@ class SignalService:
             return []
         employee_id = await self._employee_id(session, message)
         created: list[Signal] = []
-        dialog = await session.get(TelegramDialog, message.dialog_id)
         for candidate in candidates:
             logical_source = (
                 f"peer:{dialog.canonical_peer_id}:{message.telegram_message_id}"
@@ -233,6 +241,19 @@ class SignalService:
             session, message, candidates, employee_id, settings.response_sla_minutes
         )
         return created
+
+    @staticmethod
+    async def _clear_non_business_state(
+        session: AsyncSession, message: TelegramMessage
+    ) -> None:
+        state = await session.scalar(
+            select(DialogState).where(DialogState.dialog_id == message.dialog_id)
+        )
+        if state is None or state.response_expected_message_id != message.id:
+            return
+        state.awaiting_employee_since = None
+        state.response_expected_message_id = None
+        state.next_sla_check_at = None
 
     async def _schedule_temporal_jobs(self, message_ids: list[str]) -> None:
         async with self.session_factory() as session:

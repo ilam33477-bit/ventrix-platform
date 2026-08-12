@@ -17,6 +17,8 @@ class TriageResult(BaseModel):
     recommended_action: str = Field(min_length=1, max_length=2000)
     recommended_deadline_minutes: int | None = Field(default=None, ge=1, le=43_200)
     needs_deep_analysis: bool
+    message_class: str = Field(default="business", max_length=32)
+    business_relevance: bool = True
 
 
 def parse_triage_result(raw: str) -> tuple[TriageResult, bool]:

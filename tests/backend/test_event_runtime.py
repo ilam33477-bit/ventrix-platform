@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
 
 from services.backend.intelligence.local_signals import LocalSignalEngine
+from services.backend.intelligence.message_relevance import classify_message_relevance
+from services.backend.intelligence.reconciliation import ReconciliationService
 from services.backend.intelligence.signals import SignalService
 from services.backend.jobs.queue import JobLease, SQLiteJobQueue
 from services.backend.models import (
     BackgroundJob,
+    DialogState,
     MonitoredSource,
+    OperationalProblem,
     Signal,
     TelegramConnection,
     TelegramDialog,
@@ -141,6 +145,99 @@ def test_telegram_private_entity_classifier_rejects_non_humans() -> None:
     assert is_automated_private_entity(SimpleNamespace(deleted=True, username=None))
     assert is_automated_private_entity(SimpleNamespace(is_self=True, username="me"))
     assert not is_automated_private_entity(SimpleNamespace(username="real_customer"))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_class"),
+    [
+        ("Код для входа в Telegram: 56818. Не давайте код никому.", "service"),
+        ("Вадим, добро пожаловать в группу Crypto Taverna Chat.", "service"),
+        ("Казино дарит бесплатный бонус — успейте забрать!", "advertising"),
+        ("Клиент просит прислать договор и счёт до пятницы.", "business"),
+    ],
+)
+def test_message_relevance_separates_service_ads_and_business(
+    text: str, expected_class: str
+) -> None:
+    result = classify_message_relevance(text)
+    assert result.message_class == expected_class
+    assert result.business_relevant is (expected_class == "business")
+
+
+@pytest.mark.asyncio
+async def test_sla_check_discards_stale_timer_for_automated_dialog(
+    session_factory, make_service, tenant_payload
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.flush()
+        dialog = TelegramDialog(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            telegram_dialog_id=777000,
+            canonical_peer_id="777000",
+            title="Telegram",
+            dialog_type="personal",
+            source="history",
+            classification="automated_account",
+            selected=False,
+            excluded=True,
+        )
+        session.add(dialog)
+        await session.flush()
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=1,
+            sender_role="customer",
+            sent_at=now - timedelta(hours=2),
+            outgoing=False,
+            body_text="Код для входа в Telegram: 56818.",
+            attachments_json=[],
+        )
+        session.add(message)
+        await session.flush()
+        session.add(
+            DialogState(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                awaiting_employee_since=message.sent_at,
+                response_expected_message_id=message.id,
+                next_sla_check_at=now - timedelta(hours=1),
+                open_commitments_json=[],
+                unresolved_questions_json=[],
+            )
+        )
+        await session.commit()
+
+    queue = SQLiteJobQueue(session_factory)
+    result = await ReconciliationService(session_factory, queue).sla_check(
+        JobLease(
+            id="automated-sla",
+            tenant_id=tenant.id,
+            telegram_account_id=connection.id,
+            dialog_id=dialog.id,
+            correlation_id=None,
+            job_type="dialog.sla_check",
+            category="reconciliation",
+            cost_class="light",
+            payload={"dialog_id": dialog.id, "expected_message_id": message.id},
+            attempts=0,
+            max_attempts=3,
+            locked_by="test",
+        )
+    )
+    assert result == {"created": False, "problem_id": None}
+    async with session_factory() as session:
+        state = await session.scalar(select(DialogState))
+        assert state.response_expected_message_id is None
+        assert state.next_sla_check_at is None
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
 
 
 @pytest.mark.asyncio

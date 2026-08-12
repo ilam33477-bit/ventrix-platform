@@ -21,15 +21,24 @@ from ..models import (
     TelegramMessage,
     TenantSettings,
 )
+from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
 from .problem_lifecycle import initialize_problem_lifecycle
 from .triage import TriageResult, parse_triage_result
 
-TRIAGE_SYSTEM_PROMPT = """You triage one new Telegram business event. Return JSON only.
+TRIAGE_SYSTEM_PROMPT = """You classify and triage one Telegram event. Return JSON only.
 Required keys: criticality (0-100), category, requires_immediate_attention,
 requires_employee_notification, requires_manager_notification, reason,
-recommended_action, recommended_deadline_minutes (integer or null), needs_deep_analysis.
+recommended_action, recommended_deadline_minutes (integer or null), needs_deep_analysis,
+message_class, business_relevance.
 Do not invent facts or message IDs. Evaluate context, not keywords alone.
+message_class must be one of: business, service, advertising, social, uncertain.
+Authentication codes, Telegram security notices, join/leave/welcome events, bot menus,
+subscription verification, automated job feeds, mass promotions and channel advertising
+are not unanswered clients and must have business_relevance=false, criticality <= 10,
+no notifications, no deadline and needs_deep_analysis=false.
+Use business_relevance=true only when the context shows a real work conversation,
+client request, employee commitment, payment/document exchange or operational risk.
 """
 
 
@@ -61,6 +70,17 @@ class AITriageService:
         payload, signal, settings = await self._payload(signal_id, job.tenant_id)
         if signal.status in {"triaged", "problem_created", "history", "suppressed"}:
             return {"signal_id": signal.id, "status": signal.status, "deduplicated": True}
+        relevance = classify_message_relevance(
+            str(payload["new_message"].get("text") or ""),
+            dialog_classification=str(payload["dialog"].get("type") or ""),
+        )
+        if not relevance.business_relevant:
+            await self._suppress_non_business(signal.id, relevance.message_class, relevance.reason)
+            return {
+                "signal_id": signal.id,
+                "status": "suppressed",
+                "message_class": relevance.message_class,
+            }
         await self._enforce_budget(signal, settings)
         started = time.perf_counter()
         raw = ""
@@ -112,6 +132,20 @@ class AITriageService:
             None,
         )
         problem_id = await self._apply_result(signal.id, result, settings, repaired)
+        if not result.business_relevance or result.message_class in {
+            "service",
+            "advertising",
+            "social",
+        }:
+            return {
+                "signal_id": signal.id,
+                "criticality": result.criticality,
+                "status": "suppressed",
+                "message_class": result.message_class,
+                "problem_id": None,
+                "notifications": 0,
+                "deep_analysis_job_id": None,
+            }
         await self.notifications.reconcile_provisional(
             signal.id,
             confirmed=(
@@ -252,6 +286,13 @@ class AITriageService:
                 "triage": result.model_dump(mode="json"),
                 "json_repaired": repaired,
             }
+            if not result.business_relevance or result.message_class in {
+                "service",
+                "advertising",
+                "social",
+            }:
+                signal.status = "suppressed"
+                return None
             state = await session.scalar(
                 select(DialogState).where(DialogState.dialog_id == signal.dialog_id)
             )
@@ -304,6 +345,27 @@ class AITriageService:
             return problem.id
 
         return await self.transactions.run(write)
+
+    async def _suppress_non_business(
+        self, signal_id: str, message_class: str, reason: str
+    ) -> None:
+        async def write(session: AsyncSession) -> None:
+            signal = await session.get(Signal, signal_id)
+            if signal is None:
+                return
+            signal.status = "suppressed"
+            signal.processed_at = datetime.now(UTC)
+            signal.metadata_json = {
+                **(signal.metadata_json or {}),
+                "message_relevance": {
+                    "class": message_class,
+                    "business_relevant": False,
+                    "reason": reason,
+                    "source": "deterministic_guard",
+                },
+            }
+
+        await self.transactions.run(write)
 
     async def _record_usage(
         self,

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.ai_router import AIModelRouter, AnalysisContext, RouterPolicy
 
 from ..database import SQLiteTransactionManager
+from ..intelligence.message_relevance import classify_message_relevance
 from ..models import (
     AnalysisBatch,
     AnalysisRun,
@@ -72,7 +73,12 @@ def compact_messages(
     seen: set[tuple[int | None, datetime, str]] = set()
     for item in messages:
         text = " ".join((item.body_text or "").split())
-        if not text or text.lower().startswith(SYSTEM_EVENT_PREFIXES):
+        relevance = classify_message_relevance(text)
+        if (
+            not text
+            or text.lower().startswith(SYSTEM_EVENT_PREFIXES)
+            or not relevance.business_relevant
+        ):
             continue
         key = (item.sender_id, item.sent_at, text)
         if key in seen:
@@ -204,6 +210,7 @@ class AnalysisBatchBuilder:
                 TelegramDialog.connection_id == run.telegram_account_id,
                 TelegramDialog.selected.is_(True),
                 TelegramDialog.excluded.is_(False),
+                TelegramDialog.classification != "automated_account",
             )
             if dialog_ids is not None:
                 if not dialog_ids:
