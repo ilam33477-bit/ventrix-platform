@@ -22,11 +22,14 @@ from services.backend.config import get_settings
 from services.backend.database import get_session
 
 
-def signed_init_data(token: str, user_id: int, auth_date: int) -> str:
+def signed_init_data(token: str, user_id: int, auth_date: int, username: str | None = None) -> str:
+    user = {"id": user_id, "first_name": "Owner"}
+    if username:
+        user["username"] = username
     values = {
         "auth_date": str(auth_date),
         "query_id": "query-1",
-        "user": json.dumps({"id": user_id, "first_name": "Owner"}, separators=(",", ":")),
+        "user": json.dumps(user, separators=(",", ":")),
     }
     check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
     secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
@@ -260,9 +263,7 @@ async def test_owner_api_endpoints(
         )
         assert mini_app_auth.json()["permissions"] == ["*"]
         assert "dashboard_summary" in mini_app_auth.json()
-        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {
-            "calls_today": 0
-        }
+        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {"calls_today": 0}
         assert "tokens_today" not in mini_app_auth.json()["dashboard_summary"]["ai_usage"]
         assert mini_app_auth.json()["project_context"]["onboarding"] == {
             "step": "welcome",
@@ -349,6 +350,29 @@ async def test_owner_api_endpoints(
             json={"display_name": "Иван", "telegram_user_id": 700002},
         )
         assert second_employee.status_code == 201
+        username_only_employee = await client.post(
+            "/api/v1/client/employees",
+            headers={"Authorization": f"tma {init_data}"},
+            json={"display_name": "username_only", "telegram_username": "username_only"},
+        )
+        assert username_only_employee.status_code == 201
+        username_init_data = signed_init_data(
+            "mock-telegram-token-must-remain-secret",
+            700003,
+            int(time.time()),
+            username="Username_Only",
+        )
+        username_employee_menu = await client.get(
+            "/api/v1/client/menu",
+            headers={"Authorization": f"tma {username_init_data}"},
+        )
+        assert username_employee_menu.status_code == 200
+        assert "problems.read_own" in username_employee_menu.json()["permissions"]
+        username_employee_rows = await client.get(
+            "/api/v1/client/employees",
+            headers={"Authorization": f"tma {username_init_data}"},
+        )
+        assert [row["telegram_user_id"] for row in username_employee_rows.json()] == [700003]
         employee_init_data = signed_init_data(
             "mock-telegram-token-must-remain-secret", 700001, int(time.time())
         )

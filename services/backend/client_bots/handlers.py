@@ -46,6 +46,7 @@ from ..models import (
     TenantMembership,
     TenantSettings,
 )
+from ..services.employee_access import claim_employee_by_username
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
 from ..timezones import timezone_info
@@ -109,6 +110,15 @@ class TenantOwnerMiddleware(BaseMiddleware):
                         TenantMembership.status == "active",
                     )
                 )
+                if membership is None:
+                    membership = await claim_employee_by_username(
+                        session,
+                        tenant_id=tenant.id,
+                        telegram_user_id=user_id,
+                        telegram_username=getattr(user, "username", None),
+                    )
+                    if membership is not None:
+                        await session.commit()
         if tenant is None or user_id is None or membership is None:
             await self.events.record(
                 tenant_id=self.tenant_id,

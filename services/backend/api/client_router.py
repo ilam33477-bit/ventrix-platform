@@ -13,7 +13,7 @@ from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, SecretStr, field_validator
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.problems import ProblemStatus
@@ -55,6 +55,7 @@ from ..models import (
 )
 from ..repositories.client_data import TenantClientRepository
 from ..scheduler.service import TenantAnalysisScheduler, next_analysis_time
+from ..services.employee_access import claim_employee_by_username, sync_employee_membership
 from ..services.encryption import EncryptionService
 from ..services.onboarding_welcome import ensure_onboarding_welcome, fallback_welcome
 from ..services.system_secrets import load_runtime_secret_overrides
@@ -311,100 +312,6 @@ def require_permission(context: ClientAuthContext, permission: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
 
-ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
-    "manager": frozenset(
-        {
-            "problems.read_all",
-            "problems.manage",
-            "employees.read",
-            "employees.manage",
-            "groups.manage",
-            "reports.read",
-            "commitments.read_all",
-            "settings.read",
-            "settings.manage",
-        }
-    ),
-    "employee": frozenset(
-        {
-            "problems.read_own",
-            "problems.manage_own",
-            "commitments.read_own",
-            "commitments.manage_own",
-            "reports.read_own",
-        }
-    ),
-    "observer": frozenset({"reports.read"}),
-}
-
-
-async def sync_employee_membership(
-    session: AsyncSession,
-    employee: Employee,
-    *,
-    previous_telegram_user_id: int | None = None,
-) -> TenantMembership | None:
-    """Keep the employee access identity and its role permissions in lockstep."""
-    if previous_telegram_user_id and previous_telegram_user_id != employee.telegram_user_id:
-        previous = await session.scalar(
-            select(TenantMembership).where(
-                TenantMembership.tenant_id == employee.tenant_id,
-                TenantMembership.employee_id == employee.id,
-                TenantMembership.telegram_user_id == previous_telegram_user_id,
-            )
-        )
-        if previous is not None:
-            previous.status = "inactive"
-
-    if employee.telegram_user_id is None:
-        linked = await session.scalar(
-            select(TenantMembership).where(
-                TenantMembership.tenant_id == employee.tenant_id,
-                TenantMembership.employee_id == employee.id,
-            )
-        )
-        if linked is not None:
-            linked.status = "inactive"
-        return None
-
-    membership = await session.scalar(
-        select(TenantMembership).where(
-            TenantMembership.tenant_id == employee.tenant_id,
-            TenantMembership.telegram_user_id == employee.telegram_user_id,
-        )
-    )
-    if membership is not None and membership.employee_id not in {None, employee.id}:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Telegram user already belongs to another employee in tenant",
-        )
-    if membership is None:
-        membership = TenantMembership(
-            tenant_id=employee.tenant_id,
-            telegram_user_id=employee.telegram_user_id,
-            employee_id=employee.id,
-            role=employee.role,
-            status=employee.status,
-        )
-        session.add(membership)
-        await session.flush()
-    else:
-        membership.employee_id = employee.id
-        membership.role = employee.role
-        membership.status = employee.status
-
-    await session.execute(delete(Permission).where(Permission.membership_id == membership.id))
-    session.add_all(
-        Permission(
-            tenant_id=employee.tenant_id,
-            membership_id=membership.id,
-            permission=permission,
-        )
-        for permission in ROLE_PERMISSIONS[employee.role]
-    )
-    return membership
-
-
 def can_read_problem(context: ClientAuthContext, problem: OperationalProblem) -> bool:
     if context.membership.role in {"owner", "manager"} or context.allows("problems.read_all"):
         return True
@@ -537,6 +444,15 @@ async def require_client_context(
                 TenantMembership.status == "active",
             )
         )
+        if membership is None:
+            membership = await claim_employee_by_username(
+                session,
+                tenant_id=tenant.id,
+                telegram_user_id=validated["user_id"],
+                telegram_username=validated["user"].get("username"),
+            )
+            if membership is not None:
+                await session.commit()
         if membership is None:
             continue
         permissions = frozenset(
@@ -1348,9 +1264,7 @@ async def start_connection_login(
             "PhoneNumberBannedError": "Этот Telegram-аккаунт заблокирован.",
             "TimeoutError": "Telegram не ответил вовремя. Проверьте сеть и попробуйте ещё раз.",
         }.get(error_name, "Telegram временно не принял запрос. Попробуйте позже.")
-        raise HTTPException(
-            status_code=502, detail=detail
-        ) from exc
+        raise HTTPException(status_code=502, detail=detail) from exc
     return {
         "id": connection.id,
         "status": connection.status,
@@ -1836,7 +1750,10 @@ async def create_employee(
     )
     session.add(employee)
     await session.flush()
-    membership = await sync_employee_membership(session, employee)
+    try:
+        membership = await sync_employee_membership(session, employee)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await session.commit()
     return {
         "id": employee.id,
@@ -1868,11 +1785,14 @@ async def update_employee(
         values["telegram_username"] = (values["telegram_username"] or "").lstrip("@") or None
     for key, value in values.items():
         setattr(employee, key, value)
-    membership = await sync_employee_membership(
-        session,
-        employee,
-        previous_telegram_user_id=previous_telegram_user_id,
-    )
+    try:
+        membership = await sync_employee_membership(
+            session,
+            employee,
+            previous_telegram_user_id=previous_telegram_user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await record_event(session, context, "employee_updated", {"employee_id": employee.id})
     await session.commit()
     return {
