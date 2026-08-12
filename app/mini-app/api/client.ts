@@ -128,7 +128,7 @@ export class VentrixClientApi {
     notifications_enabled: boolean;
     criticality_threshold: number;
   }) {
-    return this.request<{ id: string }>("/employees", {
+    return this.request<{ id: string; name: string }>("/employees", {
       method: "POST",
       body: JSON.stringify(value),
     });

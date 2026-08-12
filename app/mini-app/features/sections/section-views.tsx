@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 
 import type { VentrixClientApi } from "../../api/client";
 import { Card, EmptyState, SectionHeading, Skeleton, StatusBadge } from "../../components/ui";
+import { ConnectionManager } from "../connections/connection-manager";
 import { useResource } from "../../hooks/use-resource";
 import type { ClientSettings, Employee, ReportDetail, TabId } from "../../types";
 
@@ -15,30 +16,42 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
   return <><SectionHeading eyebrow="ОТЧЁТЫ" title="История аналитики" description="Компания, сотрудники, клиенты, решённые и открытые проблемы." />{loading ? <Skeleton lines={4} /> : data?.length ? <div className="section-list">{data.map((item) => <button className="section-button" key={item.id} onClick={() => void api.report(item.id).then(setDetail)}><Card><StatusBadge tone={item.status === "ready" ? "success" : "neutral"}>{item.status}</StatusBadge><h3>{item.summary || "Отчёт Ventrix"}</h3><p>{item.period_start ? `${new Date(item.period_start).toLocaleDateString("ru-RU")} — ${new Date(item.period_end ?? item.period_start).toLocaleDateString("ru-RU")}` : "Период формируется"}</p></Card></button>)}</div> : <EmptyState title="Отчётов пока нет" description="Первый consolidated-отчёт появится после анализа всех аккаунтов." />}{error && <p className="form-error">{error}</p>}</>;
 }
 
-function EmployeeEditor({ api, employee, done }: { api: VentrixClientApi; employee?: Employee; done: () => void }) {
-  const [name, setName] = useState(employee?.name ?? "");
-  const [telegramId, setTelegramId] = useState(employee?.telegram_user_id?.toString() ?? "");
+function EmployeeEditor({ api, employee, done }: { api: VentrixClientApi; employee?: Employee; done: (created?: Pick<Employee, "id" | "name">) => void }) {
   const [username, setUsername] = useState(employee?.telegram_username ?? "");
-  const [role, setRole] = useState<"manager" | "employee" | "observer">((employee?.role as "manager" | "employee" | "observer") ?? "employee");
-  const [threshold, setThreshold] = useState(employee?.criticality_threshold ?? 85);
-  const [notifications, setNotifications] = useState(employee?.notifications_enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function save() {
     setBusy(true); setError("");
-    const value = { display_name: name, telegram_user_id: telegramId ? Number(telegramId) : null, telegram_username: username || null, role, notifications_enabled: notifications, criticality_threshold: threshold };
-    try { if (employee) await api.updateEmployee(employee.id, value); else await api.createEmployee(value); done(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Не удалось сохранить"); } finally { setBusy(false); }
+    const normalizedUsername = username.trim().replace(/^@+/, "");
+    try {
+      if (employee) {
+        await api.updateEmployee(employee.id, { telegram_username: normalizedUsername });
+        done();
+      } else {
+        const created = await api.createEmployee({
+          display_name: normalizedUsername,
+          telegram_username: normalizedUsername,
+          role: "employee",
+          notifications_enabled: true,
+          criticality_threshold: 85,
+        });
+        done({ id: created.id, name: normalizedUsername });
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Не удалось сохранить"); } finally { setBusy(false); }
   }
-  return <Card className="control-form"><h3>{employee ? "Редактировать сотрудника" : "Новый сотрудник"}</h3><label>Имя<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>Telegram user ID<input inputMode="numeric" value={telegramId} onChange={(event) => setTelegramId(event.target.value.replace(/\D/g, ""))} /></label><label>Username<input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="username без @" /></label><label>Роль<select value={role} onChange={(event) => setRole(event.target.value as typeof role)}><option value="manager">Менеджер</option><option value="employee">Сотрудник</option><option value="observer">Наблюдатель</option></select></label><label>Порог уведомлений: {threshold}<input type="range" min="0" max="100" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} /></label><label className="inline-check"><input type="checkbox" checked={notifications} onChange={(event) => setNotifications(event.target.checked)} /> Получает уведомления</label>{error && <p className="form-error">{error}</p>}<div className="form-actions"><button onClick={done}>Отмена</button><button className="primary-action" disabled={busy || !name.trim()} onClick={() => void save()}>Сохранить</button></div></Card>;
+  const validUsername = /^[A-Za-z0-9_]{3,64}$/.test(username.trim().replace(/^@+/, ""));
+  return <Card className="control-form employee-editor"><h3>{employee ? "Изменить сотрудника" : "Новый сотрудник"}</h3><p>Укажите только Telegram username. Числовой Telegram ID Ventrix определит после первого входа сотрудника.</p><label>Telegram username<div className="username-input"><span>@</span><input autoCapitalize="none" autoCorrect="off" value={username.replace(/^@+/, "")} onChange={(event) => setUsername(event.target.value.replace(/[^A-Za-z0-9_@]/g, ""))} placeholder="username" /></div></label><div className="fixed-role"><small>Роль</small><strong>Сотрудник</strong><span>Доступ к данным других сотрудников не выдаётся.</span></div>{username && !validUsername && <p className="field-hint">Используйте латинские буквы, цифры и знак подчёркивания.</p>}{error && <p className="form-error">{error}</p>}<div className="form-actions"><button onClick={() => done()}>Отмена</button><button className="primary-action" disabled={busy || !validUsername} onClick={() => void save()}>{busy ? "Сохраняем…" : employee ? "Сохранить" : "Создать и подключить"}</button></div></Card>;
 }
 
 export function EmployeesView({ api }: { api: VentrixClientApi }) {
   const loader = useCallback(() => api.employees(), [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [editing, setEditing] = useState<Employee | "new" | null>(null);
-  const done = () => { setEditing(null); void reload(); };
+  const [connecting, setConnecting] = useState<Pick<Employee, "id" | "name"> | null>(null);
+  const done = (created?: Pick<Employee, "id" | "name">) => { setEditing(null); if (created) setConnecting(created); void reload(); };
+  if (connecting) return <><SectionHeading eyebrow="КОМАНДА" title={`Telegram @${connecting.name}`} description="Код придёт в официальный служебный чат Telegram подключаемого аккаунта." /><button className="text-action section-back" onClick={() => { setConnecting(null); void reload(); }}>← Вернуться к сотрудникам</button><ConnectionManager api={api} connections={[]} assignedEmployee={connecting} /></>;
   if (editing) return <><SectionHeading eyebrow="КОМАНДА" title="Доступ сотрудника" /><EmployeeEditor api={api} employee={editing === "new" ? undefined : editing} done={done} /></>;
-  return <><SectionHeading eyebrow="КОМАНДА" title="Сотрудники и доступ" description="Telegram mapping, роль, permissions и персональные уведомления." /><button className="primary-action section-action" onClick={() => setEditing("new")}>Добавить сотрудника</button>{loading ? <Skeleton lines={4} /> : data?.length ? <div className="section-list">{data.map((item) => <button className="section-button" key={item.id} onClick={() => setEditing(item)}><Card className="person-row"><span>{item.name.slice(0, 2).toUpperCase()}</span><div><h3>{item.name}</h3><p>{item.telegram_username ? `@${item.telegram_username}` : "Telegram не указан"} · доступ {item.access_status ?? "unlinked"}</p></div><StatusBadge tone={item.status === "active" ? "success" : "neutral"}>{item.role}</StatusBadge></Card></button>)}</div> : <EmptyState title="Сотрудники ещё не добавлены" description="Добавьте сотрудника и свяжите его Telegram user ID." />}{error && <p className="form-error">{error}</p>}</>;
+  return <><SectionHeading eyebrow="КОМАНДА" title="Сотрудники и доступ" description="Добавьте @username и при необходимости подключите рабочую Telegram-сессию сотрудника." /><button className="primary-action section-action" onClick={() => setEditing("new")}>Добавить сотрудника</button>{loading ? <Skeleton lines={4} /> : data?.length ? <div className="section-list">{data.map((item) => <Card className="employee-card" key={item.id}><div className="person-row"><span>{item.name.slice(0, 2).toUpperCase()}</span><div><h3>{item.telegram_username ? `@${item.telegram_username}` : item.name}</h3><p>Роль: сотрудник · доступ {item.access_status ?? "не связан"}</p></div><StatusBadge tone={item.status === "active" ? "success" : "neutral"}>{item.status === "active" ? "активен" : "неактивен"}</StatusBadge></div><div className="employee-actions"><button onClick={() => setEditing(item)}>Изменить username</button><button className="primary-action" onClick={() => setConnecting({ id: item.id, name: item.telegram_username ?? item.name })}>Подключить Telegram</button></div></Card>)}</div> : <EmptyState title="Сотрудники ещё не добавлены" description="Добавьте Telegram username — числовой ID вводить не нужно." />}{error && <p className="form-error">{error}</p>}</>;
 }
 
 export function CommitmentsView({ api, onOpenProblem }: { api: VentrixClientApi; onOpenProblem: () => void }) {
