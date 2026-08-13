@@ -155,6 +155,8 @@ def test_telegram_private_entity_classifier_rejects_non_humans() -> None:
         ("Казино дарит бесплатный бонус — успейте забрать!", "advertising"),
         ("Хорошо, спасибо", "social"),
         ("Договорились 🤝", "social"),
+        ("Да", "social"),
+        ("Понял, спасибо", "social"),
         ("Подпишитесь на канал, чтобы получать новые вакансии", "advertising"),
         ("Клиент просит прислать договор и счёт до пятницы.", "business"),
     ],
