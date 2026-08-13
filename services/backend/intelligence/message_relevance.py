@@ -34,6 +34,12 @@ PROMOTIONAL_BROADCAST_RE = re.compile(
     r"пополнение\s+через|залетайте\s+и\s+пробуйте|подпишитесь\s+на\s+канал)",
     re.IGNORECASE,
 )
+REFUSAL_OR_THANKS_RE = re.compile(
+    r"^(?!.*\?)(?:(?:нет|неа|не|скорее\s+всего\s+нет|наверное[^.]{0,40}\sнет)\b.{0,100}|"
+    r"(?:спасибо|благодарю|большое\s+спасибо|понял[аи]?[,! ]+благодарю)\b.{0,100}|"
+    r"(?:ок+е*|оке+|ок\s+спс|короче\s+я\s+понял|досвидос)\b.{0,60})$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,8 @@ def classify_message_relevance(
     """
 
     normalized = " ".join((text or "").split())
+    if normalized and not any(character.isalnum() for character in normalized):
+        return MessageRelevance("social", False, "non-verbal acknowledgement")
     if dialog_classification == "automated_account":
         return MessageRelevance("service", False, "automated Telegram account")
     if OTP_RE.search(normalized):
@@ -64,15 +72,20 @@ def classify_message_relevance(
         return MessageRelevance("service", False, "automated group or subscription event")
     closing_candidate = re.sub(r"[,;:!?…—\-]+", " ", normalized)
     closing_candidate = " ".join(closing_candidate.split())
-    if CLOSING_RE.fullmatch(normalized) or closing_candidate.casefold() in {
-        "хорошо спасибо",
-        "ок спасибо",
-        "окей спасибо",
-        "понятно спасибо",
-        "понял спасибо",
-        "поняла спасибо",
-        "договорились спасибо",
-    }:
+    if (
+        CLOSING_RE.fullmatch(normalized)
+        or REFUSAL_OR_THANKS_RE.fullmatch(normalized)
+        or closing_candidate.casefold()
+        in {
+            "хорошо спасибо",
+            "ок спасибо",
+            "окей спасибо",
+            "понятно спасибо",
+            "понял спасибо",
+            "поняла спасибо",
+            "договорились спасибо",
+        }
+    ):
         return MessageRelevance("social", False, "dialogue closing or acknowledgement")
     ad_score = sum(bool(pattern.search(normalized)) for pattern in AD_MARKERS)
     if ad_score >= 2 or PROMOTIONAL_BROADCAST_RE.search(normalized):
