@@ -79,6 +79,7 @@ export type Problem = {
   responsible_employee_id: string | null;
   responsible_employee_name?: string | null;
   connection_name?: string | null;
+  connection_username?: string | null;
   dialog_username?: string | null;
   deadline_at: string | null;
   occurred_at: string;

@@ -110,6 +110,8 @@ body{background:var(--paper);color:var(--ink)}
 .field-hint{margin:0;color:#9a6c36;font-size:9px}
 .employee-card{display:grid;gap:12px}
 .employee-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-top:11px;border-top:1px solid var(--line)}
+.employee-actions.single-action,.employee-actions:has(>button:only-child){grid-template-columns:1fr}.employee-actions>button:only-child{width:100%;justify-self:stretch}
+.employee-card .person-row{grid-template-columns:38px minmax(0,1fr) auto;min-width:0}.employee-card .person-row>div{min-width:0}.employee-card .person-row>.status-badge{max-width:100%;justify-self:end;white-space:normal;text-align:center}
 .employee-actions button{min-height:42px;border:1px solid var(--line);border-radius:10px;background:#fff;font-size:10px;font-weight:800;padding:8px}
 .employee-actions .primary-action{background:var(--green);color:#fff;border-color:var(--green)}
 .section-back{margin:0 0 12px}
@@ -120,6 +122,7 @@ body{background:var(--paper);color:var(--ink)}
 .dialog-context>div.outgoing{justify-self:end;background:#e2f0e9}
 .dialog-context>div.source{box-shadow:inset 3px 0 var(--green)}
 .dialog-context small{color:var(--muted);font-size:8px}.dialog-context p{margin:4px 0 0;font-size:11px;line-height:1.45}
+@media(max-width:420px){.employee-card .person-row{grid-template-columns:38px minmax(0,1fr)}.employee-card .person-row>.status-badge{grid-column:2;justify-self:start}.employee-actions{grid-template-columns:1fr}.employee-actions button{width:100%}}
 .report-card>div{display:flex;align-items:center;justify-content:space-between}.report-card>div small{color:var(--muted)}.report-card>span{color:var(--green);font-size:10px;font-weight:800}.report-metric{font:500 28px Georgia,serif;color:var(--green)}
 .report-employee-list{display:grid;gap:8px}.report-employee-list>div{display:grid;grid-template-columns:1fr auto;gap:4px;padding:10px;border-radius:10px;background:#f1f5f2}.report-employee-list strong{grid-column:1/-1}.report-employee-list span{font-size:9px;color:var(--muted)}
 .settings-note{margin:0;color:var(--muted);font-size:10px;line-height:1.5}.threshold-settings label>span{display:flex;justify-content:space-between;gap:10px}.threshold-settings label>small{font-weight:500;color:var(--muted);line-height:1.4}

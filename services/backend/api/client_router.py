@@ -1021,6 +1021,11 @@ async def problems(
                 if item.connection_id in connection_map
                 else None
             ),
+            "connection_username": (
+                connection_map[item.connection_id].username
+                if item.connection_id in connection_map
+                else None
+            ),
             "dialog_username": (
                 dialog_map[item.dialog_id].username if item.dialog_id in dialog_map else None
             ),

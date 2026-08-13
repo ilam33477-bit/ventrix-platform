@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ..config import get_settings
 from ..database import SQLiteTransactionManager
 from ..jobs.queue import JOB_PRIORITY, JobDeferred, JobLease, SQLiteJobQueue
 from ..models import (
@@ -348,10 +349,6 @@ class NotificationOrchestrator:
                     )
                 )
                 recent_messages.reverse()
-                context = "\n".join(
-                    f"{'Сотрудник' if item.outgoing else 'Клиент'}: {(item.body_text or 'сообщение без текста')[:260]}"
-                    for item in recent_messages
-                )[:1600]
                 try:
                     event_time = signal.detected_at.astimezone(
                         timezone_info(tenant_settings.timezone)
@@ -363,16 +360,54 @@ class NotificationOrchestrator:
                     if destination_type == "employee"
                     else ""
                 )
+                employee_username = (connection.username if connection else None) or (
+                    responsible.telegram_username if responsible else None
+                )
+                context_parts: list[str] = []
+                for item in recent_messages:
+                    if item.outgoing:
+                        actor = (
+                            f"Сотрудник @{escape(employee_username)}"
+                            if employee_username
+                            else f"Сотрудник {escape(responsible.display_name)}"
+                            if responsible
+                            else "Сотрудник"
+                        )
+                    else:
+                        client_username = item.sender_username or current_dialog.username
+                        actor = f"@{escape(client_username)}" if client_username else escape(person)
+                    item_time = item.sent_at
+                    try:
+                        item_time = item_time.astimezone(timezone_info(tenant_settings.timezone))
+                    except (ValueError, AttributeError):
+                        pass
+                    context_parts.append(
+                        f"<b>{'👨‍💼' if item.outgoing else '👤'} {actor}</b> "
+                        f"<i>{item_time:%H:%M}</i>\n"
+                        f"<blockquote>{escape((item.body_text or 'Сообщение без текста')[:360])}</blockquote>"
+                    )
+                context = "\n".join(context_parts)
+                working_account = (
+                    f"@{employee_username}"
+                    if employee_username
+                    else (
+                        responsible.display_name
+                        if responsible
+                        else connection.display_name
+                        if connection
+                        else "общий аккаунт"
+                    )
+                )
                 text = (
                     f"⚠️ <b>{escape(prefix + title)}</b>\n\n"
                     f"{destination_intro}"
                     f"<b>Клиент:</b> {escape(person)}\n"
                     f"<b>Username:</b> {escape('@' + username) if username else 'не указан'}\n"
-                    f"<b>Рабочий аккаунт:</b> {escape((responsible.display_name if responsible else None) or (connection.display_name if connection else None) or 'общий аккаунт')}\n"
+                    f"<b>Рабочий аккаунт:</b> {escape(working_account)}\n"
                     f"<b>Ответственный:</b> {escape(responsible.display_name) if responsible else 'нужно назначить'}\n\n"
                     f"<b>Причина:</b>\n{escape(signal.reason)}\n\n"
                     f"<b>Сообщение:</b>\n<blockquote>{escape(body)}</blockquote>\n\n"
-                    f"<b>Последние реплики:</b>\n<blockquote>{escape(context or body)}</blockquote>\n\n"
+                    f"<b>Контекст диалога:</b>\n{context or f'<blockquote>{escape(body)}</blockquote>'}\n\n"
                     f"<b>Что сделать:</b> {escape((current_problem.recommended_action if current_problem else None) or 'Проверить диалог и определить следующий шаг.')}\n\n"
                     f"<i>{event_time:%d.%m.%Y %H:%M}</i>"
                 )
@@ -393,14 +428,19 @@ class NotificationOrchestrator:
                             }
                         ]
                     )
-            username = current_dialog.username if current_dialog else None
-            if username:
-                message_url = (
-                    f"https://t.me/{username}/{source.telegram_message_id}"
-                    if source and current_dialog.dialog_type in {"group", "channel"}
-                    else f"https://t.me/{username}"
+            mini_app_url = get_settings().client_mini_app_url
+            if current_problem and mini_app_url and not is_group:
+                separator = "&" if "?" in mini_app_url else "?"
+                rows.append(
+                    [
+                        {
+                            "text": "Посмотреть в системе",
+                            "web_app": {
+                                "url": f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
+                            },
+                        }
+                    ]
                 )
-                rows.append([{"text": "Открыть чат", "url": message_url}])
             log = NotificationLog(
                 tenant_id=signal.tenant_id,
                 signal_id=signal.id,

@@ -21,7 +21,7 @@ from ..models import (
     TelegramMessage,
     TenantSettings,
 )
-from .message_relevance import classify_message_relevance
+from .message_relevance import classify_message_relevance, dialogue_is_explicitly_closed
 from .notifications import NotificationOrchestrator
 from .problem_lifecycle import initialize_problem_lifecycle
 from .triage import TriageResult, parse_triage_result
@@ -42,6 +42,16 @@ are not unanswered clients and must have business_relevance=false, criticality <
 no notifications, no deadline and needs_deep_analysis=false.
 Use business_relevance=true only when the context shows a real work conversation,
 client request, employee commitment, payment/document exchange or operational risk.
+The product searches for missed opportunities, unanswered actionable requests and
+open discussion threads. Never create a problem merely because the last customer
+message is older than SLA. First decide whether a response is actually expected.
+If the customer declined or showed no interest and the employee accepted the refusal
+politely (for example: "понял, без проблем", "не буду настаивать", "если передумаете,
+я на связи"), the sales thread is complete. Later "спасибо", "хорошо", or another
+courtesy acknowledgement does not reopen it. Return message_class=social,
+business_relevance=false, criticality<=10 and disable all notifications.
+An unanswered problem requires a concrete open question, requested action, agreed
+follow-up, pending document/payment, or another unresolved next step in the latest context.
 """
 
 
@@ -77,6 +87,12 @@ class AITriageService:
             str(payload["new_message"].get("text") or ""),
             dialog_classification=str(payload["dialog"].get("type") or ""),
         )
+        recent_messages = list(payload.get("recent_messages") or [])
+        if dialogue_is_explicitly_closed(recent_messages):
+            await self._suppress_non_business(
+                signal.id, "social", "customer decline was acknowledged; dialogue is closed"
+            )
+            return {"signal_id": signal.id, "status": "suppressed", "message_class": "social"}
         if not relevance.business_relevant:
             await self._suppress_non_business(signal.id, relevance.message_class, relevance.reason)
             return {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 OTP_RE = re.compile(
     r"(?:код\s+(?:для\s+)?(?:входа|подтверждения)|login\s+code|verification\s+code|"
@@ -40,6 +42,23 @@ REFUSAL_OR_THANKS_RE = re.compile(
     r"(?:ок+е*|оке+|ок\s+спс|короче\s+я\s+понял|досвидос)\b.{0,60})$",
     re.IGNORECASE,
 )
+CUSTOMER_DECLINE_RE = re.compile(
+    r"(?:\bне\s+(?:интересно|нужно|хочу|готов[аы]?|подходит|актуально)\b|"
+    r"\bне\s+особо\s+горю\s+желанием\b|\bчерез\s+ботов\s+.*не\s+работаю\b|"
+    r"\bнет[, ]+спасибо\b|\bоткажусь\b)",
+    re.IGNORECASE,
+)
+EMPLOYEE_GRACEFUL_CLOSE_RE = re.compile(
+    r"(?:\bпонял[а]?[, ]+(?:без\s+проблем|хорошо)\b|\bне\s+буду\s+настаивать\b|"
+    r"\bесли\s+(?:надумаете|передумаете|появятся\s+вопросы)\b|"
+    r"\b(?:бот|я)\s+(?:всегда\s+)?(?:доступен|на\s+связи)\b)",
+    re.IGNORECASE,
+)
+CUSTOMER_CLOSING_RE = re.compile(
+    r"^(?!.*\?)(?:(?:хорошо|понятно|ок(?:ей)?)[, ]+)?"
+    r"(?:спасибо|благодарю)(?:\s+за\s+(?:предложение|ответ|информацию|помощь))?[.! )🙏👍]*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +66,55 @@ class MessageRelevance:
     message_class: str
     business_relevant: bool
     reason: str
+
+
+def dialogue_is_explicitly_closed(messages: Sequence[dict[str, Any]]) -> bool:
+    """Detect an explicit, mutually understood end of a sales thread.
+
+    This is intentionally narrower than generic sentiment analysis: a decline
+    must be followed by a graceful employee acknowledgement, with only closing
+    acknowledgements after it. A future substantive customer message starts a
+    new thread and will no longer match this guard.
+    """
+
+    tail = [
+        {
+            "outgoing": bool(item.get("outgoing")),
+            "text": " ".join(str(item.get("text") or "").split()),
+        }
+        for item in messages[-10:]
+        if str(item.get("text") or "").strip()
+    ]
+    decline_index = next(
+        (
+            index
+            for index in range(len(tail) - 1, -1, -1)
+            if not tail[index]["outgoing"] and CUSTOMER_DECLINE_RE.search(tail[index]["text"])
+        ),
+        None,
+    )
+    if decline_index is None:
+        return False
+    employee_close_index = next(
+        (
+            index
+            for index in range(decline_index + 1, len(tail))
+            if tail[index]["outgoing"] and EMPLOYEE_GRACEFUL_CLOSE_RE.search(tail[index]["text"])
+        ),
+        None,
+    )
+    if employee_close_index is None:
+        return False
+    for item in tail[employee_close_index + 1 :]:
+        if item["outgoing"]:
+            if not EMPLOYEE_GRACEFUL_CLOSE_RE.search(item["text"]):
+                return False
+        elif (
+            not CUSTOMER_CLOSING_RE.match(item["text"])
+            and classify_message_relevance(item["text"]).business_relevant
+        ):
+            return False
+    return True
 
 
 def classify_message_relevance(

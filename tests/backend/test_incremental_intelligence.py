@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -9,6 +10,7 @@ from sqlalchemy import func, select
 
 from services.backend.intelligence.ai_triage import AITriageService
 from services.backend.intelligence.local_signals import LocalSignalEngine, parse_deadline
+from services.backend.intelligence.message_relevance import dialogue_is_explicitly_closed
 from services.backend.intelligence.notifications import NotificationOrchestrator
 from services.backend.intelligence.reconciliation import ReconciliationService
 from services.backend.intelligence.signals import SignalService
@@ -42,6 +44,28 @@ from services.backend.telegram_sessions.gateway import (
 )
 from services.backend.telegram_sessions.incremental import IncrementalTelegramIngestion
 from services.backend.telegram_sessions.service import TelegramConnectionService
+
+
+def test_completed_sales_decline_is_not_an_open_customer_thread() -> None:
+    completed_dialogue = [
+        {"outgoing": True, "text": "Могу дать тестовый доступ на один день."},
+        {"outgoing": False, "text": "Если честно, то не особо горю желанием."},
+        {"outgoing": True, "text": "Понимаю, без проблем. Не буду настаивать."},
+        {"outgoing": True, "text": "Если передумаете или появятся вопросы, я на связи."},
+        {"outgoing": False, "text": "Хорошо, спасибо за предложение."},
+    ]
+
+    assert dialogue_is_explicitly_closed(completed_dialogue) is True
+
+
+def test_new_customer_question_reopens_a_previously_closed_thread() -> None:
+    dialogue_with_follow_up = [
+        {"outgoing": False, "text": "Нет, спасибо, сейчас не интересно."},
+        {"outgoing": True, "text": "Понял, без проблем. Если передумаете, я на связи."},
+        {"outgoing": False, "text": "А сколько будет стоить доступ на месяц?"},
+    ]
+
+    assert dialogue_is_explicitly_closed(dialogue_with_follow_up) is False
 
 
 class IncrementalGateway:
@@ -383,8 +407,12 @@ def test_triage_json_is_strict_and_supports_one_controlled_repair() -> None:
 
 @pytest.mark.asyncio
 async def test_critical_triage_records_usage_problem_and_privacy_safe_notifications(
-    session_factory, make_service, tenant_payload, encryption_key
+    session_factory, make_service, tenant_payload, encryption_key, monkeypatch
 ) -> None:
+    monkeypatch.setattr(
+        "services.backend.intelligence.notifications.get_settings",
+        lambda: SimpleNamespace(client_mini_app_url="https://mini.example"),
+    )
     gateway = IncrementalGateway()
     tenant, connection, dialog, _ = await _connection_with_dialog(
         session_factory, make_service, tenant_payload, encryption_key, gateway
@@ -392,6 +420,8 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     queue = SQLiteJobQueue(session_factory)
     now = datetime.now(UTC)
     async with session_factory() as session:
+        managed_connection = await session.get(TelegramConnection, connection.id)
+        managed_connection.username = "employee_account"
         employee = Employee(
             tenant_id=tenant.id,
             display_name="Менеджер",
@@ -468,6 +498,15 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     group_payload = next(item.payload_json for item in logs if item.destination_type == "group")
     assert group_payload["privacy_safe"] is True
     assert "Секретные условия" not in group_payload["text"]
+    manager_payload = next(item.payload_json for item in logs if item.destination_type == "manager")
+    assert "Рабочий аккаунт:</b> @employee_account" in manager_payload["text"]
+    assert "Контекст диалога" in manager_payload["text"]
+    buttons = [
+        button for row in manager_payload["reply_markup"]["inline_keyboard"] for button in row
+    ]
+    assert "Открыть чат" not in {button["text"] for button in buttons}
+    system_button = next(button for button in buttons if button["text"] == "Посмотреть в системе")
+    assert f"problem_id={result['problem_id']}" in system_button["web_app"]["url"]
 
     duplicate = await NotificationOrchestrator(session_factory, queue).plan_for_signal(
         signal_id, result["problem_id"]

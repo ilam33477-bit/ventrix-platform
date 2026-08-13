@@ -196,3 +196,31 @@ async def test_assigned_problem_can_be_marked_false_positive(
         ),
     )
     assert result.status == "false_positive"
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_problem_can_be_marked_false_positive(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, _employee, _connection, _dialog, _message, problem = await _problem_fixture(
+        session_factory, make_service, tenant_payload
+    )
+    lifecycle = ProblemLifecycleService(session_factory)
+    await lifecycle.transition(
+        tenant.id,
+        problem.id,
+        TransitionRequest(ProblemStatus.ACKNOWLEDGED, "membership", None, "Проверено"),
+    )
+
+    result = await lifecycle.transition(
+        tenant.id,
+        problem.id,
+        TransitionRequest(
+            ProblemStatus.FALSE_POSITIVE,
+            "membership",
+            None,
+            "Диалог завершён без упущенной возможности",
+        ),
+    )
+
+    assert result.status == "false_positive"

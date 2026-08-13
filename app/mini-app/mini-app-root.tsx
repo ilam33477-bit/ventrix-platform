@@ -15,7 +15,15 @@ import type { TabId } from "./types";
 
 export function MiniAppRoot() {
   const { launchState, session, api, error, refresh, advanceOnboarding } = useMiniAppSession();
-  const [activeTab, setActiveTab] = useState<TabId>("dashboard");
+  const requestedSection = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("section")
+    : null;
+  const requestedProblemId = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("problem_id") ?? undefined
+    : undefined;
+  const [activeTab, setActiveTab] = useState<TabId>(
+    requestedSection === "problems" ? "problems" : "dashboard",
+  );
   const [history, setHistory] = useState<TabId[]>([]);
   const primary = new Set<TabId>(["dashboard", "problems", "statistics", "employees", "more"]);
   function navigate(tab: TabId) {
@@ -46,7 +54,7 @@ export function MiniAppRoot() {
 
   const content = (() => {
     switch (activeTab) {
-      case "problems": return <ProblemsView api={api} />;
+      case "problems": return <ProblemsView api={api} initialProblemId={requestedProblemId} />;
       case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
       case "statistics": return <StatisticsView summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;

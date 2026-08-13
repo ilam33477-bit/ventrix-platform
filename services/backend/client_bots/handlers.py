@@ -221,6 +221,46 @@ def build_client_router(
                     raise
         await query.answer()
 
+    def problem_system_markup(problem_id: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        if mini_app_url:
+            separator = "&" if "?" in mini_app_url else "?"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Посмотреть в системе",
+                        web_app=WebAppInfo(
+                            url=(
+                                f"{mini_app_url}{separator}section=problems&problem_id={problem_id}"
+                            )
+                        ),
+                    )
+                ]
+            )
+        rows.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def mark_problem_card(
+        query: CallbackQuery, problem_id: str, *, status_text: str, note: str
+    ) -> None:
+        if not query.message:
+            return
+        original = query.message.html_text or escape(query.message.text or "")
+        marker = "\n\n<b>Статус ситуации</b>\n"
+        if marker in original:
+            original = original.split(marker, 1)[0]
+        updated = (
+            f"{original}{marker}<blockquote>{escape(status_text)}\n{escape(note)}</blockquote>"
+        )
+        try:
+            await query.message.edit_text(
+                updated,
+                reply_markup=problem_system_markup(problem_id),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
     async def edit_saved_screen(
         state: FSMContext,
         bot: Any,
@@ -489,7 +529,7 @@ def build_client_router(
             InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="Закрыть", callback_data=f"np:close:{problem.id}")],
-                    [InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")],
+                    *problem_system_markup(problem.id).inline_keyboard,
                 ]
             ),
         )
@@ -502,8 +542,9 @@ def build_client_router(
             await query.answer("Действие доступно владельцу или менеджеру", show_alert=True)
             return
         problem_id = query.data.rsplit(":", 1)[1]
+        lifecycle = ProblemLifecycleService(events.session_factory)
         try:
-            await ProblemLifecycleService(events.session_factory).transition(
+            problem = await lifecycle.transition(
                 client_context.tenant_id,
                 problem_id,
                 TransitionRequest(
@@ -514,8 +555,22 @@ def build_client_router(
                 ),
             )
         except ValueError:
-            await query.answer("Текущий статус уже нельзя отметить как ложный", show_alert=True)
-            return
+            async with events.session_factory() as session:
+                problem = await session.scalar(
+                    select(OperationalProblem).where(
+                        OperationalProblem.id == problem_id,
+                        OperationalProblem.tenant_id == client_context.tenant_id,
+                    )
+                )
+            if problem is None or problem.status != ProblemStatus.FALSE_POSITIVE.value:
+                await query.answer("Текущий статус уже нельзя отметить как ложный", show_alert=True)
+                return
+        await mark_problem_card(
+            query,
+            problem_id,
+            status_text="Не проблема",
+            note="Карточка исключена из активных ситуаций и синхронизирована с Mini App.",
+        )
         await query.answer("Отмечено как не проблема", show_alert=True)
         await record(
             client_context,
@@ -555,6 +610,21 @@ def build_client_router(
                         "Ситуация подтверждена владельцем.",
                     ),
                 )
+            if (
+                problem.status == ProblemStatus.ACKNOWLEDGED.value
+                and problem.responsible_employee_id
+            ):
+                problem = await lifecycle.transition(
+                    client_context.tenant_id,
+                    problem.id,
+                    TransitionRequest(
+                        ProblemStatus.ASSIGNED,
+                        "tenant_owner",
+                        str(client_context.telegram_user_id),
+                        "Ответственный подтверждён владельцем.",
+                        responsible_employee_id=problem.responsible_employee_id,
+                    ),
+                )
             if problem.status == ProblemStatus.ASSIGNED.value:
                 problem = await lifecycle.transition(
                     client_context.tenant_id,
@@ -582,7 +652,7 @@ def build_client_router(
                         "Получено подтверждение владельца.",
                     ),
                 )
-            await lifecycle.transition(
+            problem = await lifecycle.transition(
                 client_context.tenant_id,
                 problem.id,
                 TransitionRequest(
@@ -595,6 +665,12 @@ def build_client_router(
         except ValueError:
             await query.answer("Переход статуса недоступен", show_alert=True)
             return
+        await mark_problem_card(
+            query,
+            problem_id,
+            status_text="Решено",
+            note="Ситуация закрыта и обновлена в Mini App.",
+        )
         await query.answer("Ситуация закрыта", show_alert=True)
 
     @router.callback_query(F.data.startswith("np:notify:"))

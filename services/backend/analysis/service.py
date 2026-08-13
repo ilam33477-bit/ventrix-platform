@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.ai_router import RouteName
 
 from ..database import SQLiteTransactionManager
+from ..intelligence.message_relevance import dialogue_is_explicitly_closed
 from ..intelligence.problem_lifecycle import initialize_problem_lifecycle
 from ..jobs.queue import JobDeferred, JobLease, SQLiteJobQueue
 from ..models import (
@@ -69,6 +70,16 @@ churn_risk, conflict, task_risk, operational_risk.
 Set is_problem=true only for a concrete actionable business risk supported by the
 source messages. Ordinary conversation, acknowledgements and neutral questions
 without a missed action are not problems.
+The goal is to find missed opportunities, unanswered actionable messages and open
+discussion threads — not every dialog whose last message is from a customer.
+Before emitting client_without_answer, identify the exact latest unanswered question,
+request, agreed follow-up, payment/document action or other open line of discussion.
+If a customer declined, said they were not interested, or rejected the offer and the
+employee accepted that outcome (for example "понял, без проблем", "не буду настаивать",
+"если передумаете, я на связи"), the conversation is completed. Courtesy replies such
+as "хорошо, спасибо за предложение" do not reopen it. Emit no problem for that dialog.
+If the evidence can also be explained as a completed polite sales conversation, prefer
+is_problem=false. Silence alone is never sufficient evidence of a problem.
 """
 
 CANONICAL_PROBLEM_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -642,6 +653,24 @@ class AnalysisPipelineService:
                     ):
                         continue
                     problem_type = canonical_problem_type(candidate.event_type)
+                    if problem_type == "client_without_answer":
+                        latest = list(
+                            await session.scalars(
+                                select(TelegramMessage)
+                                .where(
+                                    TelegramMessage.tenant_id == batch.tenant_id,
+                                    TelegramMessage.dialog_id == dialog.id,
+                                    TelegramMessage.deleted_at.is_(None),
+                                )
+                                .order_by(TelegramMessage.telegram_message_id.desc())
+                                .limit(10)
+                            )
+                        )
+                        latest.reverse()
+                        if dialogue_is_explicitly_closed(
+                            [{"outgoing": item.outgoing, "text": item.body_text} for item in latest]
+                        ):
+                            continue
                     source_remote_id = int(candidate.source_message_ids[0])
                     source = await session.scalar(
                         select(TelegramMessage).where(

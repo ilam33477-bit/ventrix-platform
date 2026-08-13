@@ -35,7 +35,9 @@ ALLOWED_TRANSITIONS: dict[ProblemStatus, frozenset[ProblemStatus]] = {
     ProblemStatus.NEEDS_CONFIRMATION: frozenset(
         {ProblemStatus.ACKNOWLEDGED, ProblemStatus.FALSE_POSITIVE}
     ),
-    ProblemStatus.ACKNOWLEDGED: frozenset({ProblemStatus.ASSIGNED, ProblemStatus.IGNORED}),
+    ProblemStatus.ACKNOWLEDGED: frozenset(
+        {ProblemStatus.ASSIGNED, ProblemStatus.FALSE_POSITIVE, ProblemStatus.IGNORED}
+    ),
     ProblemStatus.ASSIGNED: frozenset({ProblemStatus.IN_PROGRESS, ProblemStatus.FALSE_POSITIVE}),
     ProblemStatus.IN_PROGRESS: frozenset(
         {
