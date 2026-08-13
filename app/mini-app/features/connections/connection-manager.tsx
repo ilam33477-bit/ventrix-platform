@@ -20,7 +20,7 @@ function initialConnectStep(
   return "phone";
 }
 
-export function ConnectionManager({ api, connections: initialConnections, onboardingStep, onOnboardingStep, mode = "manage", onSkip, assignedEmployee }: {
+export function ConnectionManager({ api, connections: initialConnections, onboardingStep, onOnboardingStep, mode = "manage", onSkip, assignedEmployee, createEmployee = false, onComplete }: {
   api: VentrixClientApi;
   connections: TelegramConnection[];
   onboardingStep?: OnboardingStep;
@@ -28,6 +28,8 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   mode?: "manage" | "onboarding_connection" | "onboarding_groups";
   onSkip?: () => void;
   assignedEmployee?: Pick<Employee, "id" | "name">;
+  createEmployee?: boolean;
+  onComplete?: () => void;
 }) {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [connections, setConnections] = useState(initialConnections);
@@ -37,7 +39,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   const [password, setPassword] = useState("");
   const [connectionId, setConnectionId] = useState(initialConnections[0]?.id ?? "");
   const [step, setStep] = useState<ConnectStep>(
-    initialConnectStep(onboardingStep, initialConnections[0]),
+    mode === "manage" ? "phone" : initialConnectStep(onboardingStep, initialConnections[0]),
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -105,7 +107,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   };
 
   const startLogin = () => run(async () => {
-    const result = await api.startTelegramLogin(phone, employeeId || null);
+    const result = await api.startTelegramLogin(phone, employeeId || null, createEmployee);
     setConnectionId(result.id);
     setCodePhoneMasked(result.phone_masked);
     setDeliveryMethod(result.code_delivery_method);
@@ -121,6 +123,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     setConnections(await api.connections());
     setStep("done");
     await onOnboardingStep?.("monitoring_started");
+    onComplete?.();
   });
 
   const cancel = () => run(async () => {
@@ -184,7 +187,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
     <div className="connection-layout">
       {showConnection && <Card className="connection-wizard">
         <div className="step-dots"><span className={["phone", "confirm_phone"].includes(step) ? "active" : "done"}>1</span><i /><span className={["code", "password"].includes(step) ? "active" : ["syncing", "done"].includes(step) ? "done" : ""}>2</span><i /><span className={["syncing", "done"].includes(step) ? "active" : ""}>3</span></div>
-        {step === "phone" && <><h3>Подключить рабочий аккаунт</h3><p>Укажите номер именно того Telegram-аккаунта, рабочие диалоги которого нужно анализировать.</p>{mode === "manage" && (assignedEmployee ? <div className="fixed-employee"><small>Сотрудник</small><strong>@{assignedEmployee.name}</strong><span>Роль: сотрудник</span></div> : <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>)}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || !normalizePhoneInput(phone)} onClick={() => { const normalized = normalizePhoneInput(phone); if (normalized) { setPhone(normalized); setStep("confirm_phone"); } }}>Продолжить</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
+        {step === "phone" && <><h3>{createEmployee ? "Подключить нового сотрудника" : "Подключить рабочий аккаунт"}</h3><p>{createEmployee ? "Введите номер рабочего Telegram. Имя и username Ventrix получит из подтверждённой сессии автоматически." : "Укажите номер именно того Telegram-аккаунта, рабочие диалоги которого нужно анализировать."}</p>{mode === "manage" && !createEmployee && (assignedEmployee ? <div className="fixed-employee"><small>Сотрудник</small><strong>{assignedEmployee.name}</strong><span>Роль: сотрудник</span></div> : <label>Сотрудник<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Общий аккаунт компании</option>{employees.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>)}<label>Номер Telegram<input type="tel" autoComplete="tel" placeholder="+7 999 000-00-00" value={phone} onChange={(event) => setPhone(event.target.value)} /></label><button className="primary-action" disabled={busy || !normalizePhoneInput(phone)} onClick={() => { const normalized = normalizePhoneInput(phone); if (normalized) { setPhone(normalized); setStep("confirm_phone"); } }}>Продолжить</button>{mode === "onboarding_connection" && <button className="text-action" disabled={busy} onClick={onSkip}>Настроить позже</button>}</>}
         {step === "confirm_phone" && <><h3>Проверьте номер</h3><p>Telegram отправит код для этого аккаунта:</p><div className="phone-confirmation">{phone}</div><p>Обычно код приходит в служебный чат «Telegram» на уже авторизованных устройствах. Способ доставки выбирает Telegram.</p><button className="primary-action" disabled={busy} onClick={startLogin}>{busy ? "Отправляем код…" : "Да, отправить код"}</button><button className="text-action" disabled={busy} onClick={() => setStep("phone")}>Изменить номер</button></>}
         {step === "code" && <><h3>Код подтверждения</h3><p>{deliveryDescription(deliveryMethod)} Ventrix использует код один раз и не сохраняет.</p><div className="delivery-hint"><strong>Код запрошен{codePhoneMasked ? ` для ${codePhoneMasked}` : ""}</strong><span>Если уведомления выключены, откройте на этом аккаунте чат «Telegram» со служебными сообщениями. Старые коды после повторной отправки не действуют.</span></div><label>Код<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} /></label><button className="primary-action" disabled={busy || !code} onClick={() => completeLogin(false)}>Подтвердить</button><div className="secondary-actions"><button disabled={busy} onClick={() => setCode("")}>Очистить код</button><button disabled={busy || resendAvailableIn > 0} onClick={resendCode}>{resendAvailableIn > 0 ? `Новый код через ${resendAvailableIn} сек.` : "Отправить новый код"}</button></div></>}
         {step === "password" && <><h3>Пароль 2FA</h3><p>Пароль передаётся только для входа в Telegram и не сохраняется.</p><label>Облачный пароль<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary-action" disabled={busy || !password} onClick={() => completeLogin(true)}>Подключить аккаунт</button><button className="text-action" disabled={busy} onClick={() => setPassword("")}>Попробовать ещё раз</button></>}
@@ -193,7 +196,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
         {error && <p className="form-error">{error}</p>}
         {["code", "password"].includes(step) && <button className="text-action" disabled={busy} onClick={cancel}>Отменить подключение</button>}
       </Card>}
-      {showConnection && !assignedEmployee && <Card className="managed-connections"><div className="card-title"><h3>Подключённые аккаунты</h3><StatusBadge tone="neutral">{visibleConnections.length}</StatusBadge></div>{visibleConnections.length ? visibleConnections.map((item) => <div className="connection-row" key={item.id}><span>{(item.account ?? "TG").slice(0, 2).toUpperCase()}</span><div><strong>{item.account ?? "Telegram account"}</strong><small>{item.username ?? item.status}</small></div><StatusBadge tone={["connected", "ready", "syncing"].includes(item.status) ? "success" : "warning"}>{item.status}</StatusBadge></div>) : <EmptyState title="Аккаунтов пока нет" description="Первый аккаунт появится после подтверждения Telegram-кода." />}<p className="security-message">Данные рабочих сессий защищены шифрованием. Коды подтверждения и пароль 2FA не сохраняются.</p></Card>}
+      {showConnection && !assignedEmployee && !createEmployee && <Card className="managed-connections"><div className="card-title"><h3>Подключённые аккаунты</h3><StatusBadge tone="neutral">{visibleConnections.length}</StatusBadge></div>{visibleConnections.length ? visibleConnections.map((item) => <div className="connection-row connection-overview" key={item.id}><span>{(item.account ?? "TG").slice(0, 2).toUpperCase()}</span><div><strong>{item.account ?? "Telegram account"}</strong><small>{item.username ? `@${item.username}` : item.employee_name ?? "Общий аккаунт компании"}</small><div className="connection-stats"><em>Диалогов <b>{item.personal_dialogs ?? 0}</b></em><em>Новых сегодня <b>{item.new_contacts_today ?? 0}</b></em><em>Сообщений сегодня <b>{item.messages_today ?? 0}</b></em></div></div><StatusBadge tone={["connected", "ready", "syncing"].includes(item.status) ? "success" : "warning"}>{item.status === "ready" ? "готов" : item.status}</StatusBadge></div>) : <EmptyState title="Аккаунтов пока нет" description="Аккаунт появится только после ввода номера и запроса Telegram-кода." />}<p className="security-message">Данные рабочих сессий защищены шифрованием. Коды подтверждения и пароль 2FA не сохраняются.</p></Card>}
       {showSources && <Card className="managed-sources"><div className="card-title"><h3>Рабочие группы</h3><StatusBadge tone="neutral">{sources.length}</StatusBadge></div><p>Личные диалоги уже включены. Вставьте ссылку на группу или общую папку Telegram. Сначала Ventrix покажет preview.</p><label>Ссылка Telegram<input type="url" placeholder="https://t.me/+… или https://t.me/addlist/…" value={sourceLink} onChange={(event) => setSourceLink(event.target.value)} /></label><button className="primary-action" disabled={busy || sourceLink.length < 5} onClick={previewSource}>Проверить ссылку</button>{sourcePreview && <div className="folder-list">{sourcePreview.peers.map((peer) => <label className={selectedPeerIds.includes(peer.canonical_peer_id) ? "selected" : ""} key={peer.canonical_peer_id}><input type="checkbox" checked={selectedPeerIds.includes(peer.canonical_peer_id)} onChange={(event) => setSelectedPeerIds((current) => event.target.checked ? [...current, peer.canonical_peer_id] : current.filter((id) => id !== peer.canonical_peer_id))} /><span><strong>{peer.title}</strong><small>{peer.source_type}{peer.participants_count ? ` · ${peer.participants_count} участников` : ""}</small></span></label>)}</div>}{sourcePreview && <button className="primary-action" disabled={busy || selectedPeerIds.length === 0} onClick={addSources}>{sourcePreview.requires_join ? "Вступить и подключить" : "Подключить выбранное"}</button>}{sources.map((source) => <div className="connection-row" key={source.id}><span>#</span><div><strong>{source.title}</strong><small>{source.type} · {source.added_via}</small></div><StatusBadge tone={source.enabled ? "success" : "neutral"}>{source.enabled ? "анализируется" : "выключено"}</StatusBadge></div>)}</Card>}
     </div>
   </section>;

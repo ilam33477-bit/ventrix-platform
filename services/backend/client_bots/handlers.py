@@ -43,6 +43,7 @@ from ..models import (
     InitialAnalysisRun,
     NotificationLog,
     OperationalProblem,
+    ProductEvent,
     Report,
     ReportMetric,
     ReportSection,
@@ -381,39 +382,67 @@ def build_client_router(
 
     @router.message(CommandStart())
     async def start(message: Message, client_context: ClientContext) -> None:
-        await record(client_context, "client_user_started_bot")
-        await record(client_context, "client_menu_opened")
         tenant = client_context.tenant
         async with events.session_factory() as session:
-            connection = await session.scalar(
-                select(TelegramConnection)
-                .where(
-                    TelegramConnection.tenant_id == tenant.id,
-                    TelegramConnection.deleted_at.is_(None),
+            connections = list(
+                await session.scalars(
+                    select(TelegramConnection)
+                    .where(
+                        TelegramConnection.tenant_id == tenant.id,
+                        TelegramConnection.deleted_at.is_(None),
+                        TelegramConnection.status.in_(("connected", "syncing", "ready")),
+                    )
+                    .order_by(TelegramConnection.created_at.desc())
                 )
-                .order_by(TelegramConnection.created_at.desc())
+            )
+            previous_start = await session.scalar(
+                select(ProductEvent)
+                .where(
+                    ProductEvent.tenant_id == tenant.id,
+                    ProductEvent.telegram_user_id == client_context.telegram_user_id,
+                    ProductEvent.event_name == "client_user_started_bot",
+                )
+                .order_by(ProductEvent.occurred_at.desc())
                 .limit(1)
             )
+            new_situations = 0
+            if previous_start is not None:
+                new_situations = int(
+                    await session.scalar(
+                        select(func.count(OperationalProblem.id)).where(
+                            OperationalProblem.tenant_id == tenant.id,
+                            OperationalProblem.created_at > previous_start.occurred_at,
+                            OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                        )
+                    )
+                    or 0
+                )
+        await record(client_context, "client_user_started_bot")
+        await record(client_context, "client_menu_opened")
         first_name = (tenant.owner_name or "").strip().split()[0] or "Здравствуйте"
         metrics = await key_metrics(tenant.id)
-        warning = ""
-        if connection is None or connection.status not in {"connected", "syncing", "ready"}:
-            warning = (
-                "\n\n⚠️ <b>Рабочий Telegram пока не подключён.</b>\n"
-                "Ventrix пока нечего анализировать. Подключить первый аккаунт можно в Mini App."
+        if connections:
+            activity = (
+                f"За время отсутствия найдено новых ситуаций: <b>{new_situations}</b>."
+                if new_situations
+                else "Ничего критичного не обнаружено. Продолжаем мониторинг."
             )
+            await message.answer(
+                f"<b>{escape(first_name)}, добрый день.</b>\n\n"
+                f"Ventrix продолжает следить за проектом <b>{escape(tenant.name)}</b>.\n\n"
+                f"<blockquote>{activity}\n\n"
+                f"Ситуации в работе: <b>{metrics['problems']}</b>\n"
+                f"Клиенты ждут ответа: <b>{metrics['waiting']}</b>\n"
+                f"Подключённые аккаунты: <b>{len(connections)}</b>\n"
+                f"Готовые сводки: <b>{metrics['reports']}</b></blockquote>",
+                reply_markup=client_main_menu(mini_app_url),
+            )
+            return
         await message.answer(
             f"<b>{escape(first_name)}, привет.</b>\n\n"
-            f"Ventrix настроен под работу команды <b>{escape(tenant.name)}</b>.\n\n"
-            "Мы будем следить за рабочими Telegram-переписками, обязательствами сотрудников, "
-            "клиентами без ответа и другими важными ситуациями.\n\n"
-            "Быстрая настройка займёт несколько минут."
-            f"\n\n<b>Сейчас в проекте</b>\n"
-            f"Ситуации в работе: <b>{metrics['problems']}</b>\n"
-            f"Клиенты ждут ответа: <b>{metrics['waiting']}</b>\n"
-            f"Сотрудники: <b>{metrics['employees']}</b>\n"
-            f"Готовые сводки: <b>{metrics['reports']}</b>"
-            f"{warning}",
+            f"Ventrix создан для команды <b>{escape(tenant.name)}</b>.\n"
+            "Подключите первый рабочий Telegram в Mini App, чтобы начать мониторинг.\n\n"
+            "<blockquote>Коды подтверждения и пароль 2FA не сохраняются. Рабочая сессия хранится в зашифрованном виде.</blockquote>",
             reply_markup=client_welcome_menu(mini_app_url),
         )
 
@@ -716,7 +745,10 @@ def build_client_router(
         )
         await render(
             query,
-            f"<b>📊 Ключевые показатели · {escape(tenant.name)}</b>\n\n<b>Сейчас требуют реакции</b>\nРабочие ситуации: <b>{live['problems']}</b>\nКлиенты ждут ответа: <b>{live['waiting']}</b>\n\n<b>Последняя рабочая сводка</b>\nИзучено сообщений: <b>{int(metrics.get('messages', 0))}</b>\nВажных ситуаций: <b>{int(metrics.get('high', 0))}</b>\nСреднего приоритета: <b>{int(metrics.get('medium', 0))}</b>\n\nПоследняя сводка: {last_report}\nСледующая проверка: {next_at}\n\n<i>«Время ответа» — срок, за который команда планирует отвечать клиенту. Он настраивается в Ventrix AI.</i>",
+            f"<b>📊 Ключевые показатели · {escape(tenant.name)}</b>\n\n"
+            f"<blockquote><b>Сейчас требуют реакции</b>\nРабочие ситуации: <b>{live['problems']}</b>\nКлиенты ждут ответа: <b>{live['waiting']}</b></blockquote>\n\n"
+            f"<blockquote><b>Последняя рабочая сводка</b>\nИзучено сообщений: <b>{int(metrics.get('messages', 0))}</b>\nВажных ситуаций: <b>{int(metrics.get('high', 0))}</b>\nСреднего приоритета: <b>{int(metrics.get('medium', 0))}</b>\n\nПоследняя сводка: {last_report}\nСледующая проверка: {next_at}</blockquote>",
+            main=True,
         )
 
     @router.callback_query(F.data == "client:important")
@@ -909,22 +941,150 @@ def build_client_router(
                 "TELEGRAM_API_ID и TELEGRAM_API_HASH. Обратитесь к администратору проекта.",
             )
             return
-        connection = await connection_service.get(client_context.tenant_id)
-        status = connection.status if connection else None
-        details = (
-            f"Аккаунт: {escape(connection.display_name or connection.phone_masked or 'подключён')}\n"
-            f"Состояние: {escape(status or 'не подключён')}\n"
-            f"История первого анализа: {connection.history_days} дней\n"
-            "Личные рабочие диалоги: автоматически"
-            if connection
-            else "Рабочий аккаунт ещё не подключён."
+        rows = [
+            item
+            for item in await connection_service.get_all(client_context.tenant_id)
+            if item.status
+            in {
+                "awaiting_code",
+                "awaiting_2fa",
+                "connected",
+                "syncing",
+                "ready",
+                "reauthorization_required",
+            }
+        ]
+        if not rows:
+            await edit_screen(
+                query,
+                "<b>Подключения Telegram</b>\n\nРабочие аккаунты ещё не подключены.",
+                connection_actions(None),
+            )
+            return
+        details = []
+        buttons = []
+        for index, item in enumerate(rows, start=1):
+            label = item.display_name or item.phone_masked or f"Аккаунт {index}"
+            details.append(f"<b>{index}. {escape(label)}</b>\nСтатус: {escape(item.status)}")
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{index}. {label[:28]}", callback_data=f"ctv:{item.id}"
+                    )
+                ]
+            )
+        buttons.append(
+            [InlineKeyboardButton(text="➕ Подключить аккаунт", callback_data="client:tg:intro")]
         )
+        buttons.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
         await edit_screen(
             query,
-            "<b>Подключение Telegram</b>\n\n"
-            f"{details}\n\nРабочие группы подключаются отдельно по ссылке.",
-            connection_actions(status),
+            f"<b>Подключения Telegram · {len(rows)}</b>\n\n<blockquote>{'\n\n'.join(details)}</blockquote>\n\nВыберите аккаунт, чтобы проверить его статистику и состояние.",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
         )
+
+    @router.callback_query(F.data.startswith("ctv:"))
+    async def connection_detail(query: CallbackQuery, client_context: ClientContext) -> None:
+        connection_id = (query.data or "").split(":", 1)[1]
+        connection = (
+            await connection_service.get(client_context.tenant_id, connection_id)
+            if connection_service
+            else None
+        )
+        if connection is None:
+            await query.answer("Аккаунт не найден", show_alert=True)
+            return
+        async with events.session_factory() as session:
+            employee = (
+                await session.get(Employee, connection.assigned_employee_id)
+                if connection.assigned_employee_id
+                else None
+            )
+            dialogs = int(
+                await session.scalar(
+                    select(func.count(TelegramDialog.id)).where(
+                        TelegramDialog.connection_id == connection.id,
+                        TelegramDialog.dialog_type == "personal",
+                        TelegramDialog.excluded.is_(False),
+                    )
+                )
+                or 0
+            )
+            today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            messages = int(
+                await session.scalar(
+                    select(func.count(TelegramMessage.id)).where(
+                        TelegramMessage.connection_id == connection.id,
+                        TelegramMessage.sent_at >= today,
+                        TelegramMessage.deleted_at.is_(None),
+                    )
+                )
+                or 0
+            )
+            contacts = int(
+                await session.scalar(
+                    select(func.count(TelegramDialog.id)).where(
+                        TelegramDialog.connection_id == connection.id,
+                        TelegramDialog.dialog_type == "personal",
+                        TelegramDialog.created_at >= today,
+                    )
+                )
+                or 0
+            )
+        await edit_screen(
+            query,
+            f"<b>{escape(connection.display_name or connection.phone_masked or 'Telegram')}</b>\n\n"
+            f"<blockquote>Сотрудник: <b>{escape(employee.display_name if employee else 'общий аккаунт')}</b>\nСтатус: <b>{escape(connection.status)}</b>\nЛичных диалогов: <b>{dialogs}</b>\nСообщений сегодня: <b>{messages}</b>\nНовых контактов сегодня: <b>{contacts}</b>\nПоследняя синхронизация: {connection.last_sync_at.strftime('%d.%m.%Y %H:%M') if connection.last_sync_at else 'ещё не было'}</blockquote>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Отключить аккаунт", callback_data=f"ctd:{connection.id}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="← Подключения", callback_data="client:connections"
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("ctd:"))
+    async def connection_disconnect_confirm(
+        query: CallbackQuery, client_context: ClientContext
+    ) -> None:
+        connection_id = (query.data or "").split(":", 1)[1]
+        connection = (
+            await connection_service.get(client_context.tenant_id, connection_id)
+            if connection_service
+            else None
+        )
+        if connection is None:
+            await query.answer("Аккаунт не найден", show_alert=True)
+            return
+        await edit_screen(
+            query,
+            "<b>Отключить этот аккаунт?</b>\n\nСессия будет удалена после подтверждения.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Подтвердить отключение", callback_data=f"ctdc:{connection.id}"
+                        )
+                    ],
+                    [InlineKeyboardButton(text="← Назад", callback_data=f"ctv:{connection.id}")],
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("ctdc:"))
+    async def connection_disconnect(query: CallbackQuery, client_context: ClientContext) -> None:
+        connection_id = (query.data or "").split(":", 1)[1]
+        if connection_service:
+            await connection_service.disconnect(client_context.tenant_id, connection_id)
+        await connections(query, client_context)
 
     @router.callback_query(F.data == "client:tg:intro")
     async def connection_intro(query: CallbackQuery) -> None:
@@ -1519,17 +1679,16 @@ def build_client_router(
         await edit_screen(
             query,
             f"<b>Настройки проекта</b>\n\n"
-            f"Компания: {escape(tenant.name)}\n"
-            f"Ниша: {escape(tenant.niche)}\n"
-            f"Рабочие часы: {escape(_hours(tenant.settings.working_hours))}\n"
-            f"Плановое время ответа клиенту: {tenant.settings.response_sla_minutes} мин.\n"
-            f"Время отчёта: {tenant.settings.daily_report_time:%H:%M}\n"
-            f"Часовой пояс: {escape(tenant.settings.timezone)}\n\n"
-            f"Создавать ситуацию при уверенности: {tenant.settings.signal_problem_threshold}/100\n"
-            f"Срочно уведомлять при важности: {tenant.settings.signal_immediate_threshold}/100\n"
-            f"Уведомления сотрудников: {'включены' if tenant.settings.employee_notifications_enabled else 'выключены'}\n"
-            f"Напоминания в группах: {'включены' if tenant.settings.group_reminders_enabled else 'выключены'}\n\n"
-            f"<b>Доступ к системе</b>\n{escape(_access_status(tenant))}\n\n<i>Изменить расписание и чувствительность можно в Mini App.</i>",
+            f"<blockquote><b>Компания</b>\n{escape(tenant.name)}\n\n"
+            f"<b>Направление</b>\n{escape(tenant.niche)}\n\n"
+            f"<b>Расписание</b>\nРабочие часы: {escape(_hours(tenant.settings.working_hours))}\n"
+            f"Плановое время ответа: {tenant.settings.response_sla_minutes} мин.\n"
+            f"Сводка: {tenant.settings.daily_report_time:%H:%M} · {escape(tenant.settings.timezone)}</blockquote>\n\n"
+            f"<blockquote><b>Уведомления</b>\nСоздавать ситуацию: {tenant.settings.signal_problem_threshold}/100\n"
+            f"Присылать срочно: {tenant.settings.signal_immediate_threshold}/100\n"
+            f"Сотрудникам: {'включены' if tenant.settings.employee_notifications_enabled else 'выключены'}\n"
+            f"В группы: {'включены' if tenant.settings.group_reminders_enabled else 'выключены'}</blockquote>\n\n"
+            f"<blockquote><b>Доступ к системе</b>\n{escape(_access_status(tenant))}</blockquote>\n\n<i>Изменить расписание и чувствительность можно в Mini App.</i>",
             settings_markup(),
         )
 
@@ -1549,9 +1708,9 @@ def build_client_router(
         ]
         await edit_screen(
             query,
-            "<b>👥 Команда</b>\n\n"
+            "<b>👥 Команда</b>\n\n<blockquote>"
             + ("\n\n".join(lines) if lines else "Сотрудники ещё не добавлены.")
-            + "\n\n<i>Роль сотрудников фиксирована. Username и рабочая Telegram-сессия настраиваются в Ventrix AI.</i>",
+            + "</blockquote>\n\n<i>Новый сотрудник добавляется по номеру телефона в Ventrix AI; профиль определяется после входа.</i>",
             settings_markup(),
         )
 

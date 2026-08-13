@@ -221,6 +221,7 @@ class CommitmentPatch(BaseModel):
 class TelegramLoginStart(BaseModel):
     phone: str = Field(min_length=8, max_length=24)
     employee_id: str | None = None
+    create_employee: bool = False
 
     @field_validator("phone")
     @classmethod
@@ -966,6 +967,37 @@ async def problems(
     else:
         rows = [item for item in rows if item.status in ACTIVE_PROBLEM_STATUSES]
     rows = [item for item in rows if can_read_problem(context, item)]
+    employee_ids = {item.responsible_employee_id for item in rows if item.responsible_employee_id}
+    connection_ids = {item.connection_id for item in rows if item.connection_id}
+    dialog_ids = {item.dialog_id for item in rows if item.dialog_id}
+    employee_map = (
+        {
+            item.id: item
+            for item in await session.scalars(select(Employee).where(Employee.id.in_(employee_ids)))
+        }
+        if employee_ids
+        else {}
+    )
+    connection_map = (
+        {
+            item.id: item
+            for item in await session.scalars(
+                select(TelegramConnection).where(TelegramConnection.id.in_(connection_ids))
+            )
+        }
+        if connection_ids
+        else {}
+    )
+    dialog_map = (
+        {
+            item.id: item
+            for item in await session.scalars(
+                select(TelegramDialog).where(TelegramDialog.id.in_(dialog_ids))
+            )
+        }
+        if dialog_ids
+        else {}
+    )
     return [
         {
             "id": item.id,
@@ -977,6 +1009,21 @@ async def problems(
             "explanation": item.explanation,
             "recommended_action": item.recommended_action,
             "responsible_employee_id": item.responsible_employee_id,
+            "responsible_employee_name": (
+                employee_map[item.responsible_employee_id].display_name
+                if item.responsible_employee_id in employee_map
+                else None
+            ),
+            "connection_name": (
+                connection_map[item.connection_id].display_name
+                or connection_map[item.connection_id].username
+                or connection_map[item.connection_id].phone_masked
+                if item.connection_id in connection_map
+                else None
+            ),
+            "dialog_username": (
+                dialog_map[item.dialog_id].username if item.dialog_id in dialog_map else None
+            ),
             "deadline_at": item.deadline_at,
             "occurred_at": item.occurred_at,
         }
@@ -1046,6 +1093,8 @@ async def problem_detail(
         if item.responsible_employee_id
         else None
     )
+    connection = await session.get(TelegramConnection, item.connection_id)
+    dialog = await session.get(TelegramDialog, item.dialog_id)
     await record_event(session, context, "problem_opened", {"problem_id": item.id})
     await session.commit()
     return {
@@ -1059,6 +1108,14 @@ async def problem_detail(
         "recommended_action": item.recommended_action,
         "responsible_employee_id": item.responsible_employee_id,
         "responsible_employee_name": responsible.display_name if responsible else None,
+        "connection_name": (
+            connection.display_name or connection.username or connection.phone_masked
+            if connection
+            else None
+        ),
+        "connection_username": connection.username if connection else None,
+        "dialog_title": dialog.title if dialog else None,
+        "dialog_username": dialog.username if dialog else None,
         "deadline_at": item.deadline_at,
         "closed_reason": item.closed_reason,
         "resolution_evidence": item.resolution_evidence,
@@ -1252,20 +1309,63 @@ async def connections(
             .order_by(TelegramConnection.created_at.desc())
         )
     )
-    return [
-        {
-            "id": item.id,
-            "status": item.status,
-            "account": item.display_name or item.phone_masked,
-            "username": item.username,
-            "health_status": item.health_status,
-            "last_health_check_at": item.last_health_check_at,
-            "last_sync_at": item.last_sync_at,
-            "folder": item.selected_folder_title,
-            **login_delivery_payload(item),
-        }
-        for item in rows
-    ]
+    day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    result: list[dict[str, Any]] = []
+    for item in rows:
+        employee = (
+            await session.get(Employee, item.assigned_employee_id)
+            if item.assigned_employee_id
+            else None
+        )
+        personal_dialogs = int(
+            await session.scalar(
+                select(func.count(TelegramDialog.id)).where(
+                    TelegramDialog.connection_id == item.id,
+                    TelegramDialog.dialog_type == "personal",
+                    TelegramDialog.excluded.is_(False),
+                )
+            )
+            or 0
+        )
+        new_contacts_today = int(
+            await session.scalar(
+                select(func.count(TelegramDialog.id)).where(
+                    TelegramDialog.connection_id == item.id,
+                    TelegramDialog.dialog_type == "personal",
+                    TelegramDialog.created_at >= day_start,
+                )
+            )
+            or 0
+        )
+        messages_today = int(
+            await session.scalar(
+                select(func.count(TelegramMessage.id)).where(
+                    TelegramMessage.connection_id == item.id,
+                    TelegramMessage.sent_at >= day_start,
+                    TelegramMessage.deleted_at.is_(None),
+                )
+            )
+            or 0
+        )
+        result.append(
+            {
+                "id": item.id,
+                "status": item.status,
+                "account": item.display_name or item.phone_masked,
+                "username": item.username,
+                "health_status": item.health_status,
+                "last_health_check_at": item.last_health_check_at,
+                "last_sync_at": item.last_sync_at,
+                "folder": item.selected_folder_title,
+                "employee_id": item.assigned_employee_id,
+                "employee_name": employee.display_name if employee else None,
+                "personal_dialogs": personal_dialogs,
+                "new_contacts_today": new_contacts_today,
+                "messages_today": messages_today,
+                **login_delivery_payload(item),
+            }
+        )
+    return result
 
 
 def login_delivery_payload(connection: TelegramConnection) -> dict[str, Any]:
@@ -1307,6 +1407,10 @@ async def start_connection_login(
             payload.phone,
             assigned_employee_id=employee.id if employee else None,
         )
+        if payload.create_employee:
+            connection.progress_json = {**(connection.progress_json or {}), "create_employee": True}
+            session.add(connection)
+            await session.commit()
     except TelegramFloodWait as exc:
         raise HTTPException(
             status_code=429,
@@ -1441,6 +1545,34 @@ async def complete_connection_login(
             cost_class="light",
             max_attempts=8,
         )
+        if (getattr(connection, "progress_json", None) or {}).get(
+            "create_employee"
+        ) and not getattr(connection, "assigned_employee_id", None):
+            employee = await session.scalar(
+                select(Employee).where(
+                    Employee.tenant_id == context.tenant.id,
+                    Employee.telegram_user_id == connection.telegram_user_id,
+                )
+            )
+            if employee is None:
+                employee = Employee(
+                    tenant_id=context.tenant.id,
+                    display_name=connection.display_name or connection.username or "Сотрудник",
+                    telegram_user_id=connection.telegram_user_id,
+                    telegram_username=connection.username,
+                    role="employee",
+                    status="active",
+                    notifications_enabled=True,
+                    criticality_threshold=85,
+                )
+                session.add(employee)
+                await session.flush()
+            else:
+                employee.status = "active"
+                employee.display_name = connection.display_name or employee.display_name
+                employee.telegram_username = connection.username or employee.telegram_username
+            connection.assigned_employee_id = employee.id
+            await sync_employee_membership(session, employee)
         await reconcile_connected_onboarding(session, tenant_settings, connection)
         logger.info(
             "Telegram authorization completed tenant_id=%s connection_id=%s preparation_job_id=%s",
@@ -1758,7 +1890,7 @@ async def employees(
 ) -> list[dict[str, Any]]:
     if context.membership.role == "observer" and not context.allows("employees.read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    employee_filters = [Employee.tenant_id == context.tenant.id]
+    employee_filters = [Employee.tenant_id == context.tenant.id, Employee.status == "active"]
     if context.membership.role == "employee":
         employee_filters.append(Employee.id == context.membership.employee_id)
     rows = list(
@@ -1784,9 +1916,66 @@ async def employees(
                     )
                 )
             ),
+            "connection_id": await session.scalar(
+                select(TelegramConnection.id)
+                .where(
+                    TelegramConnection.tenant_id == context.tenant.id,
+                    TelegramConnection.assigned_employee_id == item.id,
+                    TelegramConnection.deleted_at.is_(None),
+                    TelegramConnection.status.in_(
+                        ("connected", "syncing", "ready", "reauthorization_required")
+                    ),
+                )
+                .order_by(TelegramConnection.created_at.desc())
+                .limit(1)
+            ),
         }
         for item in rows
     ]
+
+
+@router.delete("/employees/{employee_id}")
+async def delete_employee(
+    employee_id: str,
+    context: ClientContext,
+    connection_service: TelegramConnectionService = Depends(get_client_connection_service),  # noqa: B008
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, bool]:
+    require_permission(context, "employees.manage")
+    employee = await session.scalar(
+        select(Employee).where(
+            Employee.id == employee_id,
+            Employee.tenant_id == context.tenant.id,
+            Employee.status == "active",
+        )
+    )
+    if employee is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    connection_ids = list(
+        await session.scalars(
+            select(TelegramConnection.id).where(
+                TelegramConnection.tenant_id == context.tenant.id,
+                TelegramConnection.assigned_employee_id == employee.id,
+                TelegramConnection.deleted_at.is_(None),
+            )
+        )
+    )
+    for connection_id in connection_ids:
+        await connection_service.disconnect(context.tenant.id, connection_id)
+    employee.status = "inactive"
+    memberships = list(
+        await session.scalars(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == context.tenant.id,
+                TenantMembership.employee_id == employee.id,
+            )
+        )
+    )
+    for membership in memberships:
+        membership.status = "revoked"
+    await record_event(session, context, "employee_deleted", {"employee_id": employee.id})
+    await session.commit()
+    return {"deleted": True}
 
 
 @router.post("/employees", status_code=status.HTTP_201_CREATED)

@@ -16,6 +16,19 @@ import type { TabId } from "./types";
 export function MiniAppRoot() {
   const { launchState, session, api, error, refresh, advanceOnboarding } = useMiniAppSession();
   const [activeTab, setActiveTab] = useState<TabId>("dashboard");
+  const [history, setHistory] = useState<TabId[]>([]);
+  const primary = new Set<TabId>(["dashboard", "problems", "statistics", "employees", "more"]);
+  function navigate(tab: TabId) {
+    if (tab !== activeTab) setHistory((current) => [...current, activeTab].slice(-8));
+    setActiveTab(tab);
+  }
+  function goBack() {
+    setHistory((current) => {
+      const previous = current.at(-1) ?? "more";
+      setActiveTab(previous);
+      return current.slice(0, -1);
+    });
+  }
 
   if (launchState === "outside_telegram") {
     return <main className="state-shell"><section className="state-card"><p className="eyebrow">VENTRIX MINI APP</p><h1>Откройте Ventrix через вашего Telegram-бота</h1><p>Эта панель безопасно определяет ваш проект по подписанным данным Telegram. Откройте клиентского бота и нажмите «Ventrix AI».</p><div className="launch-hint"><span>1</span><p>Откройте бот вашего проекта</p><span>2</span><p>Нажмите «Ventrix AI»</p></div></section></main>;
@@ -34,17 +47,17 @@ export function MiniAppRoot() {
   const content = (() => {
     switch (activeTab) {
       case "problems": return <ProblemsView api={api} />;
-      case "commitments": return <CommitmentsView api={api} onOpenProblem={() => setActiveTab("problems")} />;
+      case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
       case "statistics": return <StatisticsView summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;
       case "employees": return <EmployeesView api={api} />;
       case "connections": return <ConnectionManager api={api} connections={session.bootstrap.connections} />;
       case "groups": return <GroupsView api={api} />;
       case "settings": return <SettingsView api={api} />;
-      case "more": return <MoreView onNavigate={setActiveTab} />;
-      default: return <DashboardView summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => setActiveTab("problems")} />;
+      case "more": return <MoreView onNavigate={navigate} />;
+      default: return <DashboardView summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => navigate("problems")} />;
     }
   })();
 
-  return <MiniAppShell auth={session.auth} active={activeTab} onNavigate={setActiveTab}>{content}</MiniAppShell>;
+  return <MiniAppShell auth={session.auth} active={activeTab} onNavigate={navigate} canGoBack={!primary.has(activeTab) && history.length > 0} onBack={goBack}>{content}</MiniAppShell>;
 }

@@ -149,6 +149,10 @@ export class VentrixClientApi {
     });
   }
 
+  deleteEmployee(employeeId: string) {
+    return this.request<{ deleted: boolean }>(`/employees/${employeeId}`, { method: "DELETE" });
+  }
+
   settings() {
     return this.request<ClientSettings>("/settings");
   }
@@ -173,7 +177,7 @@ export class VentrixClientApi {
     });
   }
 
-  startTelegramLogin(phone: string, employeeId: string | null) {
+  startTelegramLogin(phone: string, employeeId: string | null, createEmployee = false) {
     return this.request<{
       id: string;
       phone_masked: string;
@@ -182,7 +186,7 @@ export class VentrixClientApi {
       resend_available_in: number;
     }>("/connections/login/start", {
       method: "POST",
-      body: JSON.stringify({ phone, employee_id: employeeId }),
+      body: JSON.stringify({ phone, employee_id: employeeId, create_employee: createEmployee }),
     });
   }
 

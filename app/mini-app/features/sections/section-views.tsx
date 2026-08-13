@@ -1,12 +1,13 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import type * as React from "react";
 
 import type { VentrixClientApi } from "../../api/client";
 import { Card, EmptyState, SectionHeading, Skeleton, StatusBadge } from "../../components/ui";
 import { ConnectionManager } from "../connections/connection-manager";
 import { useResource } from "../../hooks/use-resource";
-import type { ClientSettings, Employee, ReportDetail, TabId } from "../../types";
+import type { ClientSettings, ReportDetail, TabId } from "../../types";
 
 export function ReportsView({ api }: { api: VentrixClientApi }) {
   const loader = useCallback(() => api.reports(), [api]);
@@ -24,42 +25,31 @@ function Metric({ value, label }: { value: number; label: string }) { return <Ca
 function ReportRow({ label, value }: { label: string; value: unknown }) { return <p><span>{label}</span><strong>{String(value ?? 0)}</strong></p>; }
 function ReportObject({ value }: { value: Record<string, unknown> }) { const rows = Array.isArray(value.rows) ? value.rows as Array<Record<string, unknown>> : []; return rows.length ? <div className="report-employee-list">{rows.map((row, index) => <div key={String(row.employee_id ?? index)}><strong>{String(row.name ?? "Сотрудник")}</strong><span>Открытые обещания: {String(row.open_promises ?? 0)}</span><span>Клиенты ждут: {String(row.clients_waiting ?? 0)}</span><span>Решено: {String(row.resolved ?? 0)}</span></div>)}</div> : <p className="muted-copy">Данных по сотрудникам пока нет.</p>; }
 
-function EmployeeEditor({ api, employee, done }: { api: VentrixClientApi; employee?: Employee; done: (created?: Pick<Employee, "id" | "name">) => void }) {
-  const [username, setUsername] = useState(employee?.telegram_username ?? "");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  async function save() {
-    setBusy(true); setError("");
-    const normalizedUsername = username.trim().replace(/^@+/, "");
-    try {
-      if (employee) {
-        await api.updateEmployee(employee.id, { telegram_username: normalizedUsername });
-        done();
-      } else {
-        const created = await api.createEmployee({
-          display_name: normalizedUsername,
-          telegram_username: normalizedUsername,
-          role: "employee",
-          notifications_enabled: true,
-          criticality_threshold: 85,
-        });
-        done({ id: created.id, name: normalizedUsername });
-      }
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Не удалось сохранить"); } finally { setBusy(false); }
-  }
-  const validUsername = /^[A-Za-z0-9_]{3,64}$/.test(username.trim().replace(/^@+/, ""));
-  return <Card className="control-form employee-editor"><h3>{employee ? "Изменить сотрудника" : "Новый сотрудник"}</h3><p>Укажите только Telegram username. Числовой Telegram ID Ventrix определит после первого входа сотрудника.</p><label>Telegram username<div className="username-input"><span>@</span><input autoCapitalize="none" autoCorrect="off" value={username.replace(/^@+/, "")} onChange={(event) => setUsername(event.target.value.replace(/[^A-Za-z0-9_@]/g, ""))} placeholder="username" /></div></label><div className="fixed-role"><small>Роль</small><strong>Сотрудник</strong><span>Доступ к данным других сотрудников не выдаётся.</span></div>{username && !validUsername && <p className="field-hint">Используйте латинские буквы, цифры и знак подчёркивания.</p>}{error && <p className="form-error">{error}</p>}<div className="form-actions"><button onClick={() => done()}>Отмена</button><button className="primary-action" disabled={busy || !validUsername} onClick={() => void save()}>{busy ? "Сохраняем…" : employee ? "Сохранить" : "Создать и подключить"}</button></div></Card>;
+const UTC_OPTIONS = Array.from({ length: 27 }, (_, index) => index - 12);
+function offsetTimezone(offset: number) { return offset === 0 ? "Etc/UTC" : `Etc/GMT${offset > 0 ? "-" : "+"}${Math.abs(offset)}`; }
+function timezoneOffset(timezone: string) {
+  if (timezone === "Etc/UTC" || timezone === "UTC") return 0;
+  if (timezone === "Europe/Moscow") return 3;
+  const match = timezone.match(/^Etc\/GMT([+-])(\d+)$/);
+  return match ? (match[1] === "-" ? Number(match[2]) : -Number(match[2])) : 3;
 }
+function utcLabel(offset: number) { return `UTC${offset >= 0 ? "+" : ""}${offset}`; }
 
 export function EmployeesView({ api }: { api: VentrixClientApi }) {
   const loader = useCallback(() => api.employees(), [api]);
   const { data, loading, error, reload } = useResource(loader);
-  const [editing, setEditing] = useState<Employee | "new" | null>(null);
-  const [connecting, setConnecting] = useState<Pick<Employee, "id" | "name"> | null>(null);
-  const done = (created?: Pick<Employee, "id" | "name">) => { setEditing(null); if (created) setConnecting(created); void reload(); };
-  if (connecting) return <><SectionHeading eyebrow="КОМАНДА" title={`Telegram @${connecting.name}`} description="Код придёт в официальный служебный чат Telegram подключаемого аккаунта." /><button className="text-action section-back" onClick={() => { setConnecting(null); void reload(); }}>← Вернуться к сотрудникам</button><ConnectionManager api={api} connections={[]} assignedEmployee={connecting} /></>;
-  if (editing) return <><SectionHeading eyebrow="КОМАНДА" title="Доступ сотрудника" /><EmployeeEditor api={api} employee={editing === "new" ? undefined : editing} done={done} /></>;
-  return <><SectionHeading eyebrow="КОМАНДА" title="Сотрудники и доступ" description="Добавьте @username и при необходимости подключите рабочую Telegram-сессию сотрудника." /><button className="primary-action section-action" onClick={() => setEditing("new")}>Добавить сотрудника</button>{loading ? <Skeleton lines={4} /> : data?.length ? <div className="section-list">{data.map((item) => <Card className="employee-card" key={item.id}><div className="person-row"><span>{item.name.slice(0, 2).toUpperCase()}</span><div><h3>{item.telegram_username ? `@${item.telegram_username}` : item.name}</h3><p>Роль: сотрудник · доступ {item.access_status ?? "не связан"}</p></div><StatusBadge tone={item.status === "active" ? "success" : "neutral"}>{item.status === "active" ? "активен" : "неактивен"}</StatusBadge></div><div className="employee-actions"><button onClick={() => setEditing(item)}>Изменить username</button><button className="primary-action" onClick={() => setConnecting({ id: item.id, name: item.telegram_username ?? item.name })}>Подключить Telegram</button></div></Card>)}</div> : <EmptyState title="Сотрудники ещё не добавлены" description="Добавьте Telegram username — числовой ID вводить не нужно." />}{error && <p className="form-error">{error}</p>}</>;
+  const [adding, setAdding] = useState(false);
+  const [connecting, setConnecting] = useState<{ id: string; name: string } | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  async function remove(employeeId: string) {
+    if (deleting !== employeeId) { setDeleting(employeeId); return; }
+    await api.deleteEmployee(employeeId);
+    setDeleting(null);
+    await reload();
+  }
+  if (adding) return <><SectionHeading eyebrow="КОМАНДА" title="Новый сотрудник" description="Имя, username и Telegram ID будут получены из подтверждённой сессии." /><button className="text-action section-back" onClick={() => setAdding(false)}>← Вернуться к сотрудникам</button><ConnectionManager api={api} connections={[]} createEmployee onComplete={() => { setAdding(false); void reload(); }} /></>;
+  if (connecting) return <><SectionHeading eyebrow="КОМАНДА" title={`Telegram · ${connecting.name}`} description="Код придёт в официальный служебный чат подключаемого аккаунта." /><button className="text-action section-back" onClick={() => { setConnecting(null); void reload(); }}>← Вернуться к сотрудникам</button><ConnectionManager api={api} connections={[]} assignedEmployee={connecting} onComplete={() => { setConnecting(null); void reload(); }} /></>;
+  return <><SectionHeading eyebrow="КОМАНДА" title="Сотрудники и доступ" description="Новый сотрудник добавляется по номеру телефона. Данные профиля определяются после входа в Telegram." /><button className="primary-action section-action" onClick={() => setAdding(true)}>Добавить сотрудника по номеру</button>{loading ? <Skeleton lines={4} /> : data?.length ? <div className="section-list">{data.map((item) => <Card className="employee-card" key={item.id}><div className="person-row"><span>{item.name.slice(0, 2).toUpperCase()}</span><div><h3>{item.name}</h3><p>{item.telegram_username ? `@${item.telegram_username}` : "username не указан"} · роль: сотрудник</p></div><StatusBadge tone={item.connection_id ? "success" : "warning"}>{item.connection_id ? "подключён" : "нет сессии"}</StatusBadge></div><div className="employee-actions">{item.connection_id ? <button className="danger-action" onClick={() => void remove(item.id)}>{deleting === item.id ? "Подтвердить удаление" : "Удалить сотрудника и сессию"}</button> : <button className="primary-action" onClick={() => setConnecting({ id: item.id, name: item.name })}>Подключить Telegram</button>}{deleting === item.id && <button onClick={() => setDeleting(null)}>Отмена</button>}</div></Card>)}</div> : <EmptyState title="Сотрудники ещё не добавлены" description="Нажмите «Добавить сотрудника по номеру» и подтвердите вход в Telegram." />}{error && <p className="form-error">{error}</p>}</>;
 }
 
 export function CommitmentsView({ api, onOpenProblem }: { api: VentrixClientApi; onOpenProblem: () => void }) {
@@ -82,13 +72,13 @@ function SettingsForm({ api, settings, saved }: { api: VentrixClientApi; setting
   const patch = <K extends keyof ClientSettings>(key: K, next: ClientSettings[K]) => setValue((current) => ({ ...current, [key]: next }));
   async function save() { try { saved(await api.updateSettings({ timezone: value.timezone, daily_report_time: value.daily_report_time, analysis_enabled: value.analysis_enabled, history_window_days: value.history_window_days, signal_problem_threshold: value.signal_problem_threshold, signal_immediate_threshold: value.signal_immediate_threshold, manager_notification_threshold: value.manager_notification_threshold, employee_notification_threshold: value.employee_notification_threshold, group_notification_threshold: value.group_notification_threshold, notification_immediate_threshold: value.notification_immediate_threshold, employee_notifications_enabled: value.employee_notifications_enabled, group_reminders_enabled: value.group_reminders_enabled })); } catch (cause) { setError(cause instanceof Error ? cause.message : "Не удалось сохранить"); } }
   const controls = [{ key: "signal_problem_threshold" as const, title: "Создавать рабочую ситуацию", note: "Чем выше значение, тем строже Ventrix отсеивает сомнительные случаи." }, { key: "notification_immediate_threshold" as const, title: "Присылать срочно", note: "Ситуации выше этого уровня сразу приходят в Telegram." }, { key: "employee_notification_threshold" as const, title: "Уведомлять сотрудника", note: "Минимальная важность для персонального уведомления ответственному." }];
-  return <div className="section-list"><Card className="control-form"><h3>Регулярная сводка</h3><p className="settings-note">Отчёт формируется только при наличии новых рабочих сообщений.</p><label>Время отправки<input type="time" value={value.daily_report_time.slice(0, 5)} onChange={(event) => patch("daily_report_time", event.target.value)} /></label><label>Часовой пояс<input value={value.timezone} onChange={(event) => patch("timezone", event.target.value)} /></label><label>Период анализа<select value={value.history_window_days} onChange={(event) => patch("history_window_days", Number(event.target.value))}><option value="7">Последние 7 дней</option><option value="14">Последние 14 дней</option><option value="30">Последние 30 дней</option></select></label><label className="inline-check"><input type="checkbox" checked={value.analysis_enabled} onChange={(event) => patch("analysis_enabled", event.target.checked)} /> Регулярный анализ включён</label></Card><Card className="control-form threshold-settings"><h3>Чувствительность</h3><p className="settings-note">0 — показывать больше, 100 — только случаи с высокой уверенностью.</p>{controls.map((control) => <label key={control.key}><span>{control.title}<strong>{value[control.key]}/100</strong></span><small>{control.note}</small><input type="range" min="30" max="95" value={value[control.key]} onChange={(event) => patch(control.key, Number(event.target.value))} /></label>)}<label className="inline-check"><input type="checkbox" checked={value.employee_notifications_enabled} onChange={(event) => patch("employee_notifications_enabled", event.target.checked)} /> Уведомлять ответственных сотрудников</label><label className="inline-check"><input type="checkbox" checked={value.group_reminders_enabled} onChange={(event) => patch("group_reminders_enabled", event.target.checked)} /> Разрешить напоминания в рабочих группах</label></Card>{error && <p className="form-error">{error}</p>}<button className="primary-action" onClick={() => void save()}>Сохранить настройки</button></div>;
+  return <div className="section-list"><Card className="control-form"><h3>Регулярная сводка</h3><p className="settings-note">Отчёт формируется только при наличии новых рабочих сообщений.</p><label>Время отправки<input type="time" value={value.daily_report_time.slice(0, 5)} onChange={(event) => patch("daily_report_time", event.target.value)} /></label><label>Часовой пояс<select value={timezoneOffset(value.timezone)} onChange={(event) => patch("timezone", offsetTimezone(Number(event.target.value)))}>{UTC_OPTIONS.map((offset) => <option key={offset} value={offset}>{utcLabel(offset)}</option>)}</select><small>Выберите разницу с UTC. Для Москвы — UTC+3.</small></label><label>Период анализа<select value={value.history_window_days} onChange={(event) => patch("history_window_days", Number(event.target.value))}><option value="7">Последние 7 дней</option><option value="14">Последние 14 дней</option><option value="30">Последние 30 дней</option></select></label><label className="inline-check"><input type="checkbox" checked={value.analysis_enabled} onChange={(event) => patch("analysis_enabled", event.target.checked)} /> Регулярный анализ включён</label></Card><Card className="control-form threshold-settings"><h3>Чувствительность</h3><p className="settings-note">Чем выше значение, тем строже отбор и тем меньше сомнительных уведомлений.</p>{controls.map((control) => <label key={control.key}><span>{control.title}<strong>{value[control.key]}/100</strong></span><small>{control.note}</small><input type="range" min="30" max="95" value={value[control.key]} style={{ "--range-progress": `${((value[control.key] - 30) / 65) * 100}%` } as React.CSSProperties} onChange={(event) => patch(control.key, Number(event.target.value))} /></label>)}<label className="inline-check"><input type="checkbox" checked={value.employee_notifications_enabled} onChange={(event) => patch("employee_notifications_enabled", event.target.checked)} /> Уведомлять ответственных сотрудников</label><label className="inline-check"><input type="checkbox" checked={value.group_reminders_enabled} onChange={(event) => patch("group_reminders_enabled", event.target.checked)} /> Разрешить напоминания в рабочих группах</label></Card>{error && <p className="form-error">{error}</p>}<button className="primary-action" onClick={() => void save()}>Сохранить настройки</button></div>;
 }
 
 export function SettingsView({ api }: { api: VentrixClientApi }) {
   const loader = useCallback(() => api.settings(), [api]);
   const { data, loading, error, reload } = useResource(loader);
-  return <><SectionHeading eyebrow="НАСТРОЙКИ" title="Операционные настройки" description="Расписание, timezone и политика уведомлений. Секреты и model routing остаются у владельца платформы." />{loading ? <Skeleton /> : data ? <SettingsForm api={api} settings={data} saved={() => void reload()} /> : <EmptyState title="Настройки недоступны" description="Для этого раздела нужна роль владельца или менеджера." />}{error && <p className="form-error">{error}</p>}</>;
+  return <><SectionHeading eyebrow="НАСТРОЙКИ" title="Расписание и уведомления" description="Настройте время сводки и насколько строго Ventrix отбирает рабочие ситуации." />{loading ? <Skeleton /> : data ? <SettingsForm api={api} settings={data} saved={() => void reload()} /> : <EmptyState title="Настройки недоступны" description="Для этого раздела нужна роль владельца или менеджера." />}{error && <p className="form-error">{error}</p>}</>;
 }
 
 export function MoreView({ onNavigate }: { onNavigate: (tab: TabId) => void }) {

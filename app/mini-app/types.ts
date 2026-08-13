@@ -77,6 +77,9 @@ export type Problem = {
   recommended_action: string;
   status: ProblemStatus;
   responsible_employee_id: string | null;
+  responsible_employee_name?: string | null;
+  connection_name?: string | null;
+  dialog_username?: string | null;
   deadline_at: string | null;
   occurred_at: string;
 };
@@ -88,6 +91,8 @@ export type ProblemStatus =
 
 export type ProblemDetail = Problem & {
   responsible_employee_name: string | null;
+  connection_username: string | null;
+  dialog_title: string | null;
   context_messages: Array<{
     id: string;
     text: string;
@@ -141,6 +146,11 @@ export type TelegramConnection = {
   code_delivery_method?: string;
   next_code_delivery_method?: string | null;
   resend_available_in?: number;
+  employee_id?: string | null;
+  employee_name?: string | null;
+  personal_dialogs?: number;
+  new_contacts_today?: number;
+  messages_today?: number;
 };
 
 export type Employee = {
@@ -153,6 +163,7 @@ export type Employee = {
   notifications_enabled: boolean;
   criticality_threshold: number;
   access_status?: string | null;
+  connection_id?: string | null;
 };
 
 export type GroupIntegration = {

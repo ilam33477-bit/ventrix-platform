@@ -22,6 +22,7 @@ from ..models import (
     NotificationLog,
     OperationalProblem,
     Signal,
+    TelegramConnection,
     TelegramDialog,
     TelegramMessage,
     Tenant,
@@ -312,6 +313,11 @@ class NotificationOrchestrator:
                 if current_problem and current_problem.responsible_employee_id
                 else None
             )
+            connection = (
+                await session.get(TelegramConnection, current_dialog.connection_id)
+                if current_dialog
+                else None
+            )
             level = (
                 "Критично"
                 if signal.criticality >= 90
@@ -362,6 +368,7 @@ class NotificationOrchestrator:
                     f"{destination_intro}"
                     f"<b>Клиент:</b> {escape(person)}\n"
                     f"<b>Username:</b> {escape('@' + username) if username else 'не указан'}\n"
+                    f"<b>Рабочий аккаунт:</b> {escape((responsible.display_name if responsible else None) or (connection.display_name if connection else None) or 'общий аккаунт')}\n"
                     f"<b>Ответственный:</b> {escape(responsible.display_name) if responsible else 'нужно назначить'}\n\n"
                     f"<b>Причина:</b>\n{escape(signal.reason)}\n\n"
                     f"<b>Сообщение:</b>\n<blockquote>{escape(body)}</blockquote>\n\n"
