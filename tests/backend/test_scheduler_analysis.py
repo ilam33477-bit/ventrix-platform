@@ -26,6 +26,7 @@ from services.backend.models import (
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
+    Tenant,
     TenantAnalysisSchedule,
     TenantSettings,
 )
@@ -154,6 +155,30 @@ async def test_legacy_timezone_is_stored_as_iana(
             select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
         )
     assert stored.timezone == "Europe/Moscow"
+
+
+@pytest.mark.asyncio
+async def test_existing_schedule_tracks_subscription_extension(
+    session_factory, make_service, tenant_payload
+) -> None:
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        tenant.subscription_expires_at = now.date()
+        await session.commit()
+    scheduler = TenantAnalysisScheduler(session_factory)
+    await scheduler.ensure_schedules(now)
+    async with session_factory() as session:
+        tenant = await session.get(Tenant, tenant.id)
+        tenant.subscription_expires_at = now.date() + timedelta(days=30)
+        await session.commit()
+    await scheduler.ensure_schedules(now + timedelta(minutes=1))
+    async with session_factory() as session:
+        schedule = await session.scalar(
+            select(TenantAnalysisSchedule).where(TenantAnalysisSchedule.tenant_id == tenant.id)
+        )
+    assert schedule.access_status == "active"
+    assert schedule.access_expires_at.date() == now.date() + timedelta(days=30)
 
 
 def test_preprocessing_and_controlled_json_repair() -> None:

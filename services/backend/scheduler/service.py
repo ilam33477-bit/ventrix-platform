@@ -79,6 +79,13 @@ class TenantAnalysisScheduler:
                     normalized_timezone = normalize_timezone(settings.timezone)
                     if settings.timezone != normalized_timezone:
                         settings.timezone = normalized_timezone
+                    expires = None
+                    if tenant.subscription_expires_at:
+                        expires = datetime.combine(
+                            tenant.subscription_expires_at,
+                            time.max,
+                            timezone_info(normalized_timezone),
+                        ).astimezone(UTC)
                     if tenant.id in existing:
                         schedule = await session.scalar(
                             select(TenantAnalysisSchedule).where(
@@ -92,6 +99,15 @@ class TenantAnalysisScheduler:
                                 schedule_timezone = normalized_timezone
                             if schedule.timezone != schedule_timezone:
                                 schedule.timezone = schedule_timezone
+                            schedule.access_expires_at = expires
+                            schedule.access_status = (
+                                "active" if tenant.status == "active" else tenant.status
+                            )
+                            schedule.analysis_enabled = settings.analysis_enabled
+                            schedule.report_time = settings.daily_report_time
+                            schedule.enabled_days = list(settings.enabled_days)
+                            schedule.history_window_days = settings.history_window_days
+                            schedule.advance_minutes = settings.analysis_advance_minutes
                             if schedule.next_analysis_at is None:
                                 schedule.next_analysis_at = next_analysis_time(
                                     now=current,
@@ -101,13 +117,6 @@ class TenantAnalysisScheduler:
                                     advance_minutes=schedule.advance_minutes,
                                 )
                         continue
-                    expires = None
-                    if tenant.subscription_expires_at:
-                        expires = datetime.combine(
-                            tenant.subscription_expires_at,
-                            time.max,
-                            timezone_info(normalized_timezone),
-                        ).astimezone(UTC)
                     schedule = TenantAnalysisSchedule(
                         tenant_id=tenant.id,
                         timezone=normalized_timezone,
