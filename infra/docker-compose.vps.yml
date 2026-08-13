@@ -4,8 +4,10 @@ services:
     env_file: .env
     command: ["api"]
     volumes: &ventrix-volumes
-      - ./data:/app/data
-      - ./backups:/app/backups
+      # Paths are resolved relative to this compose file in /opt/ventrix/infra.
+      # Keep production state in the project-level persistent directories.
+      - ../data:/app/data
+      - ../backups:/app/backups
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
       interval: 5s
