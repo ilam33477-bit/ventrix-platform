@@ -11,13 +11,25 @@ const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string]>
   new: [["needs_confirmation", "Проверить"], ["acknowledged", "Принять"]],
   needs_confirmation: [["acknowledged", "Подтвердить"], ["false_positive", "Ложное срабатывание"]],
   acknowledged: [["assigned", "Назначить"]],
-  assigned: [["in_progress", "В работу"]],
-  in_progress: [["waiting", "Ожидание"], ["resolved", "Решено"]],
-  waiting: [["in_progress", "Вернуть в работу"]],
+  assigned: [["in_progress", "В работу"], ["false_positive", "Не проблема"]],
+  in_progress: [["waiting", "Ждём клиента"], ["resolved", "Решено"], ["false_positive", "Не проблема"]],
+  waiting: [["in_progress", "Вернуть в работу"], ["false_positive", "Не проблема"]],
   resolved: [["reopened", "Открыть снова"]],
   auto_resolved: [["reopened", "Открыть снова"]],
   reopened: [["assigned", "Назначить"], ["in_progress", "В работу"]],
 };
+
+const STATUS_LABELS: Record<string, string> = {
+  new: "Новая", needs_confirmation: "Нужно проверить", acknowledged: "Подтверждена",
+  assigned: "Назначена", in_progress: "В работе", waiting: "Ждём ответа",
+  resolved: "Решена", auto_resolved: "Исправление подтверждено",
+  false_positive: "Не проблема", reopened: "Открыта снова",
+};
+
+function problemTitle(problem: Problem) {
+  if (problem.type === "client_without_answer") return "Клиент ждёт ответа";
+  return problem.explanation.replaceAll("SLA", "установленного времени ответа");
+}
 
 function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   api: VentrixClientApi;
@@ -55,10 +67,12 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   }
 
   return <Card className="problem-detail">
-    <div className="problem-card-top"><StatusBadge tone="warning">{problem.status}</StatusBadge><button className="text-action" onClick={onClose}>Закрыть</button></div>
-    <h3>{problem.explanation}</h3>
-    <blockquote>{problem.evidence}</blockquote>
+    <div className="problem-card-top"><StatusBadge tone="warning">{STATUS_LABELS[problem.status] ?? problem.status}</StatusBadge><button className="text-action" onClick={onClose}>← К списку</button></div>
+    <h3>{problemTitle(problem)}</h3>
+    <p className="problem-explanation">{problem.explanation.replaceAll("SLA", "установленного времени ответа")}</p>
+    <div className="dialog-context"><h4>Контекст переписки</h4>{problem.context_messages.map((message) => <div className={`${message.outgoing ? "outgoing" : "incoming"} ${message.is_source ? "source" : ""}`} key={message.id}><small>{message.outgoing ? "Сотрудник" : "Клиент"} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p></div>)}</div>
     <p><strong>Ожидаемое действие:</strong> {problem.recommended_action}</p>
+    <p><strong>Ответственный:</strong> {problem.responsible_employee_name ?? "не назначен"}</p>
     <div className="control-form">
       <label>Ответственный<select value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Не назначен</option>{employees?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label>Дедлайн<input type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label>
@@ -90,9 +104,9 @@ export function ProblemsView({ api }: { api: VentrixClientApi }) {
 
   if (detail) return <><SectionHeading eyebrow="ПРОБЛЕМА" title="Карточка и история" /><ProblemDetailPanel api={api} problem={detail} onChanged={refreshDetail} onClose={() => setDetail(null)} /></>;
   return <>
-    <SectionHeading eyebrow="ПРОБЛЕМЫ И СИГНАЛЫ" title="Что требует решения" description="Статус, ответственный, доказательства и следующий шаг." />
+    <SectionHeading eyebrow="РАБОЧИЕ СИТУАЦИИ" title="Что требует решения" description="Только подтверждённые риски: кто отвечает, что произошло и какой следующий шаг." />
     <div className="chip-row">{(["all", "critical", "high", "medium"] as const).map((item) => <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item === "all" ? "Все" : item === "critical" ? "Критичные" : item === "high" ? "Высокие" : "Средние"}</button>)}</div>
-    {loading ? <Skeleton lines={4} /> : <div className="problem-cards">{visible.map((problem) => <button className="problem-card-button" key={problem.id} onClick={() => void open(problem.id)}><Card className="problem-card"><div className="problem-card-top"><StatusBadge tone={problem.priority === "critical" ? "danger" : "warning"}>{problem.priority}</StatusBadge><small>{problem.status}</small></div><h3>{problem.explanation}</h3><blockquote>{problem.evidence}</blockquote><p><strong>Что сделать:</strong> {problem.recommended_action}</p><footer>{problem.deadline_at ? `До ${new Date(problem.deadline_at).toLocaleString("ru-RU")}` : "Без дедлайна"}</footer></Card></button>)}</div>}
+    {loading ? <Skeleton lines={4} /> : <div className="problem-cards">{visible.map((problem) => <button className="problem-card-button" key={problem.id} onClick={() => void open(problem.id)}><Card className="problem-card"><div className="problem-card-top"><StatusBadge tone={problem.priority === "critical" ? "danger" : "warning"}>{problem.priority === "critical" ? "Критично" : problem.priority === "high" ? "Важно" : "Проверить"}</StatusBadge><small>{STATUS_LABELS[problem.status] ?? problem.status}</small></div><h3>{problemTitle(problem)}</h3><p>{problem.explanation.replaceAll("SLA", "установленного времени ответа")}</p><blockquote>{problem.evidence}</blockquote><p><strong>Что сделать:</strong> {problem.recommended_action}</p><footer>{problem.deadline_at ? `До ${new Date(problem.deadline_at).toLocaleString("ru-RU")}` : "Без жёсткого срока"}</footer></Card></button>)}</div>}
     {error && <p className="form-error">{error}</p>}
     {!loading && !visible.length && <EmptyState title="Активных проблем нет" description="Список обновится после следующего анализа." />}
   </>;

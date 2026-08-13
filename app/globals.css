@@ -113,6 +113,16 @@ body{background:var(--paper);color:var(--ink)}
 .employee-actions button{min-height:42px;border:1px solid var(--line);border-radius:10px;background:#fff;font-size:10px;font-weight:800;padding:8px}
 .employee-actions .primary-action{background:var(--green);color:#fff;border-color:var(--green)}
 .section-back{margin:0 0 12px}
+.problem-explanation{color:var(--muted);font-size:11px;line-height:1.55}
+.dialog-context{display:grid;gap:7px;padding:12px;border-radius:12px;background:#f2f5f3}
+.dialog-context h4{margin:0 0 4px}
+.dialog-context>div{max-width:88%;padding:9px 11px;border-radius:10px;background:#fff;border:1px solid var(--line)}
+.dialog-context>div.outgoing{justify-self:end;background:#e2f0e9}
+.dialog-context>div.source{box-shadow:inset 3px 0 var(--green)}
+.dialog-context small{color:var(--muted);font-size:8px}.dialog-context p{margin:4px 0 0;font-size:11px;line-height:1.45}
+.report-card>div{display:flex;align-items:center;justify-content:space-between}.report-card>div small{color:var(--muted)}.report-card>span{color:var(--green);font-size:10px;font-weight:800}.report-metric{font:500 28px Georgia,serif;color:var(--green)}
+.report-employee-list{display:grid;gap:8px}.report-employee-list>div{display:grid;grid-template-columns:1fr auto;gap:4px;padding:10px;border-radius:10px;background:#f1f5f2}.report-employee-list strong{grid-column:1/-1}.report-employee-list span{font-size:9px;color:var(--muted)}
+.settings-note{margin:0;color:var(--muted);font-size:10px;line-height:1.5}.threshold-settings label>span{display:flex;justify-content:space-between;gap:10px}.threshold-settings label>small{font-weight:500;color:var(--muted);line-height:1.4}
 .onboarding-shell,.onboarding-shell .ui-card{color:var(--ink)}
 .onboarding-header>div:first-child>strong,.onboarding-header h1,
 .connection-wizard h3{color:var(--ink)}

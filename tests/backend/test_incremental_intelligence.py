@@ -664,9 +664,7 @@ async def test_cross_connection_signal_provenance_never_downgrades_lifecycle_sta
 
     async with session_factory() as session:
         signals = list(
-            await session.scalars(
-                select(Signal).where(Signal.signal_type == "contract_question")
-            )
+            await session.scalars(select(Signal).where(Signal.signal_type == "contract_question"))
         )
     assert len(signals) == 1
     assert signals[0].status == "problem_created"

@@ -12,9 +12,7 @@ from ..database import SQLiteTransactionManager
 from ..models import BackgroundJob, TenantQueueState
 
 AVAILABLE_STATUSES = ("pending", "scheduled", "waiting", "retry", "retry_scheduled")
-RESERVED_LANE_CATEGORIES = frozenset(
-    {"critical", "notification", "realtime", "telegram_rpc"}
-)
+RESERVED_LANE_CATEGORIES = frozenset({"critical", "notification", "realtime", "telegram_rpc"})
 HEAVY_JOB_TYPES = {
     "telegram_initial_sync",
     "telegram_incremental_sync",
@@ -170,8 +168,7 @@ class SQLiteJobQueue:
                     (
                         ~exists(
                             select(running_partition.id).where(
-                                running_partition.partition_key
-                                == BackgroundJob.partition_key,
+                                running_partition.partition_key == BackgroundJob.partition_key,
                                 running_partition.status == "running",
                             )
                         )
@@ -180,8 +177,7 @@ class SQLiteJobQueue:
                                 predecessor.partition_key == BackgroundJob.partition_key,
                                 predecessor.status.in_((*AVAILABLE_STATUSES, "running")),
                                 predecessor.partition_sequence.is_not(None),
-                                predecessor.partition_sequence
-                                < BackgroundJob.partition_sequence,
+                                predecessor.partition_sequence < BackgroundJob.partition_sequence,
                             )
                         )
                     ),

@@ -153,6 +153,9 @@ def test_telegram_private_entity_classifier_rejects_non_humans() -> None:
         ("Код для входа в Telegram: 56818. Не давайте код никому.", "service"),
         ("Вадим, добро пожаловать в группу Crypto Taverna Chat.", "service"),
         ("Казино дарит бесплатный бонус — успейте забрать!", "advertising"),
+        ("Хорошо, спасибо", "social"),
+        ("Договорились 🤝", "social"),
+        ("Подпишитесь на канал, чтобы получать новые вакансии", "advertising"),
         ("Клиент просит прислать договор и счёт до пятницы.", "business"),
     ],
 )

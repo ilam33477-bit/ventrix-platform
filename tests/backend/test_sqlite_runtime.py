@@ -201,9 +201,7 @@ async def test_telegram_rpc_bypasses_tenant_general_concurrency(
     queue = SQLiteJobQueue(session_factory, max_active_tenant_jobs=1)
     async with session_factory() as session:
         tenant = await make_service(session).create_tenant(tenant_payload)
-        connection = TelegramConnection(
-            tenant_id=tenant.id, telegram_user_id=100, status="ready"
-        )
+        connection = TelegramConnection(tenant_id=tenant.id, telegram_user_id=100, status="ready")
         session.add(connection)
         await session.commit()
         tenant_id = tenant.id
@@ -216,9 +214,7 @@ async def test_telegram_rpc_bypasses_tenant_general_concurrency(
         telegram_account_id=account_id,
         category="telegram_rpc",
     )
-    general = await queue.claim_next(
-        "general", allowed_categories=frozenset({"analysis"})
-    )
+    general = await queue.claim_next("general", allowed_categories=frozenset({"analysis"}))
     assert general is not None
     rpc = await queue.claim_next(
         "actor",

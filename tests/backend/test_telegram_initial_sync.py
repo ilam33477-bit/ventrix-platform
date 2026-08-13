@@ -216,9 +216,7 @@ async def test_default_scope_accepts_naive_sqlite_dialog_timestamps(
         dialog.last_message_at = (datetime.now(UTC) - timedelta(hours=1)).replace(tzinfo=None)
         await session.commit()
 
-    connection = await service.activate_default_scope(
-        tenant.id, history_days=14
-    )
+    connection = await service.activate_default_scope(tenant.id, history_days=14)
 
     async with session_factory() as session:
         dialog = await session.get(TelegramDialog, dialog.id)

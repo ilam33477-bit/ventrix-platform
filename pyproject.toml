@@ -15,6 +15,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
+  "reportlab>=4.4,<5",
   "sqlalchemy[asyncio]>=2.0.41,<3",
   "telethon>=1.44,<2",
   "tzdata>=2025.2,<2027",

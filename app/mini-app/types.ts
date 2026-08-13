@@ -87,6 +87,15 @@ export type ProblemStatus =
   | "false_positive" | "ignored" | "reopened";
 
 export type ProblemDetail = Problem & {
+  responsible_employee_name: string | null;
+  context_messages: Array<{
+    id: string;
+    text: string;
+    outgoing: boolean;
+    sender_role: string | null;
+    sent_at: string;
+    is_source: boolean;
+  }>;
   closed_reason: string | null;
   resolution_evidence: string | null;
   transitions: Array<{

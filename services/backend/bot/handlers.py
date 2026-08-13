@@ -123,6 +123,7 @@ async def precompute_onboarding_welcome(
             type(exc).__name__,
         )
 
+
 router = Router(name="owner-admin-inline")
 logger = logging.getLogger(__name__)
 
@@ -750,9 +751,7 @@ async def tenant_ai_confirm(
             draft.confirmed_at = datetime.now(UTC)
             await session.commit()
             tenant = await foundation.get_tenant(tenant.id)
-    await precompute_onboarding_welcome(
-        session_factory, settings, telegram_verifier, tenant.id
-    )
+    await precompute_onboarding_welcome(session_factory, settings, telegram_verifier, tenant.id)
     await state.clear()
     await render(
         query,
@@ -1000,9 +999,7 @@ async def tenant_create_confirm(
     )
     async with session_factory() as session:
         tenant = await service_for(session, settings, telegram_verifier).create_tenant(payload)
-    await precompute_onboarding_welcome(
-        session_factory, settings, telegram_verifier, tenant.id
-    )
+    await precompute_onboarding_welcome(session_factory, settings, telegram_verifier, tenant.id)
     await state.clear()
     await render(
         query,
@@ -1161,9 +1158,7 @@ async def tenant_test_reset_confirm(
             # deletion via SET NULL. Remove them explicitly so a TEST reset
             # cannot show stale summaries for already deleted source data.
             await session.execute(delete(Report).where(Report.tenant_id == tenant_id))
-            await session.execute(
-                delete(AnalysisRun).where(AnalysisRun.tenant_id == tenant_id)
-            )
+            await session.execute(delete(AnalysisRun).where(AnalysisRun.tenant_id == tenant_id))
         await session.commit()
     await render(
         query,

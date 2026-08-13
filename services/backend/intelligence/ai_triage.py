@@ -32,6 +32,9 @@ requires_employee_notification, requires_manager_notification, reason,
 recommended_action, recommended_deadline_minutes (integer or null), needs_deep_analysis,
 message_class, business_relevance.
 Do not invent facts or message IDs. Evaluate context, not keywords alone.
+The payload may include tenant_feedback for this signal type. Treat a high false-positive
+rate as evidence that the tenant expects stricter filtering, especially for short replies,
+closing phrases and weakly contextualised events.
 message_class must be one of: business, service, advertising, social, uncertain.
 Authentication codes, Telegram security notices, join/leave/welcome events, bot menus,
 subscription verification, automated job feeds, mass promotions and channel advertising
@@ -219,6 +222,29 @@ class AITriageService:
                     )
                 )
             )
+            same_type_total = int(
+                await session.scalar(
+                    select(func.count(OperationalProblem.id))
+                    .join(Signal, Signal.id == OperationalProblem.signal_id)
+                    .where(
+                        OperationalProblem.tenant_id == signal.tenant_id,
+                        Signal.signal_type == signal.signal_type,
+                    )
+                )
+                or 0
+            )
+            same_type_false = int(
+                await session.scalar(
+                    select(func.count(OperationalProblem.id))
+                    .join(Signal, Signal.id == OperationalProblem.signal_id)
+                    .where(
+                        OperationalProblem.tenant_id == signal.tenant_id,
+                        Signal.signal_type == signal.signal_type,
+                        OperationalProblem.status == "false_positive",
+                    )
+                )
+                or 0
+            )
         payload = {
             "signal": {
                 "type": signal.signal_type,
@@ -242,6 +268,13 @@ class AITriageService:
                 for item in commitments
             ],
             "sla_minutes": settings.response_sla_minutes,
+            "tenant_feedback": {
+                "same_type_reviewed": same_type_total,
+                "same_type_false_positives": same_type_false,
+                "false_positive_rate": (
+                    round(same_type_false / same_type_total, 3) if same_type_total else 0
+                ),
+            },
         }
         return payload, signal, settings
 
@@ -346,9 +379,7 @@ class AITriageService:
 
         return await self.transactions.run(write)
 
-    async def _suppress_non_business(
-        self, signal_id: str, message_class: str, reason: str
-    ) -> None:
+    async def _suppress_non_business(self, signal_id: str, message_class: str, reason: str) -> None:
         async def write(session: AsyncSession) -> None:
             signal = await session.get(Signal, signal_id)
             if signal is None:

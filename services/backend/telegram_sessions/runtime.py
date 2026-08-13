@@ -370,8 +370,7 @@ class TelegramSessionActor:
                     row.requires_user_confirmation = False
                     row.selected = bool(
                         not remote["is_automated"]
-                        and
-                        remote["last_message_at"] is not None
+                        and remote["last_message_at"] is not None
                         and remote["last_message_at"] >= active_cutoff
                     )
                     row.excluded = remote["is_automated"]
@@ -552,8 +551,7 @@ class TelegramSessionActor:
                         "source_type": source_type,
                         "last_message_at": getattr(remote_dialog.message, "date", None),
                         "is_automated": bool(
-                            source_type == "personal"
-                            and is_automated_private_entity(entity)
+                            source_type == "personal" and is_automated_private_entity(entity)
                         ),
                     }
         except errors.FloodWaitError as exc:
@@ -564,9 +562,7 @@ class TelegramSessionActor:
             existing = {
                 item.telegram_dialog_id: item
                 for item in await session.scalars(
-                    select(TelegramDialog).where(
-                        TelegramDialog.connection_id == self.connection.id
-                    )
+                    select(TelegramDialog).where(TelegramDialog.connection_id == self.connection.id)
                 )
             }
             discovered = 0
@@ -735,9 +731,7 @@ class TelegramSessionActor:
                             )
                         )
                     else:
-                        current.last_message_id = max(
-                            current.last_message_id or 0, message_id
-                        )
+                        current.last_message_id = max(current.last_message_id or 0, message_id)
                         current.last_sync_at = now
                         current.status = "queued"
 

@@ -17,8 +17,22 @@ SERVICE_RE = re.compile(
 )
 AD_MARKERS = (
     re.compile(r"\b(?:реклам|казино|ваучер|промокод|розыгрыш|акци[яи])\w*", re.IGNORECASE),
-    re.compile(r"\b(?:подпишитесь|переходите|успейте|заберите|получите\s+бесплатн)\w*", re.IGNORECASE),
+    re.compile(
+        r"\b(?:подпишитесь|переходите|успейте|заберите|получите\s+бесплатн)\w*", re.IGNORECASE
+    ),
     re.compile(r"\b(?:бесплатн|скидк|бонус|выигра|джекпот)\w*", re.IGNORECASE),
+)
+CLOSING_RE = re.compile(
+    r"^(?:(?:ок(?:ей)?|хорошо|понятно|договорились|принято|ясно)[.! )🤝👍👌]*|"
+    r"(?:спасибо|благодарю)(?:\s+(?:вам|тебе|и\s+вам|и\s+тебе|хорошо|большое))?[.! )🙏👍]*|"
+    r"(?:и\s+вам|вам\s+тоже|тебе\s+тоже)(?:\s+(?:спасибо|удачи|хорошего\s+дня))?[.! )]*|"
+    r"(?:удачи|хорошего\s+(?:дня|вечера)|до\s+связи|до\s+свидания)[.! )]*)$",
+    re.IGNORECASE,
+)
+PROMOTIONAL_BROADCAST_RE = re.compile(
+    r"(?:подписчик|просмотр|реакци|лайк|репост|накрутк|заказы\s+запускаются\s+автоматически|"
+    r"пополнение\s+через|залетайте\s+и\s+пробуйте|подпишитесь\s+на\s+канал)",
+    re.IGNORECASE,
 )
 
 
@@ -48,7 +62,17 @@ def classify_message_relevance(
         return MessageRelevance("service", False, "authentication or confirmation code")
     if SERVICE_RE.search(normalized):
         return MessageRelevance("service", False, "automated group or subscription event")
+    closing_candidate = re.sub(r"[,;:!?…—\-]+", " ", normalized)
+    closing_candidate = " ".join(closing_candidate.split())
+    if CLOSING_RE.fullmatch(normalized) or closing_candidate.casefold() in {
+        "хорошо спасибо",
+        "ок спасибо",
+        "окей спасибо",
+        "понятно спасибо",
+        "договорились спасибо",
+    }:
+        return MessageRelevance("social", False, "dialogue closing or acknowledgement")
     ad_score = sum(bool(pattern.search(normalized)) for pattern in AD_MARKERS)
-    if ad_score >= 2:
+    if ad_score >= 2 or PROMOTIONAL_BROADCAST_RE.search(normalized):
         return MessageRelevance("advertising", False, "high-confidence promotional broadcast")
     return MessageRelevance("business", True, "potential business conversation")

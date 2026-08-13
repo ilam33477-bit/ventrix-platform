@@ -26,9 +26,7 @@ class FakeClient:
         self.disconnects += 1
 
     async def __call__(self, _request):
-        return SimpleNamespace(
-            filters=[SimpleNamespace(id=7, title="Работа")]
-        )
+        return SimpleNamespace(filters=[SimpleNamespace(id=7, title="Работа")])
 
 
 class FakeLoginClient(FakeClient):

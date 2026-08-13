@@ -417,7 +417,7 @@ def client_main_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📌 Сводка", callback_data="client:summary"),
+                InlineKeyboardButton(text="📊 Показатели", callback_data="client:summary"),
                 InlineKeyboardButton(text="⚠️ Важное", callback_data="client:important"),
             ],
             [
@@ -442,6 +442,7 @@ def client_welcome_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [panel],
+            [InlineKeyboardButton(text="📊 Ключевые показатели", callback_data="client:summary")],
             [InlineKeyboardButton(text="Главное меню", callback_data="client:menu")],
         ]
     )

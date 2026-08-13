@@ -49,6 +49,7 @@ from ..models import (
     Signal,
     TelegramConnection,
     TelegramDialog,
+    TelegramMessage,
     Tenant,
     TenantMembership,
     TenantSettings,
@@ -502,6 +503,7 @@ async def mini_app_dashboard_summary(
                 select(func.count(Signal.id)).where(
                     Signal.tenant_id == tenant_id,
                     Signal.criticality >= critical_threshold,
+                    Signal.status.in_(("triaged", "problem_created")),
                     *((Signal.employee_id == employee_id,) if self_scoped else ()),
                 )
             )
@@ -961,6 +963,8 @@ async def problems(
     rows = await repository.problems()
     if problem_status:
         rows = [item for item in rows if item.status == problem_status]
+    else:
+        rows = [item for item in rows if item.status in ACTIVE_PROBLEM_STATUSES]
     rows = [item for item in rows if can_read_problem(context, item)]
     return [
         {
@@ -1009,6 +1013,39 @@ async def problem_detail(
             .order_by(ProblemVerification.checked_at.desc())
         )
     )
+    source = await session.get(TelegramMessage, item.source_message_id)
+    context_messages: list[TelegramMessage] = []
+    if source is not None:
+        before = list(
+            await session.scalars(
+                select(TelegramMessage)
+                .where(
+                    TelegramMessage.dialog_id == item.dialog_id,
+                    TelegramMessage.telegram_message_id < source.telegram_message_id,
+                    TelegramMessage.deleted_at.is_(None),
+                )
+                .order_by(TelegramMessage.telegram_message_id.desc())
+                .limit(4)
+            )
+        )
+        after = list(
+            await session.scalars(
+                select(TelegramMessage)
+                .where(
+                    TelegramMessage.dialog_id == item.dialog_id,
+                    TelegramMessage.telegram_message_id > source.telegram_message_id,
+                    TelegramMessage.deleted_at.is_(None),
+                )
+                .order_by(TelegramMessage.telegram_message_id)
+                .limit(4)
+            )
+        )
+        context_messages = [*reversed(before), source, *after]
+    responsible = (
+        await session.get(Employee, item.responsible_employee_id)
+        if item.responsible_employee_id
+        else None
+    )
     await record_event(session, context, "problem_opened", {"problem_id": item.id})
     await session.commit()
     return {
@@ -1021,10 +1058,22 @@ async def problem_detail(
         "explanation": item.explanation,
         "recommended_action": item.recommended_action,
         "responsible_employee_id": item.responsible_employee_id,
+        "responsible_employee_name": responsible.display_name if responsible else None,
         "deadline_at": item.deadline_at,
         "closed_reason": item.closed_reason,
         "resolution_evidence": item.resolution_evidence,
         "occurred_at": item.occurred_at,
+        "context_messages": [
+            {
+                "id": message.id,
+                "text": message.body_text,
+                "outgoing": message.outgoing,
+                "sender_role": message.sender_role,
+                "sent_at": message.sent_at,
+                "is_source": message.id == item.source_message_id,
+            }
+            for message in context_messages
+        ],
         "transitions": [
             {
                 "from_status": transition.from_status,
@@ -1110,6 +1159,14 @@ async def reports(
     if context.membership.role not in {"owner", "manager"} and not context.allows("reports.read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     rows = await TenantClientRepository(session, context.tenant.id).reports()
+    canonical_rows: list[Report] = []
+    seen: set[tuple[object, str]] = set()
+    for item in rows:
+        key = (item.period_end.date(), item.summary.strip())
+        if key in seen or item.summary.strip() == "Обработано сообщений: 0. Проблем: 0.":
+            continue
+        seen.add(key)
+        canonical_rows.append(item)
     return [
         {
             "id": item.id,
@@ -1121,7 +1178,7 @@ async def reports(
             "delivery_status": item.delivery_status,
             "summary": item.summary,
         }
-        for item in rows
+        for item in canonical_rows
     ]
 
 

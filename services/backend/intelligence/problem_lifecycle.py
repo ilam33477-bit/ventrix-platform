@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.problems import ALLOWED_TRANSITIONS, ProblemStatus
 
 from ..database import SQLiteTransactionManager
-from ..models import Employee, OperationalProblem, ProblemTransition
+from ..models import Employee, OperationalProblem, ProblemTransition, Signal
 
 TERMINAL_PROBLEM_STATUSES = frozenset(
     {
@@ -102,6 +102,18 @@ class ProblemLifecycleService:
                 problem.deadline_at = request.deadline_at
             previous = problem.status
             problem.status = request.target.value
+            if request.target == ProblemStatus.FALSE_POSITIVE and problem.signal_id:
+                signal = await session.get(Signal, problem.signal_id)
+                if signal is not None and signal.tenant_id == tenant_id:
+                    signal.status = "suppressed"
+                    signal.metadata_json = {
+                        **signal.metadata_json,
+                        "tenant_feedback": {
+                            "verdict": "false_positive",
+                            "reason": reason,
+                            "recorded_at": datetime.now(UTC).isoformat(),
+                        },
+                    }
             session.add(
                 ProblemTransition(
                     tenant_id=tenant_id,

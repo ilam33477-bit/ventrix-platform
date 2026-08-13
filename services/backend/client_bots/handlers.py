@@ -11,14 +11,16 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     TelegramObject,
+    WebAppInfo,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.problems import ProblemStatus
@@ -28,8 +30,13 @@ from ..bot.keyboards import (
     client_main_menu,
     client_welcome_menu,
 )
-from ..intelligence.problem_lifecycle import ProblemLifecycleService, TransitionRequest
+from ..intelligence.problem_lifecycle import (
+    ACTIVE_PROBLEM_STATUSES,
+    ProblemLifecycleService,
+    TransitionRequest,
+)
 from ..models import (
+    AnalysisRun,
     BotInstance,
     Employee,
     GroupIntegration,
@@ -38,6 +45,7 @@ from ..models import (
     OperationalProblem,
     Report,
     ReportMetric,
+    ReportSection,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
@@ -46,6 +54,7 @@ from ..models import (
     TenantMembership,
     TenantSettings,
 )
+from ..reporting.pdf import build_report_pdf
 from ..services.employee_access import claim_employee_by_username
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
@@ -236,6 +245,64 @@ def build_client_router(
                 .limit(1)
             )
 
+    async def key_metrics(tenant_id: str) -> dict[str, int]:
+        async with events.session_factory() as session:
+            problems = int(
+                await session.scalar(
+                    select(func.count(OperationalProblem.id)).where(
+                        OperationalProblem.tenant_id == tenant_id,
+                        OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                    )
+                )
+                or 0
+            )
+            waiting = int(
+                await session.scalar(
+                    select(func.count(OperationalProblem.id)).where(
+                        OperationalProblem.tenant_id == tenant_id,
+                        OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                        OperationalProblem.problem_type == "client_without_answer",
+                    )
+                )
+                or 0
+            )
+            reports = int(
+                await session.scalar(
+                    select(func.count(Report.id)).where(
+                        Report.tenant_id == tenant_id,
+                        Report.summary != "Обработано сообщений: 0. Проблем: 0.",
+                    )
+                )
+                or 0
+            )
+            employees = int(
+                await session.scalar(
+                    select(func.count(Employee.id)).where(
+                        Employee.tenant_id == tenant_id, Employee.status == "active"
+                    )
+                )
+                or 0
+            )
+        return {
+            "problems": problems,
+            "waiting": waiting,
+            "reports": reports,
+            "employees": employees,
+        }
+
+    def settings_markup() -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        if mini_app_url:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="⚙️ Настроить в Ventrix AI", web_app=WebAppInfo(url=mini_app_url)
+                    )
+                ]
+            )
+        rows.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     def connection_actions(status: str | None) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
         if status in {"connected", "ready", "syncing"}:
@@ -278,23 +345,18 @@ def build_client_router(
             f"Ошибки отдельных чатов: {run.failed_dialogs}"
         )
         if run.status == "completed":
+            account = escape(str(metrics.get("connected_account") or "Рабочий Telegram"))
             text_value += (
-                "\n\n<b>Результат</b>\n"
-                f"Аккаунт: {escape(str(metrics.get('connected_account', 'Telegram')))}\n"
-                f"Рабочая папка: {escape(str(metrics.get('working_folder', '')))}\n"
-                f"Рабочие группы: {metrics.get('working_groups', 0)}\n"
-                f"Рабочие каналы: {metrics.get('working_channels', 0)}\n"
-                f"Личные диалоги: {metrics.get('personal_dialogs', 0)}\n"
-                "Вероятные деловые личные диалоги: "
-                f"{metrics.get('probable_business_personal_dialogs', 0)}\n"
-                f"Проблем найдено: {metrics.get('problems_created', 0)}\n"
-                f"Клиенты без ответа: {metrics.get('clients_without_answer', 0)}\n"
-                f"Жалобы: {metrics.get('complaints', 0)}\n"
-                f"Обещания: {metrics.get('promises', 0)}\n"
-                f"Потенциальные сделки: {metrics.get('potential_deals', 0)}\n"
-                f"Просроченные обязательства: {metrics.get('overdue_commitments', 0)}\n"
-                f"Созвоны под риском: {metrics.get('calls_at_risk', 0)}\n"
-                f"Системные недоработки: {metrics.get('system_gaps', 0)}"
+                "\n\n<b>✅ Первичная проверка завершена</b>\n"
+                f"Аккаунт: {account}\n"
+                f"Личных диалогов проверено: <b>{metrics.get('personal_dialogs', 0)}</b>\n"
+                f"Рабочих групп: <b>{metrics.get('working_groups', 0)}</b>\n\n"
+                "<b>Что нашёл анализ</b>\n"
+                f"Подтверждённых ситуаций: <b>{metrics.get('problems_created', 0)}</b>\n"
+                f"Обещаний сотрудников: <b>{metrics.get('promises', 0)}</b>\n"
+                f"Жалоб: <b>{metrics.get('complaints', 0)}</b>\n"
+                f"Потенциальных сделок: <b>{metrics.get('potential_deals', 0)}</b>\n\n"
+                f"<i>{metrics.get('clients_without_answer', 0)} диалогов имели предварительный признак ожидания ответа. Они не считаются проблемами, пока контекст и последующие сообщения не подтвердят риск.</i>"
             )
         rows = [[InlineKeyboardButton(text="↻ Обновить", callback_data="client:tg:progress")]]
         if run.status in {"pending", "running"} and not run.stop_requested:
@@ -333,6 +395,7 @@ def build_client_router(
                 .limit(1)
             )
         first_name = (tenant.owner_name or "").strip().split()[0] or "Здравствуйте"
+        metrics = await key_metrics(tenant.id)
         warning = ""
         if connection is None or connection.status not in {"connected", "syncing", "ready"}:
             warning = (
@@ -345,6 +408,11 @@ def build_client_router(
             "Мы будем следить за рабочими Telegram-переписками, обязательствами сотрудников, "
             "клиентами без ответа и другими важными ситуациями.\n\n"
             "Быстрая настройка займёт несколько минут."
+            f"\n\n<b>Сейчас в проекте</b>\n"
+            f"Ситуации в работе: <b>{metrics['problems']}</b>\n"
+            f"Клиенты ждут ответа: <b>{metrics['waiting']}</b>\n"
+            f"Сотрудники: <b>{metrics['employees']}</b>\n"
+            f"Готовые сводки: <b>{metrics['reports']}</b>"
             f"{warning}",
             reply_markup=client_welcome_menu(mini_app_url),
         )
@@ -352,9 +420,12 @@ def build_client_router(
     @router.callback_query(F.data == "client:menu")
     async def menu(query: CallbackQuery, client_context: ClientContext) -> None:
         await record(client_context, "client_menu_opened")
+        metrics = await key_metrics(client_context.tenant_id)
         await render(
             query,
-            f"<b>{escape(client_context.tenant.name)}</b>\n\nВыберите нужное действие.",
+            f"<b>{escape(client_context.tenant.name)}</b>\n\n"
+            f"В работе: <b>{metrics['problems']}</b> · ждут ответа: <b>{metrics['waiting']}</b>\n"
+            f"Последние действия доступны в панели Ventrix AI.\n\nВыберите действие:",
             main=True,
         )
 
@@ -417,6 +488,11 @@ def build_client_router(
             await query.answer("Текущий статус уже нельзя отметить как ложный", show_alert=True)
             return
         await query.answer("Отмечено как не проблема", show_alert=True)
+        await record(
+            client_context,
+            "problem_false_positive",
+            problem_id=problem_id,
+        )
 
     @router.callback_query(F.data.startswith("np:close:"))
     async def notification_close(query: CallbackQuery, client_context: ClientContext) -> None:
@@ -627,16 +703,20 @@ def build_client_router(
                         )
                     ).all()
                 )
+        live = await key_metrics(tenant.id)
+        last_report = (
+            report.ready_at.strftime("%d.%m.%Y %H:%M")
+            if report and report.ready_at
+            else "после появления новых сообщений"
+        )
+        next_at = (
+            schedule.next_analysis_at.strftime("%d.%m.%Y %H:%M")
+            if schedule and schedule.next_analysis_at
+            else next_report.strftime("%d.%m.%Y %H:%M")
+        )
         await render(
             query,
-            f"<b>Сводка · {escape(tenant.name)}</b>\n\n"
-            f"Требуют внимания: {int(metrics.get('problems', 0))}\n"
-            f"Высокий приоритет: {int(metrics.get('high', 0))}\n"
-            f"Средний приоритет: {int(metrics.get('medium', 0))}\n"
-            f"Сообщений в отчёте: {int(metrics.get('messages', 0))}\n"
-            f"Последний отчёт: {report.ready_at.isoformat() if report and report.ready_at else 'ещё не готов'}\n"
-            f"Следующий анализ: {schedule.next_analysis_at.isoformat() if schedule and schedule.next_analysis_at else next_report.strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"<b>Доступ к системе</b>\n{escape(_access_status(tenant))}",
+            f"<b>📊 Ключевые показатели · {escape(tenant.name)}</b>\n\n<b>Сейчас требуют реакции</b>\nРабочие ситуации: <b>{live['problems']}</b>\nКлиенты ждут ответа: <b>{live['waiting']}</b>\n\n<b>Последняя рабочая сводка</b>\nИзучено сообщений: <b>{int(metrics.get('messages', 0))}</b>\nВажных ситуаций: <b>{int(metrics.get('high', 0))}</b>\nСреднего приоритета: <b>{int(metrics.get('medium', 0))}</b>\n\nПоследняя сводка: {last_report}\nСледующая проверка: {next_at}\n\n<i>«Время ответа» — срок, за который команда планирует отвечать клиенту. Он настраивается в Ventrix AI.</i>",
         )
 
     @router.callback_query(F.data == "client:important")
@@ -667,7 +747,7 @@ def build_client_router(
     async def reports(query: CallbackQuery, client_context: ClientContext) -> None:
         await record(client_context, "reports_opened")
         async with events.session_factory() as session:
-            rows = list(
+            report_rows = list(
                 await session.scalars(
                     select(Report)
                     .where(Report.tenant_id == client_context.tenant_id)
@@ -675,14 +755,148 @@ def build_client_router(
                     .limit(10)
                 )
             )
+        canonical: list[Report] = []
+        seen: set[tuple[object, str]] = set()
+        for item in report_rows:
+            key = (item.period_end.date(), item.summary)
+            if key in seen or item.summary == "Обработано сообщений: 0. Проблем: 0.":
+                continue
+            seen.add(key)
+            canonical.append(item)
         lines = [
-            f"{index}. {item.period_end:%d.%m.%Y} · {escape(item.status)} · {escape(item.summary)}"
-            for index, item in enumerate(rows, start=1)
+            f"• <b>{item.period_end:%d.%m.%Y}</b> — {escape(item.summary.replace('Обработано сообщений', 'изучено сообщений').replace('Проблем', 'ситуаций'))}"
+            for item in canonical[:5]
         ]
-        await render(
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    text="Сводка за 7 дней", callback_data="client:report:request:week"
+                ),
+                InlineKeyboardButton(
+                    text="За 30 дней", callback_data="client:report:request:month"
+                ),
+            ]
+        ]
+        if mini_app_url:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Открыть архив в Ventrix AI", web_app=WebAppInfo(url=mini_app_url)
+                    )
+                ]
+            )
+        if canonical:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Скачать последний PDF",
+                        callback_data=f"client:report:pdf:{canonical[0].id}",
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
+        await edit_screen(
             query,
-            "<b>Отчёты</b>\n\n" + ("\n\n".join(lines) if lines else "История отчётов пока пуста."),
+            "<b>📄 Рабочие сводки</b>\n\n"
+            + (
+                "\n".join(lines)
+                if lines
+                else "Готовых сводок пока нет — пустые отчёты не создаются."
+            )
+            + "\n\n<i>Недельную сводку можно обновлять раз в день, месячную — раз в неделю.</i>",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
         )
+
+    @router.callback_query(F.data.startswith("client:report:request:"))
+    async def request_report(query: CallbackQuery, client_context: ClientContext) -> None:
+        if connection_service is None:
+            await query.answer("Анализ временно недоступен", show_alert=True)
+            return
+        period = query.data.rsplit(":", 1)[1]
+        days, cooldown = (7, timedelta(days=1)) if period == "week" else (30, timedelta(days=7))
+        trigger = f"manual_{period}"
+        async with events.session_factory() as session:
+            recent = await session.scalar(
+                select(AnalysisRun)
+                .where(
+                    AnalysisRun.tenant_id == client_context.tenant_id,
+                    AnalysisRun.trigger == trigger,
+                    AnalysisRun.created_at >= datetime.now(UTC) - cooldown,
+                )
+                .order_by(AnalysisRun.created_at.desc())
+                .limit(1)
+            )
+        if recent:
+            await query.answer(
+                "Такая сводка уже запрошена. Новые данные ещё не накопились.", show_alert=True
+            )
+            return
+        await connection_service.queue.enqueue(
+            "analysis.pipeline",
+            {
+                "history_window_days": days,
+                "trigger": trigger,
+                "report_due_at": datetime.now(UTC).isoformat(),
+            },
+            tenant_id=client_context.tenant_id,
+            priority=45,
+            idempotency_key=f"{trigger}:{client_context.tenant_id}:{datetime.now(UTC).date().isoformat()}",
+            category="analysis",
+            is_heavy=True,
+        )
+        await query.answer(
+            "Сводка поставлена в очередь. Она появится в разделе «Отчёты».", show_alert=True
+        )
+
+    @router.callback_query(F.data.startswith("client:report:pdf:"))
+    async def report_pdf(query: CallbackQuery, client_context: ClientContext) -> None:
+        report_id = (query.data or "").rsplit(":", 1)[-1]
+        async with events.session_factory() as session:
+            report = await session.scalar(
+                select(Report).where(
+                    Report.id == report_id,
+                    Report.tenant_id == client_context.tenant_id,
+                    Report.status == "ready",
+                )
+            )
+            if report is None:
+                await query.answer("Сводка не найдена", show_alert=True)
+                return
+            metrics = dict(
+                (
+                    await session.execute(
+                        select(ReportMetric.metric_key, ReportMetric.numeric_value).where(
+                            ReportMetric.report_id == report.id,
+                            ReportMetric.tenant_id == client_context.tenant_id,
+                        )
+                    )
+                ).all()
+            )
+            sections = {
+                section.section_key: section.data_json
+                for section in await session.scalars(
+                    select(ReportSection).where(
+                        ReportSection.report_id == report.id,
+                        ReportSection.tenant_id == client_context.tenant_id,
+                    )
+                )
+            }
+        pdf = build_report_pdf(
+            tenant_name=client_context.tenant.name,
+            period_start=report.period_start.strftime("%d.%m.%Y"),
+            period_end=report.period_end.strftime("%d.%m.%Y"),
+            metrics={key: float(value) for key, value in metrics.items()},
+            sections=sections,
+        )
+        if query.message:
+            await query.message.answer_document(
+                BufferedInputFile(
+                    pdf,
+                    filename=f"ventrix-{report.period_end:%Y-%m-%d}.pdf",
+                ),
+                caption="Рабочая сводка Ventrix",
+            )
+        await query.answer()
 
     @router.callback_query(F.data == "client:connections")
     @router.callback_query(F.data == "client:connect")
@@ -1302,21 +1516,21 @@ def build_client_router(
     async def settings(query: CallbackQuery, client_context: ClientContext) -> None:
         await record(client_context, "settings_opened")
         tenant = client_context.tenant
-        await render(
+        await edit_screen(
             query,
             f"<b>Настройки проекта</b>\n\n"
             f"Компания: {escape(tenant.name)}\n"
             f"Ниша: {escape(tenant.niche)}\n"
             f"Рабочие часы: {escape(_hours(tenant.settings.working_hours))}\n"
-            f"SLA ответа: {tenant.settings.response_sla_minutes} мин.\n"
+            f"Плановое время ответа клиенту: {tenant.settings.response_sla_minutes} мин.\n"
             f"Время отчёта: {tenant.settings.daily_report_time:%H:%M}\n"
             f"Часовой пояс: {escape(tenant.settings.timezone)}\n\n"
-            f"Порог отчёта: {tenant.settings.signal_report_threshold}/100\n"
-            f"Порог проблемы: {tenant.settings.signal_problem_threshold}/100\n"
-            f"Срочное уведомление: {tenant.settings.signal_immediate_threshold}/100\n"
+            f"Создавать ситуацию при уверенности: {tenant.settings.signal_problem_threshold}/100\n"
+            f"Срочно уведомлять при важности: {tenant.settings.signal_immediate_threshold}/100\n"
             f"Уведомления сотрудников: {'включены' if tenant.settings.employee_notifications_enabled else 'выключены'}\n"
             f"Напоминания в группах: {'включены' if tenant.settings.group_reminders_enabled else 'выключены'}\n\n"
-            f"<b>Доступ к системе</b>\n{escape(_access_status(tenant))}",
+            f"<b>Доступ к системе</b>\n{escape(_access_status(tenant))}\n\n<i>Изменить расписание и чувствительность можно в Mini App.</i>",
+            settings_markup(),
         )
 
     @router.callback_query(F.data == "client:employees")
@@ -1330,14 +1544,15 @@ def build_client_router(
                 )
             )
         lines = [
-            f"{index}. {escape(item.display_name)} · {escape(item.role)} · "
-            f"порог {item.criticality_threshold}"
-            for index, item in enumerate(rows, start=1)
+            f"{'✅' if item.status == 'active' else '⏸'} <b>{escape(item.display_name)}</b>\n   @{escape(item.telegram_username or 'username не указан')} · {'доступ связан' if item.telegram_user_id else 'ожидает первого входа'}"
+            for item in rows
         ]
-        await render(
+        await edit_screen(
             query,
-            "<b>Сотрудники</b>\n\n"
-            + ("\n".join(lines) if lines else "Сотрудники ещё не добавлены через Mini App/API."),
+            "<b>👥 Команда</b>\n\n"
+            + ("\n\n".join(lines) if lines else "Сотрудники ещё не добавлены.")
+            + "\n\n<i>Роль сотрудников фиксирована. Username и рабочая Telegram-сессия настраиваются в Ventrix AI.</i>",
+            settings_markup(),
         )
 
     def groups_markup() -> InlineKeyboardMarkup:

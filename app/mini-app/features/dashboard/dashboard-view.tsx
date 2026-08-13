@@ -7,15 +7,15 @@ export function DashboardView({ summary, bootstrap, onOpenProblems }: {
   onOpenProblems: () => void;
 }) {
   const metrics = [
-    [summary.problems, "Проблемы", "требуют внимания", "!"],
-    [summary.signals, "Сигналы", "критичные", "⌁"],
-    [summary.commitments, "Обязательства", "открытые", "✓"],
-    [summary.reports, "Отчёты", "доступны", "▤"],
+    [summary.problems, "Нужно решить", "подтверждённых ситуаций", "!"],
+    [summary.commitments, "Обещания", "открытых обязательств", "✓"],
+    [summary.reports, "Сводки", "готовых отчётов", "▤"],
+    [summary.employees, "Команда", "сотрудников", "◎"],
   ] as const;
   return <>
     <SectionHeading eyebrow="РАБОЧАЯ СВОДКА" title="Что происходит в коммуникациях" description="Только данные вашего проекта и выбранных рабочих Telegram-источников." />
     <Card className="focus-card">
-      <div><StatusBadge tone={summary.problems ? "danger" : "success"}>{summary.problems ? "Требует внимания" : "Всё спокойно"}</StatusBadge><h3>{summary.problems ? `${summary.problems} ситуаций нужно проверить` : "Критичных проблем не найдено"}</h3><p>Каждый вывод Ventrix связан с исходным сообщением и оценкой уверенности.</p></div>
+      <div><StatusBadge tone={summary.problems ? "danger" : "success"}>{summary.problems ? "Нужна реакция" : "Всё спокойно"}</StatusBadge><h3>{summary.problems ? `${summary.problems} подтверждённых ситуаций требуют решения` : "Срочных ситуаций не найдено"}</h3><p>Ventrix отсеивает служебные и завершённые диалоги. В карточке показан контекст, ответственный и следующий шаг.</p></div>
       {summary.problems > 0 && <button onClick={onOpenProblems}>Открыть проблемы</button>}
     </Card>
     <section className="mobile-metrics">{metrics.map(([value, label, note, icon]) => <MetricCard key={label} value={value} label={label} note={note} icon={icon} />)}</section>

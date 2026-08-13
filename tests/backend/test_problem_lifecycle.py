@@ -159,3 +159,40 @@ async def test_remediation_verifier_does_not_treat_acknowledgement_as_fix(
     strong = await verifier.verify(problem, [acknowledgement, completed])
     assert strong.outcome == "fixed"
     assert strong.confidence >= verifier.auto_close_confidence
+
+
+@pytest.mark.asyncio
+async def test_assigned_problem_can_be_marked_false_positive(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, employee, _connection, _dialog, _message, problem = await _problem_fixture(
+        session_factory, make_service, tenant_payload
+    )
+    lifecycle = ProblemLifecycleService(session_factory)
+    await lifecycle.transition(
+        tenant.id,
+        problem.id,
+        TransitionRequest(ProblemStatus.ACKNOWLEDGED, "membership", None, "Проверено"),
+    )
+    await lifecycle.transition(
+        tenant.id,
+        problem.id,
+        TransitionRequest(
+            ProblemStatus.ASSIGNED,
+            "membership",
+            None,
+            "Назначено",
+            responsible_employee_id=employee.id,
+        ),
+    )
+    result = await lifecycle.transition(
+        tenant.id,
+        problem.id,
+        TransitionRequest(
+            ProblemStatus.FALSE_POSITIVE,
+            "membership",
+            None,
+            "Диалог уже завершён",
+        ),
+    )
+    assert result.status == "false_positive"

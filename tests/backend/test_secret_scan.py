@@ -14,7 +14,9 @@ def test_source_export_contains_only_safe_tracked_files(tmp_path) -> None:
         names = set(archive.namelist())
     assert "README.md" in names
     assert not any(
-        name.startswith((".git/", ".next/", ".venv/", "backups/", "data/", "logs/", "node_modules/"))
+        name.startswith(
+            (".git/", ".next/", ".venv/", "backups/", "data/", "logs/", "node_modules/")
+        )
         or name.endswith((".db", ".sqlite", ".sqlite3", ".session", ".log"))
         or (name.rsplit("/", 1)[-1].startswith(".env") and name != ".env.example")
         for name in names

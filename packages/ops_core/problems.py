@@ -36,11 +36,16 @@ ALLOWED_TRANSITIONS: dict[ProblemStatus, frozenset[ProblemStatus]] = {
         {ProblemStatus.ACKNOWLEDGED, ProblemStatus.FALSE_POSITIVE}
     ),
     ProblemStatus.ACKNOWLEDGED: frozenset({ProblemStatus.ASSIGNED, ProblemStatus.IGNORED}),
-    ProblemStatus.ASSIGNED: frozenset({ProblemStatus.IN_PROGRESS}),
+    ProblemStatus.ASSIGNED: frozenset({ProblemStatus.IN_PROGRESS, ProblemStatus.FALSE_POSITIVE}),
     ProblemStatus.IN_PROGRESS: frozenset(
-        {ProblemStatus.WAITING, ProblemStatus.RESOLVED, ProblemStatus.AUTO_RESOLVED}
+        {
+            ProblemStatus.WAITING,
+            ProblemStatus.RESOLVED,
+            ProblemStatus.AUTO_RESOLVED,
+            ProblemStatus.FALSE_POSITIVE,
+        }
     ),
-    ProblemStatus.WAITING: frozenset({ProblemStatus.IN_PROGRESS}),
+    ProblemStatus.WAITING: frozenset({ProblemStatus.IN_PROGRESS, ProblemStatus.FALSE_POSITIVE}),
     ProblemStatus.RESOLVED: frozenset({ProblemStatus.REOPENED}),
     ProblemStatus.AUTO_RESOLVED: frozenset({ProblemStatus.REOPENED}),
     ProblemStatus.REOPENED: frozenset({ProblemStatus.ASSIGNED, ProblemStatus.IN_PROGRESS}),

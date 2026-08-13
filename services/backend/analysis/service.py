@@ -336,6 +336,8 @@ class AnalysisPipelineService:
             await self._fail_run(run_id, "required_ai_batch_failed")
             raise RuntimeError("required AI batch failed")
         result = await self._build_report(run_id)
+        if not result.get("report_id"):
+            return result
         report_id = str(result["report_id"])
         await self.queue.enqueue(
             "report_delivery",
@@ -422,6 +424,8 @@ class AnalysisPipelineService:
 
         await self.transactions.run(finish_children)
         result = await self._build_report(tenant_run_id)
+        if not result.get("report_id"):
+            return {**result, "connections": len(children), "consolidated": True}
         report_id = str(result["report_id"])
         await self.queue.enqueue(
             "report_delivery",
@@ -834,7 +838,7 @@ class AnalysisPipelineService:
             "low": sum(item.priority in {"low", "informational"} for item in problems),
         }
 
-        async def write(session: AsyncSession) -> str:
+        async def write(session: AsyncSession) -> str | None:
             current = await session.get(AnalysisRun, run_id)
             report = await session.scalar(select(Report).where(Report.analysis_run_id == run_id))
             now = datetime.now(UTC)
@@ -842,20 +846,37 @@ class AnalysisPipelineService:
             if due_at is not None and due_at.tzinfo is None:
                 due_at = due_at.replace(tzinfo=UTC)
             delayed = due_at is not None and now > due_at
-            if report is None:
-                report = Report(
-                    tenant_id=current.tenant_id,
-                    analysis_run_id=current.id,
-                    status="ready",
-                    period_start=current.started_at - timedelta(days=history_window_days),
-                    period_end=now,
-                    due_at=current.report_due_at,
-                    ready_at=now,
-                    delivery_status="pending",
-                    summary=f"Обработано сообщений: {metrics['messages']}. Проблем: {metrics['problems']}.",
+            duplicate = await session.scalar(
+                select(Report)
+                .where(
+                    Report.tenant_id == current.tenant_id,
+                    Report.summary
+                    == f"Обработано сообщений: {metrics['messages']}. Проблем: {metrics['problems']}.",
+                    Report.period_end >= now - timedelta(minutes=15),
                 )
-                session.add(report)
-                await session.flush()
+                .order_by(Report.period_end.desc())
+                .limit(1)
+            )
+            suppress_reason = None
+            if metrics["messages"] == 0:
+                suppress_reason = "no_new_reportable_messages"
+            elif report is None and duplicate is not None:
+                suppress_reason = "equivalent_report_already_created"
+            if report is None:
+                if suppress_reason is None:
+                    report = Report(
+                        tenant_id=current.tenant_id,
+                        analysis_run_id=current.id,
+                        status="ready",
+                        period_start=current.started_at - timedelta(days=history_window_days),
+                        period_end=now,
+                        due_at=current.report_due_at,
+                        ready_at=now,
+                        delivery_status="pending",
+                        summary=f"Обработано сообщений: {metrics['messages']}. Проблем: {metrics['problems']}.",
+                    )
+                    session.add(report)
+                    await session.flush()
                 sections = {
                     "overview": metrics,
                     "employee_report": employee_report,
@@ -865,7 +886,7 @@ class AnalysisPipelineService:
                         "items": [item.recommended_action for item in problems[:20]]
                     },
                 }
-                for position, (key, data) in enumerate(sections.items()):
+                for position, (key, data) in enumerate(sections.items()) if report else ():
                     session.add(
                         ReportSection(
                             tenant_id=current.tenant_id,
@@ -875,7 +896,7 @@ class AnalysisPipelineService:
                             data_json=data,
                         )
                     )
-                for key, value in metrics.items():
+                for key, value in metrics.items() if report else ():
                     session.add(
                         ReportMetric(
                             tenant_id=current.tenant_id,
@@ -884,7 +905,7 @@ class AnalysisPipelineService:
                             numeric_value=float(value),
                         )
                     )
-                for problem in problems:
+                for problem in problems if report else ():
                     session.add(
                         ReportProblem(
                             tenant_id=current.tenant_id,
@@ -892,16 +913,17 @@ class AnalysisPipelineService:
                             problem_id=problem.id,
                         )
                     )
-                session.add(
-                    ReportGenerationRun(
-                        tenant_id=current.tenant_id,
-                        report_id=report.id,
-                        status="completed",
-                        started_at=current.started_at,
-                        finished_at=now,
-                        delayed_reason="completed_after_due_time" if delayed else None,
+                if report:
+                    session.add(
+                        ReportGenerationRun(
+                            tenant_id=current.tenant_id,
+                            report_id=report.id,
+                            status="completed",
+                            started_at=current.started_at,
+                            finished_at=now,
+                            delayed_reason="completed_after_due_time" if delayed else None,
+                        )
                     )
-                )
             current.status = "completed"
             current.stage = "report_ready"
             current.finished_at = now
@@ -925,8 +947,12 @@ class AnalysisPipelineService:
             await add_system_event(
                 session,
                 tenant_id=current.tenant_id,
-                event_name="report_ready",
-                metadata={"report_id": report.id, "analysis_run_id": current.id},
+                event_name="report_ready" if report else "report_suppressed",
+                metadata={
+                    "report_id": report.id if report else None,
+                    "analysis_run_id": current.id,
+                    "reason": suppress_reason,
+                },
             )
             await add_system_event(
                 session,
@@ -960,10 +986,14 @@ class AnalysisPipelineService:
                 )
             else:
                 daily.metrics_json = metrics
-            return report.id
+            return report.id if report else None
 
         report_id = await self.transactions.run(write)
-        return {"report_id": report_id, "metrics": metrics}
+        return {
+            "report_id": report_id,
+            "metrics": metrics,
+            "report_suppressed": report_id is None,
+        }
 
     @staticmethod
     def _employee_report(

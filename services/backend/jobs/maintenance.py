@@ -8,7 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..analysis.service import AnalysisPipelineService
 from ..bot.sqlite_storage import SQLiteFSMStorage
 from ..database import SQLiteTransactionManager
-from ..models import BackgroundJob, OperationalProblem, Report, TelegramDialog
+from ..models import (
+    BackgroundJob,
+    GroupIntegration,
+    NotificationLog,
+    OperationalProblem,
+    Report,
+    ReportMetric,
+    TelegramDialog,
+    Tenant,
+)
 from ..telegram_sessions.service import TelegramConnectionService
 from .queue import JobLease
 
@@ -72,10 +81,10 @@ class MaintenanceJobHandlers:
         # Fingerprint has a database uniqueness constraint, so duplicates cannot commit.
         return {"problems": int(total or 0), "duplicates_removed": 0}
 
-    async def report_delivery(self, job: JobLease) -> dict[str, str]:
+    async def report_delivery(self, job: JobLease) -> dict[str, object]:
         report_id = str(job.payload["report_id"])
 
-        async def write(session: AsyncSession) -> str:
+        async def write(session: AsyncSession) -> tuple[str, list[tuple[str, str]]]:
             report = await session.scalar(
                 select(Report).where(
                     Report.id == report_id,
@@ -85,13 +94,95 @@ class MaintenanceJobHandlers:
             )
             if report is None:
                 raise LookupError("ready report not found")
-            # The inline bot and Mini App read this durable state; a transport adapter may
-            # additionally push a Telegram notification without changing report readiness.
-            report.delivery_status = "available"
-            return report.id
+            tenant = await session.get(Tenant, report.tenant_id)
+            if tenant is None:
+                raise LookupError("report tenant not found")
+            metrics = dict(
+                (
+                    await session.execute(
+                        select(ReportMetric.metric_key, ReportMetric.numeric_value).where(
+                            ReportMetric.report_id == report.id
+                        )
+                    )
+                ).all()
+            )
+            text = (
+                f"📊 <b>Рабочая сводка · {tenant.name}</b>\n"
+                f"{report.period_start:%d.%m.%Y} — {report.period_end:%d.%m.%Y}\n\n"
+                f"Сообщений изучено: <b>{int(metrics.get('messages', 0))}</b>\n"
+                f"Ситуаций найдено: <b>{int(metrics.get('problems', 0))}</b>\n"
+                f"Высокий приоритет: <b>{int(metrics.get('high', 0))}</b>\n\n"
+                "Подробности и данные по сотрудникам доступны в Ventrix AI."
+            )
+            destinations: list[tuple[str, str, str | None]] = [
+                ("manager", str(tenant.owner_telegram_user_id), None)
+            ]
+            groups = list(
+                await session.scalars(
+                    select(GroupIntegration).where(
+                        GroupIntegration.tenant_id == tenant.id,
+                        GroupIntegration.status == "active",
+                        GroupIntegration.notifications_enabled.is_(True),
+                    )
+                )
+            )
+            destinations.extend(
+                ("group", str(group.telegram_chat_id), group.id) for group in groups
+            )
+            queued: list[tuple[str, str]] = []
+            for destination_type, destination_id, group_id in destinations:
+                dedup = f"report:{report.id}:{destination_type}:{destination_id}"
+                existing = await session.scalar(
+                    select(NotificationLog).where(NotificationLog.deduplication_key == dedup)
+                )
+                if existing is None:
+                    existing = NotificationLog(
+                        tenant_id=tenant.id,
+                        group_integration_id=group_id,
+                        destination_type=destination_type,
+                        destination_id=destination_id,
+                        deduplication_key=dedup,
+                        criticality=0,
+                        payload_json={
+                            "text": text,
+                            "privacy_safe": True,
+                            "reply_markup": {
+                                "inline_keyboard": [
+                                    [
+                                        {
+                                            "text": "Открыть отчёты",
+                                            "callback_data": "client:reports",
+                                        }
+                                    ]
+                                ]
+                            },
+                        },
+                    )
+                    session.add(existing)
+                    await session.flush()
+                if existing.status != "sent":
+                    queued.append((existing.id, destination_type))
+            report.delivery_status = "pending" if queued else "sent"
+            if not queued:
+                report.delivered_at = datetime.now(UTC)
+            return report.id, queued
 
-        delivered_id = await self.transactions.run(write)
-        return {"report_id": delivered_id, "delivery_status": "available"}
+        delivered_id, notifications = await self.transactions.run(write)
+        for notification_id, destination_type in notifications:
+            await self.analysis.queue.enqueue(
+                f"notification.{destination_type}",
+                {"notification_id": notification_id},
+                tenant_id=job.tenant_id,
+                priority=35,
+                idempotency_key=f"report-delivery:{notification_id}",
+                correlation_id=report_id,
+                category="notifications",
+            )
+        return {
+            "report_id": delivered_id,
+            "delivery_status": "queued" if notifications else "sent",
+            "notifications": len(notifications),
+        }
 
     async def statistics_refresh(self, job: JobLease) -> dict[str, int]:
         if job.tenant_id is None:

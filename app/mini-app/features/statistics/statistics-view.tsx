@@ -6,10 +6,9 @@ export function StatisticsView({ summary }: { summary: DashboardSummary }) {
   return <>
     <SectionHeading eyebrow="СТАТИСТИКА" title="Состояние проекта" description="Операционные показатели без технических AI-лимитов и внутренних настроек моделей." />
     <section className="statistics-grid">
-      <MetricCard value={summary.problems} label="Открытые проблемы" icon="!" />
-      <MetricCard value={summary.signals} label="Критичные сигналы" icon="⌁" />
-      <MetricCard value={summary.commitments} label="Обязательства" icon="✓" />
-      <MetricCard value={summary.reports} label="Отчёты" icon="▤" />
+      <MetricCard value={summary.problems} label="Ситуации в работе" icon="!" />
+      <MetricCard value={summary.commitments} label="Открытые обещания" icon="✓" />
+      <MetricCard value={summary.reports} label="Готовые сводки" icon="▤" />
       <MetricCard value={summary.employees} label="Сотрудники" icon="◎" />
       <MetricCard value={summary.groups} label="Рабочие группы" icon="◫" />
     </section>

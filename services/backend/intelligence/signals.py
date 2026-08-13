@@ -243,9 +243,7 @@ class SignalService:
         return created
 
     @staticmethod
-    async def _clear_non_business_state(
-        session: AsyncSession, message: TelegramMessage
-    ) -> None:
+    async def _clear_non_business_state(session: AsyncSession, message: TelegramMessage) -> None:
         state = await session.scalar(
             select(DialogState).where(DialogState.dialog_id == message.dialog_id)
         )
@@ -522,6 +520,12 @@ class SignalService:
                 unresolved_questions_json=[],
             )
             session.add(state)
+        elif state.last_activity_at is not None and SignalService._aware(
+            state.last_activity_at
+        ) > SignalService._aware(message.sent_at):
+            # Historical scan batches may complete out of order. An older message must
+            # never reopen an SLA timer already cleared by a newer employee reply.
+            return
         state.last_activity_at = message.sent_at
         employee_side = message.outgoing or message.sender_role in {"employee", "account_owner"}
         if employee_side:
@@ -563,3 +567,7 @@ class SignalService:
             meaningful = True
         if meaningful or any(item.score >= 65 for item in candidates):
             state.meaningful_version = (state.meaningful_version or 0) + 1
+
+    @staticmethod
+    def _aware(value: datetime) -> datetime:
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

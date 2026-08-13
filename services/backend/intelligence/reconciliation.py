@@ -71,8 +71,7 @@ class ReconciliationService:
             select(1).where(
                 commitment_evidence.tenant_id == Commitment.tenant_id,
                 commitment_evidence.dialog_id == Commitment.dialog_id,
-                commitment_evidence.telegram_message_id
-                > commitment_source.telegram_message_id,
+                commitment_evidence.telegram_message_id > commitment_source.telegram_message_id,
                 commitment_evidence.deleted_at.is_(None),
                 or_(
                     Commitment.last_checked_at.is_(None),
@@ -256,9 +255,7 @@ class ReconciliationService:
                 telegram_account_id=commitment.connection_id,
                 dialog_id=commitment.dialog_id,
                 scheduled_at=deadline,
-                idempotency_key=(
-                    f"commitment-deadline:{commitment.id}:{deadline.isoformat()}"
-                ),
+                idempotency_key=(f"commitment-deadline:{commitment.id}:{deadline.isoformat()}"),
                 category="reconciliation",
                 cost_class="light",
             )
@@ -303,6 +300,25 @@ class ReconciliationService:
             source = await session.get(TelegramMessage, expected_message_id)
             if source is None:
                 return None, None
+            later_employee_reply = await session.scalar(
+                select(TelegramMessage.id)
+                .where(
+                    TelegramMessage.tenant_id == job.tenant_id,
+                    TelegramMessage.dialog_id == dialog_id,
+                    TelegramMessage.telegram_message_id > source.telegram_message_id,
+                    TelegramMessage.deleted_at.is_(None),
+                    or_(
+                        TelegramMessage.outgoing.is_(True),
+                        TelegramMessage.sender_role.in_(("employee", "account_owner")),
+                    ),
+                )
+                .limit(1)
+            )
+            if later_employee_reply is not None:
+                state.awaiting_employee_since = None
+                state.response_expected_message_id = None
+                state.next_sla_check_at = None
+                return None, None
             dialog = await session.get(TelegramDialog, dialog_id)
             relevance = classify_message_relevance(
                 source.body_text,
@@ -336,7 +352,10 @@ class ReconciliationService:
                     local_score=settings.signal_problem_threshold,
                     criticality=settings.signal_problem_threshold,
                     status="problem_created",
-                    reason="Клиент не получил ответ в пределах SLA.",
+                    reason=(
+                        "Клиент не получил ответ за "
+                        f"{settings.response_sla_minutes} мин. — установленное время ответа."
+                    ),
                     detected_at=now,
                     processed_at=now,
                     metadata_json={"response_expected_message_id": expected_message_id},
@@ -378,7 +397,10 @@ class ReconciliationService:
                         problem,
                         responsible_employee_id=responsible,
                         requires_confirmation=responsible is None,
-                        reason="SLA истёк без ответа сотрудника.",
+                        reason=(
+                            "Истекло установленное время ответа "
+                            f"({settings.response_sla_minutes} мин.)."
+                        ),
                     )
                 )
             return signal.id, problem.id

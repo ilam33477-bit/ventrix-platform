@@ -307,6 +307,11 @@ class NotificationOrchestrator:
                 else None
             )
             current_problem = await session.get(OperationalProblem, problem.id) if problem else None
+            responsible = (
+                await session.get(Employee, current_problem.responsible_employee_id)
+                if current_problem and current_problem.responsible_employee_id
+                else None
+            )
             level = (
                 "Критично"
                 if signal.criticality >= 90
@@ -322,13 +327,25 @@ class NotificationOrchestrator:
             else:
                 person = current_dialog.title or "Собеседник"
                 username = (source.sender_username if source else None) or current_dialog.username
-                telegram_id = source.sender_id if source else None
                 body = ((source.body_text if source else None) or "Сообщение без текста")[:1200]
-                context = (
-                    (current_problem.explanation if current_problem else None)
-                    or signal.reason
-                    or "Ситуация подтверждена анализом диалога."
-                )[:1000]
+                recent_messages = list(
+                    await session.scalars(
+                        select(TelegramMessage)
+                        .where(
+                            TelegramMessage.dialog_id == signal.dialog_id,
+                            TelegramMessage.deleted_at.is_(None),
+                            TelegramMessage.telegram_message_id
+                            <= (source.telegram_message_id if source else 0),
+                        )
+                        .order_by(TelegramMessage.telegram_message_id.desc())
+                        .limit(5)
+                    )
+                )
+                recent_messages.reverse()
+                context = "\n".join(
+                    f"{'Сотрудник' if item.outgoing else 'Клиент'}: {(item.body_text or 'сообщение без текста')[:260]}"
+                    for item in recent_messages
+                )[:1600]
                 try:
                     event_time = signal.detected_at.astimezone(
                         timezone_info(tenant_settings.timezone)
@@ -345,36 +362,28 @@ class NotificationOrchestrator:
                     f"{destination_intro}"
                     f"<b>Клиент:</b> {escape(person)}\n"
                     f"<b>Username:</b> {escape('@' + username) if username else 'не указан'}\n"
-                    f"<b>Telegram ID:</b> <code>{telegram_id or 'неизвестен'}</code>\n"
-                    f"<b>Чат:</b> {escape(current_dialog.title or person)}\n\n"
+                    f"<b>Ответственный:</b> {escape(responsible.display_name) if responsible else 'нужно назначить'}\n\n"
                     f"<b>Причина:</b>\n{escape(signal.reason)}\n\n"
-                    f"<b>Исходное сообщение:</b>\n<blockquote>{escape(body)}</blockquote>\n\n"
-                    f"<b>Контекст:</b>\n<blockquote>{escape(context)}</blockquote>\n\n"
-                    "<b>Следующий шаг:</b> Ответить клиенту или уточнить статус у ответственного.\n\n"
+                    f"<b>Сообщение:</b>\n<blockquote>{escape(body)}</blockquote>\n\n"
+                    f"<b>Последние реплики:</b>\n<blockquote>{escape(context or body)}</blockquote>\n\n"
+                    f"<b>Что сделать:</b> {escape((current_problem.recommended_action if current_problem else None) or 'Проверить диалог и определить следующий шаг.')}\n\n"
                     f"<i>{event_time:%d.%m.%Y %H:%M}</i>"
                 )
             rows: list[list[dict[str, str]]] = []
             if current_problem:
                 rows.append(
                     [
-                        {
-                            "text": "Открыть карточку",
-                            "callback_data": f"np:open:{current_problem.id}",
-                        },
-                        {"text": "Закрыть", "callback_data": f"np:close:{current_problem.id}"},
+                        {"text": "Решено", "callback_data": f"np:close:{current_problem.id}"},
+                        {"text": "Не проблема", "callback_data": f"np:false:{current_problem.id}"},
                     ]
                 )
-                if destination_type == "manager":
+                if destination_type == "manager" and responsible and responsible.telegram_user_id:
                     rows.append(
                         [
                             {
-                                "text": "Не проблема",
-                                "callback_data": f"np:false:{current_problem.id}",
-                            },
-                            {
-                                "text": "Уведомить сотрудника",
+                                "text": f"Уведомить {responsible.display_name[:25]}",
                                 "callback_data": f"np:notify:{current_problem.id}",
-                            },
+                            }
                         ]
                     )
             username = current_dialog.username if current_dialog else None

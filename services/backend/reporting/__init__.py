@@ -1,0 +1,1 @@
+"""Tenant report rendering adapters."""
