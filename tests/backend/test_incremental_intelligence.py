@@ -332,7 +332,9 @@ async def test_incremental_ingestion_is_idempotent_and_recovers_cursor_after_res
             select(func.count(BackgroundJob.id)).where(BackgroundJob.job_type == "signal.ai_triage")
         )
     assert first["messages"] == 2 and second["messages"] == 0
-    assert message_count == 2 and signal_count >= 2
+    # The acknowledgement "ок" is a terminal courtesy message, not a
+    # separate business signal. Only the actionable request is queued.
+    assert message_count == 2 and signal_count == 1
     assert cursor.last_message_id == 2
     assert gateway.fetch_after_ids == [0, 2]
     assert queued_triage == signal_count

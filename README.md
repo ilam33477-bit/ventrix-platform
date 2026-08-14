@@ -200,6 +200,8 @@ docker compose exec backend python -m services.backend.jobs.cli enqueue-test --t
 Initial sync, incremental ingestion и scheduled analysis коррелируют находки через один downstream
 lifecycle. Проблемы изменяются только через доменную FSM, а автоматическое закрытие требует
 deterministic/AI verification с достаточной уверенностью и сохраняет audit trail.
+SLA запускается только для содержательного входящего запроса. Отметка «Не проблема» обратима;
+накопленная tenant-specific обратная связь периодически обобщается DeepSeek и версионируется.
 
 Безопасный экспорт только исходников:
 

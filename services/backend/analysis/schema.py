@@ -19,6 +19,12 @@ class DetectedProblem(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     summary: str = Field(min_length=1, max_length=2000)
     recommended_action: str = Field(min_length=1, max_length=2000)
+    conversation_state: str = Field(default="AMBIGUOUS", max_length=40)
+    response_required: bool = True
+    action_required: bool = True
+    issue_family: str | None = Field(default=None, max_length=64)
+    evidence_message_ids: list[str | int] = Field(default_factory=list)
+    close_existing_issue_families: list[str] = Field(default_factory=list)
 
 
 class DialogAnalysisResult(BaseModel):

@@ -20,6 +20,7 @@ from ..models import (
     DialogState,
     TelegramDialog,
     TelegramMessage,
+    TenantAIFeedbackProfile,
     TenantAIProfile,
     TenantSettings,
 )
@@ -203,6 +204,11 @@ class AnalysisBatchBuilder:
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == run.tenant_id)
             )
+            feedback_profile = await session.scalar(
+                select(TenantAIFeedbackProfile).where(
+                    TenantAIFeedbackProfile.tenant_id == run.tenant_id
+                )
+            )
             if profile is None or settings is None:
                 raise LookupError("tenant analysis profile/settings not found")
             dialog_query = select(TelegramDialog).where(
@@ -260,6 +266,12 @@ class AnalysisBatchBuilder:
                 "ai_instructions": profile.additional_instructions,
                 "working_hours": settings.working_hours,
                 "response_sla_minutes": settings.response_sla_minutes,
+                "learned_false_positive_guidance": (
+                    feedback_profile.guidance_json if feedback_profile is not None else {}
+                ),
+                "feedback_guidance_version": (
+                    feedback_profile.version if feedback_profile is not None else 0
+                ),
             },
         }
         input_budget = self.model_budget.usable_input_tokens(

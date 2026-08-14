@@ -51,7 +51,7 @@ ALLOWED_TRANSITIONS: dict[ProblemStatus, frozenset[ProblemStatus]] = {
     ProblemStatus.RESOLVED: frozenset({ProblemStatus.REOPENED}),
     ProblemStatus.AUTO_RESOLVED: frozenset({ProblemStatus.REOPENED}),
     ProblemStatus.REOPENED: frozenset({ProblemStatus.ASSIGNED, ProblemStatus.IN_PROGRESS}),
-    ProblemStatus.FALSE_POSITIVE: frozenset(),
+    ProblemStatus.FALSE_POSITIVE: frozenset({ProblemStatus.REOPENED}),
     ProblemStatus.IGNORED: frozenset(),
 }
 

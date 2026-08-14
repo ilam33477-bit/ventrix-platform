@@ -240,8 +240,38 @@ def build_client_router(
         rows.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    def problem_status_markup(
+        problem_id: str, *, false_positive: bool = False
+    ) -> InlineKeyboardMarkup:
+        if false_positive:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        text="Вернуть как проблему", callback_data=f"np:restore:{problem_id}"
+                    )
+                ],
+                *problem_system_markup(problem_id).inline_keyboard,
+            ]
+        else:
+            rows = [
+                [
+                    InlineKeyboardButton(text="Решено", callback_data=f"np:close:{problem_id}"),
+                    InlineKeyboardButton(
+                        text="Не проблема", callback_data=f"np:false:{problem_id}"
+                    ),
+                ],
+                *problem_system_markup(problem_id).inline_keyboard,
+            ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     async def mark_problem_card(
-        query: CallbackQuery, problem_id: str, *, status_text: str, note: str
+        query: CallbackQuery,
+        problem_id: str,
+        *,
+        status_text: str,
+        note: str,
+        false_positive: bool = False,
+        restored: bool = False,
     ) -> None:
         if not query.message:
             return
@@ -255,7 +285,13 @@ def build_client_router(
         try:
             await query.message.edit_text(
                 updated,
-                reply_markup=problem_system_markup(problem_id),
+                reply_markup=(
+                    problem_status_markup(problem_id, false_positive=True)
+                    if false_positive
+                    else problem_status_markup(problem_id)
+                    if restored
+                    else problem_system_markup(problem_id)
+                ),
             )
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc).lower():
@@ -570,6 +606,7 @@ def build_client_router(
             problem_id,
             status_text="Не проблема",
             note="Карточка исключена из активных ситуаций и синхронизирована с Mini App.",
+            false_positive=True,
         )
         await query.answer("Отмечено как не проблема", show_alert=True)
         await record(
@@ -577,6 +614,38 @@ def build_client_router(
             "problem_false_positive",
             problem_id=problem_id,
         )
+
+    @router.callback_query(F.data.startswith("np:restore:"))
+    async def notification_restore_problem(
+        query: CallbackQuery, client_context: ClientContext
+    ) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await query.answer("Действие доступно владельцу или менеджеру", show_alert=True)
+            return
+        problem_id = query.data.rsplit(":", 1)[1]
+        try:
+            await ProblemLifecycleService(events.session_factory).transition(
+                client_context.tenant_id,
+                problem_id,
+                TransitionRequest(
+                    target=ProblemStatus.REOPENED,
+                    actor_type="tenant_owner",
+                    actor_id=str(client_context.telegram_user_id),
+                    reason="Владелец вернул ошибочно исключённую карточку в работу.",
+                ),
+            )
+        except ValueError:
+            await query.answer("Карточку уже нельзя вернуть этим действием", show_alert=True)
+            return
+        await mark_problem_card(
+            query,
+            problem_id,
+            status_text="Снова в работе",
+            note="Карточка возвращена в активные ситуации и Mini App.",
+            restored=True,
+        )
+        await query.answer("Карточка возвращена", show_alert=True)
+        await record(client_context, "problem_restored", problem_id=problem_id)
 
     @router.callback_query(F.data.startswith("np:close:"))
     async def notification_close(query: CallbackQuery, client_context: ClientContext) -> None:
@@ -634,6 +703,17 @@ def build_client_router(
                         "tenant_owner",
                         str(client_context.telegram_user_id),
                         "Владелец подтвердил выполнение действия.",
+                    ),
+                )
+            if problem.status == ProblemStatus.REOPENED.value:
+                problem = await lifecycle.transition(
+                    client_context.tenant_id,
+                    problem.id,
+                    TransitionRequest(
+                        ProblemStatus.IN_PROGRESS,
+                        "tenant_owner",
+                        str(client_context.telegram_user_id),
+                        "Возвращённая проблема взята в работу перед закрытием.",
                     ),
                 )
             if problem.status not in {ProblemStatus.IN_PROGRESS.value, ProblemStatus.WAITING.value}:

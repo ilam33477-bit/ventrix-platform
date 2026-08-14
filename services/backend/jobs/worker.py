@@ -17,6 +17,7 @@ from ..bot.sqlite_storage import SQLiteFSMStorage
 from ..config import get_settings
 from ..database import get_session_factory
 from ..intelligence.ai_triage import AITriageService
+from ..intelligence.feedback_learning import TenantFeedbackLearningService
 from ..intelligence.notifications import (
     NotificationDispatcher,
     TelegramBotNotificationSender,
@@ -223,6 +224,11 @@ async def run() -> None:
         verification_provider=provider,
         verification_model=settings.deepseek_fast_model,
     )
+    feedback_learning = TenantFeedbackLearningService(
+        session_factory,
+        provider,
+        model=settings.deepseek_fast_model,
+    )
     notification_sender = TelegramBotNotificationSender(
         session_factory,
         encryption,
@@ -259,6 +265,7 @@ async def run() -> None:
             "dialog.sla_check": reconciliation.sla_check,
             "problem.evaluate": reconciliation.evaluate_problem,
             "analysis.hourly": reconciliation.reconcile,
+            "feedback.synthesize": feedback_learning.synthesize,
             "notification.employee": notification_dispatcher.dispatch,
             "notification.manager": notification_dispatcher.dispatch,
             "notification.group": notification_dispatcher.dispatch,

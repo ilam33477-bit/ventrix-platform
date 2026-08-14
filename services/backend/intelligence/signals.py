@@ -15,12 +15,15 @@ from ..models import (
     DialogState,
     Employee,
     EmployeeTelegramAccount,
+    OperationalProblem,
+    ProblemTransition,
     Signal,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
     TenantSettings,
 )
+from .conversation_state import ConversationAssessment, assess_conversation
 from .local_signals import LocalSignalCandidate, LocalSignalEngine
 from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
@@ -138,15 +141,56 @@ class SignalService:
         if not relevance.business_relevant:
             await self._clear_non_business_state(session, message)
             return []
+        assessment = assess_conversation([*previous, message])
         candidates = self.engine.scan(
             message,
             previous,
             response_sla_minutes=settings.response_sla_minutes,
             timezone=settings.timezone,
         )
+        protected = [
+            item
+            for item in candidates
+            if item.signal_type in {"employee_commitment", "invoice_received"}
+        ]
+        if assessment.action_required and assessment.issue_family:
+            engine_types = {item.signal_type for item in candidates}
+            signal_type = {
+                "UNANSWERED_REQUEST": (
+                    "contract_question"
+                    if "contract_question" in engine_types
+                    else "customer_question"
+                ),
+                "TECHNICAL_PROBLEM": "technical_problem",
+                "COMMERCIAL_OPPORTUNITY": "commercial_opportunity",
+                "PRODUCT_DISSATISFACTION": "complaint",
+                "PAYMENT_QUESTION": "payment_question",
+                "HANDOFF": "handoff",
+            }.get(assessment.issue_family, "customer_question")
+            score = 80 if assessment.severity == "HIGH" else 68
+            candidates = [
+                LocalSignalCandidate(
+                    signal_type=signal_type,
+                    score=score,
+                    reason=assessment.reason,
+                    features={
+                        "conversation": assessment.as_payload(),
+                        "response_required": assessment.response_required,
+                        "issue_family": assessment.issue_family,
+                    },
+                ),
+                *[item for item in protected if item.signal_type != signal_type],
+            ]
+        else:
+            candidates = protected
         if not candidates:
             await self._update_dialog_state(
-                session, message, [], None, settings.response_sla_minutes
+                session,
+                message,
+                [],
+                None,
+                settings.response_sla_minutes,
+                assessment,
             )
             return []
         employee_id = await self._employee_id(session, message)
@@ -238,7 +282,12 @@ class SignalService:
                 await self._create_commitment(session, signal, message, candidate, employee_id)
             created.append(signal)
         await self._update_dialog_state(
-            session, message, candidates, employee_id, settings.response_sla_minutes
+            session,
+            message,
+            candidates,
+            employee_id,
+            settings.response_sla_minutes,
+            assessment,
         )
         return created
 
@@ -507,6 +556,7 @@ class SignalService:
         candidates: list[LocalSignalCandidate],
         employee_id: str | None,
         response_sla_minutes: int,
+        assessment: ConversationAssessment,
     ) -> None:
         state = await session.scalar(
             select(DialogState).where(DialogState.dialog_id == message.dialog_id)
@@ -539,9 +589,57 @@ class SignalService:
             state.last_customer_message_id = message.telegram_message_id
             state.last_customer_message_at = message.sent_at
             state.awaiting_customer_since = None
-            state.awaiting_employee_since = message.sent_at
-            state.response_expected_message_id = message.id
-            state.next_sla_check_at = message.sent_at + timedelta(minutes=response_sla_minutes)
+            if assessment.response_required and assessment.action_required:
+                state.awaiting_employee_since = message.sent_at
+                state.response_expected_message_id = message.id
+                state.next_sla_check_at = message.sent_at + timedelta(minutes=response_sla_minutes)
+            else:
+                state.awaiting_employee_since = None
+                state.response_expected_message_id = None
+                state.next_sla_check_at = None
+        families_to_close = set(assessment.close_existing_issue_families)
+        if employee_side:
+            # A reply resolves the generic unanswered-request issue. Specific
+            # technical/payment issues still require their remediation verifier.
+            families_to_close.add("UNANSWERED_REQUEST")
+        if families_to_close:
+            active = list(
+                await session.scalars(
+                    select(OperationalProblem).where(
+                        OperationalProblem.tenant_id == message.tenant_id,
+                        OperationalProblem.dialog_id == message.dialog_id,
+                        OperationalProblem.issue_family.in_(families_to_close),
+                        OperationalProblem.status.in_(
+                            (
+                                "new",
+                                "needs_confirmation",
+                                "acknowledged",
+                                "assigned",
+                                "in_progress",
+                                "waiting",
+                                "reopened",
+                            )
+                        ),
+                    )
+                )
+            )
+            for problem in active:
+                previous = problem.status
+                problem.status = "auto_resolved"
+                problem.resolved_at = message.sent_at
+                problem.closed_reason = "Диалог продолжен или корректно завершён."
+                problem.resolution_evidence = (message.body_text or "")[:2000]
+                session.add(
+                    ProblemTransition(
+                        tenant_id=problem.tenant_id,
+                        problem_id=problem.id,
+                        from_status=previous,
+                        to_status="auto_resolved",
+                        actor_type="conversation_classifier",
+                        reason=problem.closed_reason,
+                        evidence=problem.resolution_evidence,
+                    )
+                )
         meaningful = False
         if not message.outgoing and "?" in (message.body_text or ""):
             questions = list(state.unresolved_questions_json or [])

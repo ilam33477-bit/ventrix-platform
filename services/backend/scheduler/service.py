@@ -4,16 +4,18 @@ import logging
 from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..database import SQLiteTransactionManager
 from ..jobs.queue import JOB_PRIORITY, SQLiteJobQueue
 from ..models import (
     BackgroundJob,
+    ProblemTransition,
     RuntimeHealth,
     TelegramConnection,
     Tenant,
+    TenantAIFeedbackProfile,
     TenantAnalysisSchedule,
     TenantSettings,
 )
@@ -228,6 +230,47 @@ class TenantAnalysisScheduler:
                 )
             )
             tenant_ids = sorted({item.tenant_id for item in connections})
+            feedback_tenant_ids = list(
+                await session.scalars(
+                    select(Tenant.id)
+                    .join(
+                        TenantAnalysisSchedule,
+                        TenantAnalysisSchedule.tenant_id == Tenant.id,
+                    )
+                    .where(
+                        Tenant.status == "active",
+                        Tenant.deleted_at.is_(None),
+                        TenantAnalysisSchedule.access_status == "active",
+                        (
+                            TenantAnalysisSchedule.access_expires_at.is_(None)
+                            | (TenantAnalysisSchedule.access_expires_at >= now)
+                        ),
+                    )
+                )
+            )
+            feedback_due: list[tuple[str, datetime]] = []
+            for tenant_id in feedback_tenant_ids:
+                profile = await session.scalar(
+                    select(TenantAIFeedbackProfile).where(
+                        TenantAIFeedbackProfile.tenant_id == tenant_id
+                    )
+                )
+                pending_query = select(
+                    func.count(ProblemTransition.id),
+                    func.min(ProblemTransition.occurred_at),
+                    func.max(ProblemTransition.occurred_at),
+                ).where(
+                    ProblemTransition.tenant_id == tenant_id,
+                    ProblemTransition.to_status == "false_positive",
+                )
+                if profile and profile.last_processed_transition_at:
+                    pending_query = pending_query.where(
+                        ProblemTransition.occurred_at > profile.last_processed_transition_at
+                    )
+                count, oldest, latest = (await session.execute(pending_query)).one()
+                weekly_due = oldest is not None and oldest <= now - timedelta(days=7)
+                if count and latest is not None and (count >= 10 or weekly_due):
+                    feedback_due.append((tenant_id, latest))
         fetch_bucket = int(now.timestamp() // self.incremental_interval_seconds)
         reconcile_bucket = int(now.timestamp() // self.reconciliation_interval_seconds)
         job_ids: list[str] = []
@@ -259,6 +302,24 @@ class TenantAnalysisScheduler:
                     is_heavy=False,
                     category="reconciliation",
                     cost_class="light",
+                    max_attempts=3,
+                )
+            )
+        for tenant_id, latest in feedback_due:
+            feedback_week = int(now.timestamp() // (7 * 24 * 3600))
+            job_ids.append(
+                await self.queue.enqueue(
+                    "feedback.synthesize",
+                    {},
+                    tenant_id=tenant_id,
+                    priority=JOB_PRIORITY["P3"],
+                    idempotency_key=(
+                        f"feedback-learning:{tenant_id}:{latest.isoformat()}:{feedback_week}"
+                    ),
+                    correlation_id=str(uuid4()),
+                    is_heavy=False,
+                    category="ai",
+                    cost_class="standard",
                     max_attempts=3,
                 )
             )

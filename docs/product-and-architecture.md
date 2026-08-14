@@ -137,6 +137,20 @@ Closure requires either human confirmation or verification evidence. An automate
 9. Deduplicate and correlate events before creating a problem.
 10. Re-run a narrow verifier after later relevant messages.
 
+Before AI triage, one shared conversation-state classifier assigns semantic roles
+(`EMPLOYEE/outgoing`, `CLIENT/incoming`) and a state such as `WAITING_FOR_EMPLOYEE`,
+`WAITING_FOR_CLIENT`, `CLOSED_SUCCESS`, `CLOSED_REJECTED`, `ACTIVE_SUPPORT` or
+`ACTIVE_SALES`. SLA starts only when a client message requires a concrete response.
+Problem identity is canonical per tenant, dialog and issue family; a specific payment,
+technical or dissatisfaction issue supersedes a generic unanswered-request card.
+
+`false_positive` is reversible through `reopened`. Explicit false-positive transitions are
+batched per tenant: ten new examples trigger synthesis early, while any pending example is
+processed after seven days at the latest. DeepSeek produces generalized suppression guidance
+without names, usernames or IDs. The versioned guidance is supplied to both fast triage and
+scheduled analysis, but it can only make filtering stricter and cannot suppress direct questions,
+payments, unresolved failures, complaints or employee promises.
+
 Routes are `fast` (Flash/non-thinking), `balanced` (Flash/thinking), `deep` (Pro/high), and `critical` (Pro/max). Model IDs live in configuration and are checked against `GET /models` at startup when a key is available. On 2026-08-04 the official documentation lists `deepseek-v4-flash` and `deepseek-v4-pro`; runtime discovery remains authoritative.
 
 ## 8. Tenant creation scenario

@@ -97,6 +97,18 @@ class ProblemLifecycleService:
                 problem.resolved_at = None
                 problem.closed_reason = None
                 problem.resolution_evidence = None
+                if problem.signal_id:
+                    signal = await session.get(Signal, problem.signal_id)
+                    if signal is not None and signal.tenant_id == tenant_id:
+                        signal.status = "problem_created"
+                        signal.metadata_json = {
+                            **(signal.metadata_json or {}),
+                            "tenant_feedback": {
+                                "verdict": "restored",
+                                "reason": reason,
+                                "recorded_at": datetime.now(UTC).isoformat(),
+                            },
+                        }
 
             if request.deadline_at is not None:
                 problem.deadline_at = request.deadline_at

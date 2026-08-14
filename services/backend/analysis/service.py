@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.ai_router import RouteName
 
 from ..database import SQLiteTransactionManager
+from ..intelligence.conversation_state import assess_conversation
 from ..intelligence.message_relevance import dialogue_is_explicitly_closed
 from ..intelligence.problem_lifecycle import initialize_problem_lifecycle
 from ..jobs.queue import JobDeferred, JobLease, SQLiteJobQueue
@@ -80,6 +81,11 @@ employee accepted that outcome (for example "понял, без проблем",
 as "хорошо, спасибо за предложение" do not reopen it. Emit no problem for that dialog.
 If the evidence can also be explained as a completed polite sales conversation, prefer
 is_problem=false. Silence alone is never sufficient evidence of a problem.
+For every candidate also return conversation_state, response_required, action_required,
+issue_family, evidence_message_ids and close_existing_issue_families. EMPLOYEE/outgoing is
+the monitored employee; CLIENT/incoming is external. Never infer client interest from an
+employee pitch. Prefer NO_ACTION when uncertain. A main problem requires literal evidence,
+action_required=true, and confidence >=0.80 for high/critical or >=0.85 for medium.
 """
 
 CANONICAL_PROBLEM_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -110,6 +116,23 @@ def canonical_problem_type(value: str) -> str:
         if any(hint in normalized for hint in hints):
             return canonical
     return "operational_risk"
+
+
+def canonical_issue_family(problem_type: str) -> str:
+    value = problem_type.casefold()
+    if any(marker in value for marker in ("payment", "invoice", "price", "оплат")):
+        return "PAYMENT_QUESTION"
+    if any(marker in value for marker in ("technical", "support", "error", "технич")):
+        return "TECHNICAL_PROBLEM"
+    if any(marker in value for marker in ("complaint", "dissatisfaction", "mismatch")):
+        return "PRODUCT_DISSATISFACTION"
+    if any(marker in value for marker in ("lead", "commercial", "partnership", "opportunity")):
+        return "COMMERCIAL_OPPORTUNITY"
+    if any(marker in value for marker in ("commitment", "promise", "deadline")):
+        return "PROMISE_DEADLINE"
+    if "follow" in value or "task" in value:
+        return "FOLLOWUP"
+    return "UNANSWERED_REQUEST" if "answer" in value or "question" in value else "OTHER"
 
 
 class AnalysisPipelineService:
@@ -653,24 +676,33 @@ class AnalysisPipelineService:
                     ):
                         continue
                     problem_type = canonical_problem_type(candidate.event_type)
-                    if problem_type == "client_without_answer":
-                        latest = list(
-                            await session.scalars(
-                                select(TelegramMessage)
-                                .where(
-                                    TelegramMessage.tenant_id == batch.tenant_id,
-                                    TelegramMessage.dialog_id == dialog.id,
-                                    TelegramMessage.deleted_at.is_(None),
-                                )
-                                .order_by(TelegramMessage.telegram_message_id.desc())
-                                .limit(10)
+                    latest = list(
+                        await session.scalars(
+                            select(TelegramMessage)
+                            .where(
+                                TelegramMessage.tenant_id == batch.tenant_id,
+                                TelegramMessage.dialog_id == dialog.id,
+                                TelegramMessage.deleted_at.is_(None),
                             )
+                            .order_by(TelegramMessage.telegram_message_id.desc())
+                            .limit(20)
                         )
-                        latest.reverse()
-                        if dialogue_is_explicitly_closed(
+                    )
+                    latest.reverse()
+                    assessment = assess_conversation(latest)
+                    if (
+                        dialogue_is_explicitly_closed(
                             [{"outgoing": item.outgoing, "text": item.body_text} for item in latest]
-                        ):
-                            continue
+                        )
+                        or not candidate.action_required
+                        or (
+                            not assessment.action_required
+                            and problem_type
+                            not in {"commitment_risk", "overdue_commitment", "payment_risk"}
+                        )
+                    ):
+                        continue
+                    issue_family = candidate.issue_family or canonical_issue_family(problem_type)
                     source_remote_id = int(candidate.source_message_ids[0])
                     source = await session.scalar(
                         select(TelegramMessage).where(
@@ -718,22 +750,86 @@ class AnalysisPipelineService:
                         )
                         session.add(signal)
                         await session.flush()
-                    minimum_confidence = (
-                        0.55 if candidate.priority in {"high", "critical"} else 0.65
-                    )
+                    minimum_confidence = 0.8 if candidate.priority in {"high", "critical"} else 0.85
                     if (
                         candidate.priority in {"low", "informational"}
                         or candidate.confidence < minimum_confidence
                     ):
                         signal.status = "triaged"
                         continue
-                    problem_fingerprint = f"signal:{signal_fingerprint}"
-                    exists = await session.scalar(
-                        select(OperationalProblem.id).where(
-                            OperationalProblem.fingerprint == problem_fingerprint
+                    if issue_family == "UNANSWERED_REQUEST":
+                        specific = await session.scalar(
+                            select(OperationalProblem.id).where(
+                                OperationalProblem.tenant_id == batch.tenant_id,
+                                OperationalProblem.dialog_id == dialog.id,
+                                OperationalProblem.issue_family.in_(
+                                    (
+                                        "TECHNICAL_PROBLEM",
+                                        "PAYMENT_QUESTION",
+                                        "PRODUCT_DISSATISFACTION",
+                                        "COMMERCIAL_OPPORTUNITY",
+                                    )
+                                ),
+                                OperationalProblem.status.in_(
+                                    (
+                                        "new",
+                                        "needs_confirmation",
+                                        "acknowledged",
+                                        "assigned",
+                                        "in_progress",
+                                        "waiting",
+                                        "reopened",
+                                    )
+                                ),
+                            )
                         )
+                        if specific is not None:
+                            signal.status = "triaged"
+                            continue
+                    problem_fingerprint = f"signal:{signal_fingerprint}"
+                    existing_problem = await session.scalar(
+                        select(OperationalProblem)
+                        .where(
+                            OperationalProblem.tenant_id == batch.tenant_id,
+                            OperationalProblem.dialog_id == dialog.id,
+                            OperationalProblem.issue_family == issue_family,
+                            OperationalProblem.status.in_(
+                                (
+                                    "new",
+                                    "needs_confirmation",
+                                    "acknowledged",
+                                    "assigned",
+                                    "in_progress",
+                                    "waiting",
+                                    "reopened",
+                                )
+                            ),
+                        )
+                        .order_by(OperationalProblem.occurred_at.desc())
+                        .limit(1)
                     )
-                    if exists:
+                    if existing_problem:
+                        existing_problem.signal_id = signal.id
+                        existing_problem.source_message_id = source.id
+                        existing_problem.problem_type = problem_type
+                        existing_problem.priority = candidate.priority
+                        existing_problem.confidence = max(
+                            existing_problem.confidence, candidate.confidence
+                        )
+                        existing_problem.evidence = "\n".join(candidate.evidence)[:4000]
+                        existing_problem.explanation = candidate.summary
+                        existing_problem.recommended_action = candidate.recommended_action
+                        existing_problem.last_seen_at = datetime.now(UTC)
+                        existing_problem.evidence_message_ids_json = list(
+                            dict.fromkeys(
+                                [
+                                    *(existing_problem.evidence_message_ids_json or []),
+                                    *candidate.evidence_message_ids,
+                                    *candidate.source_message_ids,
+                                ]
+                            )
+                        )[-20:]
+                        signal.status = "problem_created"
                         continue
                     problem = OperationalProblem(
                         tenant_id=batch.tenant_id,
@@ -744,12 +840,19 @@ class AnalysisPipelineService:
                         responsible_employee_id=dialog_connection_employee,
                         fingerprint=problem_fingerprint,
                         problem_type=problem_type,
+                        issue_family=issue_family,
                         priority=candidate.priority,
                         confidence=candidate.confidence,
                         evidence="\n".join(candidate.evidence)[:4000],
                         explanation=candidate.summary,
                         recommended_action=candidate.recommended_action,
                         occurred_at=source.sent_at,
+                        last_seen_at=datetime.now(UTC),
+                        evidence_message_ids_json=list(
+                            dict.fromkeys(
+                                [*candidate.evidence_message_ids, *candidate.source_message_ids]
+                            )
+                        ),
                     )
                     session.add(problem)
                     await session.flush()

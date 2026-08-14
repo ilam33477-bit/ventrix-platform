@@ -21,6 +21,7 @@ from ..models import (
     TelegramMessage,
     TenantSettings,
 )
+from .conversation_state import assess_conversation
 from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
 from .problem_lifecycle import (
@@ -324,11 +325,28 @@ class ReconciliationService:
                 source.body_text,
                 dialog_classification=dialog.classification if dialog else None,
             )
+            recent = list(
+                await session.scalars(
+                    select(TelegramMessage)
+                    .where(
+                        TelegramMessage.tenant_id == job.tenant_id,
+                        TelegramMessage.dialog_id == dialog_id,
+                        TelegramMessage.telegram_message_id <= source.telegram_message_id,
+                        TelegramMessage.deleted_at.is_(None),
+                    )
+                    .order_by(TelegramMessage.telegram_message_id.desc())
+                    .limit(12)
+                )
+            )
+            recent.reverse()
+            assessment = assess_conversation(recent)
             if (
                 dialog is None
                 or not dialog.selected
                 or dialog.excluded
                 or not relevance.business_relevant
+                or not assessment.response_required
+                or not assessment.action_required
             ):
                 state.awaiting_employee_since = None
                 state.response_expected_message_id = None
@@ -362,10 +380,54 @@ class ReconciliationService:
                 )
                 session.add(signal)
                 await session.flush()
-            problem = await session.scalar(
-                select(OperationalProblem).where(
-                    OperationalProblem.fingerprint == f"sla-problem:{fingerprint}"
+            specific_problem = await session.scalar(
+                select(OperationalProblem.id).where(
+                    OperationalProblem.tenant_id == job.tenant_id,
+                    OperationalProblem.dialog_id == dialog_id,
+                    OperationalProblem.issue_family.in_(
+                        (
+                            "TECHNICAL_PROBLEM",
+                            "PAYMENT_QUESTION",
+                            "PRODUCT_DISSATISFACTION",
+                            "COMMERCIAL_OPPORTUNITY",
+                        )
+                    ),
+                    OperationalProblem.status.in_(
+                        (
+                            "new",
+                            "needs_confirmation",
+                            "acknowledged",
+                            "assigned",
+                            "in_progress",
+                            "waiting",
+                            "reopened",
+                        )
+                    ),
                 )
+            )
+            if specific_problem is not None:
+                signal.status = "history"
+                return None, None
+            problem = await session.scalar(
+                select(OperationalProblem)
+                .where(
+                    OperationalProblem.tenant_id == job.tenant_id,
+                    OperationalProblem.dialog_id == dialog_id,
+                    OperationalProblem.issue_family == "UNANSWERED_REQUEST",
+                    OperationalProblem.status.in_(
+                        (
+                            "new",
+                            "needs_confirmation",
+                            "acknowledged",
+                            "assigned",
+                            "in_progress",
+                            "waiting",
+                            "reopened",
+                        )
+                    ),
+                )
+                .order_by(OperationalProblem.occurred_at.desc())
+                .limit(1)
             )
             if problem is None:
                 responsible = await session.scalar(
@@ -382,13 +444,16 @@ class ReconciliationService:
                     responsible_employee_id=responsible,
                     fingerprint=f"sla-problem:{fingerprint}",
                     problem_type="client_without_answer",
+                    issue_family="UNANSWERED_REQUEST",
                     priority="high",
-                    confidence=1.0,
+                    confidence=max(0.9, assessment.confidence),
                     evidence=(source.body_text or "")[:2000],
                     explanation=signal.reason,
                     recommended_action="Ответить клиенту и подтвердить следующий шаг.",
                     occurred_at=now,
                     next_check_at=now,
+                    last_seen_at=now,
+                    evidence_message_ids_json=list(assessment.evidence_message_ids),
                 )
                 session.add(problem)
                 await session.flush()
@@ -403,6 +468,21 @@ class ReconciliationService:
                         ),
                     )
                 )
+            else:
+                problem.source_message_id = source.id
+                problem.signal_id = signal.id
+                problem.evidence = (source.body_text or "")[:2000]
+                problem.explanation = assessment.reason
+                problem.recommended_action = assessment.next_action or problem.recommended_action
+                problem.last_seen_at = now
+                problem.evidence_message_ids_json = list(
+                    dict.fromkeys(
+                        [
+                            *(problem.evidence_message_ids_json or []),
+                            *assessment.evidence_message_ids,
+                        ]
+                    )
+                )[-20:]
             return signal.id, problem.id
 
         signal_id, problem_id = await self.transactions.run(write)

@@ -155,7 +155,8 @@ class LocalSignalEngine:
             "time": bool(TIME_RE.search(text)),
             "attachment": bool(message.attachments_json),
             "complaint": bool(COMPLAINT_RE.search(text)),
-            "confirmed_interest": bool(INTEREST_RE.search(text)),
+            # Commercial interest is evidence only when the external person says it.
+            "confirmed_interest": bool(external_sender and INTEREST_RE.search(text)),
             "next_step": bool(NEXT_STEP_RE.search(text)),
         }
         if LOW_VALUE_RE.fullmatch(text) and not any(

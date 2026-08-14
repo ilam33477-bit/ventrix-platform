@@ -40,6 +40,7 @@ const NEXT_ACTIONS: Partial<
   ],
   resolved: [["reopened", "Открыть снова"]],
   auto_resolved: [["reopened", "Открыть снова"]],
+  false_positive: [["reopened", "Вернуть как проблему"]],
   reopened: [
     ["assigned", "Назначить"],
     ["in_progress", "В работу"],
@@ -77,8 +78,6 @@ function ProblemDetailPanel({
 }) {
   const employeesLoader = useCallback(() => api.employees(), [api]);
   const { data: employees } = useResource(employeesLoader);
-  const [reason, setReason] = useState("");
-  const [evidence, setEvidence] = useState("");
   const [employeeId, setEmployeeId] = useState(
     problem.responsible_employee_id ?? "",
   );
@@ -89,14 +88,18 @@ function ProblemDetailPanel({
   const [error, setError] = useState("");
 
   async function transition(status: ProblemStatus) {
-    const actualReason = reason.trim() || `Статус изменён на ${status}`;
+    const actualReason =
+      status === "false_positive"
+        ? "Пользователь отметил карточку как не проблему."
+        : status === "reopened"
+          ? "Пользователь вернул карточку в работу после ошибочной отметки."
+          : `Статус изменён на ${status}`;
     setBusy(true);
     setError("");
     try {
       await api.transitionProblem(problem.id, {
         status,
         reason: actualReason,
-        evidence: evidence.trim() || undefined,
         responsible_employee_id: employeeId || undefined,
         deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
       });
@@ -180,22 +183,6 @@ function ProblemDetailPanel({
             onChange={(event) => setDeadline(event.target.value)}
           />
         </label>
-        <label>
-          Причина / комментарий
-          <textarea
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            placeholder="Что сделано или почему меняется статус"
-          />
-        </label>
-        <label>
-          Доказательство исправления
-          <textarea
-            value={evidence}
-            onChange={(event) => setEvidence(event.target.value)}
-            placeholder="Ссылка, сообщение или результат проверки"
-          />
-        </label>
       </div>
       {error && <p className="form-error">{error}</p>}
       <div className="problem-actions">
@@ -255,15 +242,23 @@ export function ProblemsView({
   api: VentrixClientApi;
   initialProblemId?: string;
 }) {
-  const loader = useCallback(() => api.problems(), [api]);
+  const [filter, setFilter] = useState<
+    "all" | Problem["priority"] | "false_positive"
+  >("all");
+  const loader = useCallback(
+    () => api.problems(filter === "false_positive" ? "false_positive" : undefined),
+    [api, filter],
+  );
   const { data, loading, error, reload } = useResource(loader);
-  const [filter, setFilter] = useState<"all" | Problem["priority"]>("all");
   const [detail, setDetail] = useState<ProblemDetail | null>(null);
   const initialProblemOpened = useRef(false);
   const visible = useMemo(
     () =>
       (data ?? []).filter(
-        (item) => filter === "all" || item.priority === filter,
+        (item) =>
+          filter === "all" ||
+          filter === "false_positive" ||
+          item.priority === filter,
       ),
     [filter, data],
   );
@@ -306,7 +301,7 @@ export function ProblemsView({
         description="Только подтверждённые риски: кто отвечает, что произошло и какой следующий шаг."
       />
       <div className="chip-row">
-        {(["all", "critical", "high", "medium"] as const).map((item) => (
+        {(["all", "critical", "high", "medium", "false_positive"] as const).map((item) => (
           <button
             key={item}
             className={filter === item ? "active" : ""}
@@ -318,7 +313,9 @@ export function ProblemsView({
                 ? "Критичные"
                 : item === "high"
                   ? "Высокие"
-                  : "Средние"}
+                  : item === "medium"
+                    ? "Средние"
+                    : "Не проблема"}
           </button>
         ))}
       </div>
