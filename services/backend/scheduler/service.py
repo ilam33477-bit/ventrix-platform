@@ -25,6 +25,14 @@ from ..timezones import normalize_timezone, timezone_info
 logger = logging.getLogger(__name__)
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def next_analysis_time(
     *,
     now: datetime,
@@ -268,6 +276,8 @@ class TenantAnalysisScheduler:
                         ProblemTransition.occurred_at > profile.last_processed_transition_at
                     )
                 count, oldest, latest = (await session.execute(pending_query)).one()
+                oldest = _as_utc(oldest)
+                latest = _as_utc(latest)
                 weekly_due = oldest is not None and oldest <= now - timedelta(days=7)
                 if count and latest is not None and (count >= 10 or weekly_due):
                     feedback_due.append((tenant_id, latest))
