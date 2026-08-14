@@ -24,6 +24,7 @@ export function MiniAppRoot() {
   const [activeTab, setActiveTab] = useState<TabId>(
     requestedSection === "problems" ? "problems" : "dashboard",
   );
+  const [dashboardProblemId, setDashboardProblemId] = useState<string | undefined>();
   const [history, setHistory] = useState<TabId[]>([]);
   const primary = new Set<TabId>(["dashboard", "problems", "statistics", "employees", "more"]);
   function navigate(tab: TabId) {
@@ -54,7 +55,7 @@ export function MiniAppRoot() {
 
   const content = (() => {
     switch (activeTab) {
-      case "problems": return <ProblemsView api={api} initialProblemId={requestedProblemId} />;
+      case "problems": return <ProblemsView api={api} initialProblemId={dashboardProblemId ?? requestedProblemId} />;
       case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
       case "statistics": return <StatisticsView summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;
@@ -63,9 +64,9 @@ export function MiniAppRoot() {
       case "groups": return <GroupsView api={api} />;
       case "settings": return <SettingsView api={api} />;
       case "more": return <MoreView onNavigate={navigate} />;
-      default: return <DashboardView summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => navigate("problems")} />;
+      default: return <DashboardView api={api} auth={session.auth} summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => { setDashboardProblemId(undefined); navigate("problems"); }} onOpenProblem={(problemId) => { setDashboardProblemId(problemId); navigate("problems"); }} />;
     }
   })();
 
-  return <MiniAppShell auth={session.auth} active={activeTab} onNavigate={navigate} canGoBack={!primary.has(activeTab) && history.length > 0} onBack={goBack}>{content}</MiniAppShell>;
+  return <MiniAppShell auth={session.auth} access={session.access} active={activeTab} onNavigate={navigate} canGoBack={!primary.has(activeTab) && history.length > 0} onBack={goBack}>{content}</MiniAppShell>;
 }

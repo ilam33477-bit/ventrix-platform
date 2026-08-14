@@ -495,7 +495,11 @@ def build_client_router(
                 )
         await record(client_context, "client_user_started_bot")
         await record(client_context, "client_menu_opened")
-        first_name = (tenant.owner_name or "").strip().split()[0] or "Здравствуйте"
+        first_name = (
+            (message.from_user.first_name if message.from_user else None)
+            or (tenant.owner_name or "").strip().split()[0]
+            or "Здравствуйте"
+        )
         metrics = await key_metrics(tenant.id)
         if connections:
             activity = (
@@ -516,9 +520,11 @@ def build_client_router(
             return
         await message.answer(
             f"<b>{escape(first_name)}, привет.</b>\n\n"
-            f"Ventrix создан для команды <b>{escape(tenant.name)}</b>.\n"
-            "Подключите первый рабочий Telegram в Mini App, чтобы начать мониторинг.\n\n"
-            "<blockquote>Коды подтверждения и пароль 2FA не сохраняются. Рабочая сессия хранится в зашифрованном виде.</blockquote>",
+            f"Ventrix настроен для команды <b>{escape(tenant.name)}</b>"
+            f"{f' в направлении «{escape(tenant.niche)}»' if tenant.niche else ''}.\n\n"
+            "Он поможет замечать клиентов без ответа, незавершённые договорённости "
+            "и ситуации, которым нужна реакция руководителя.\n\n"
+            "Откройте Mini App, чтобы подключить рабочий Telegram и выбрать расписание сводок.",
             reply_markup=client_welcome_menu(mini_app_url),
         )
 

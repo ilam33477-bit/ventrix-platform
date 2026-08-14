@@ -435,17 +435,11 @@ def client_main_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
 
 def client_welcome_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
     panel = (
-        InlineKeyboardButton(text="Ventrix AI", web_app=WebAppInfo(url=mini_app_url))
+        InlineKeyboardButton(text="Настроить Ventrix", web_app=WebAppInfo(url=mini_app_url))
         if mini_app_url
-        else InlineKeyboardButton(text="Ventrix AI", callback_data="client:panel")
+        else InlineKeyboardButton(text="Настроить Ventrix", callback_data="client:panel")
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [panel],
-            [InlineKeyboardButton(text="📊 Ключевые показатели", callback_data="client:summary")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="client:menu")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[panel]])
 
 
 def back_to_client_menu() -> InlineKeyboardMarkup:

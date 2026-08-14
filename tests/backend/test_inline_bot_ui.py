@@ -36,7 +36,7 @@ def test_owner_and_client_navigation_is_inline_only() -> None:
     assert isinstance(welcome, InlineKeyboardMarkup)
     assert "👥 Клиенты" in button_texts(owner)
     assert "⚠️ Важное" in button_texts(client)
-    assert button_texts(welcome) == ["Ventrix AI", "📊 Ключевые показатели", "Главное меню"]
+    assert button_texts(welcome) == ["Настроить Ventrix"]
 
 
 def test_client_interface_hides_platform_owner_support_and_commercial_terms() -> None:

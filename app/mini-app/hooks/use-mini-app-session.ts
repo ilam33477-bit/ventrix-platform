@@ -54,14 +54,14 @@ export function useMiniAppSession() {
   ) => {
     if (!api || !session) return;
     const onboarding = await api.updateOnboarding(step, status);
-    setSession({
-      ...session,
+    setSession((current) => current ? {
+      ...current,
       auth: {
-        ...session.auth,
-        project_context: { ...session.auth.project_context, onboarding },
+        ...current.auth,
+        project_context: { ...current.auth.project_context, onboarding },
       },
-      bootstrap: { ...session.bootstrap, onboarding },
-    });
+      bootstrap: { ...current.bootstrap, onboarding },
+    } : current);
   }, [api, session]);
 
   const refresh = useCallback(async () => {

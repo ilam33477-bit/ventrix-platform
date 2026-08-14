@@ -11,6 +11,7 @@ import type {
   Problem,
   ProblemDetail,
   ProblemStatus,
+  ProjectAccess,
   ReportDetail,
   ReportSummary,
   TelegramConnection,
@@ -54,10 +55,17 @@ export class VentrixClientApi {
     return this.request<Bootstrap>("/bootstrap");
   }
 
+  access() {
+    return this.request<ProjectAccess>("/access");
+  }
+
   async loadSession() {
-    const auth = await this.authenticate();
-    const bootstrap = await this.bootstrap();
-    return { auth, bootstrap };
+    const [auth, bootstrap, access] = await Promise.all([
+      this.authenticate(),
+      this.bootstrap(),
+      this.access(),
+    ]);
+    return { auth, bootstrap, access };
   }
 
   updateOnboarding(step: OnboardingStep, status: "completed" | "skipped" = "completed") {

@@ -67,6 +67,14 @@ export type MiniAppAuth = {
   dashboard_summary: DashboardSummary;
 };
 
+export type ProjectAccess = {
+  status: string;
+  started_at: string | null;
+  expires_at: string | null;
+  grace_period_until: string | null;
+  analysis_enabled: boolean;
+};
+
 export type Problem = {
   id: string;
   type: string;
@@ -305,4 +313,5 @@ export type TabId =
 export type ClientSession = {
   auth: MiniAppAuth;
   bootstrap: Bootstrap;
+  access: ProjectAccess;
 };

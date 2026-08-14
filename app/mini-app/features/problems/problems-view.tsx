@@ -3,277 +3,134 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { VentrixClientApi } from "../../api/client";
-import {
-  Card,
-  EmptyState,
-  SectionHeading,
-  Skeleton,
-  StatusBadge,
-} from "../../components/ui";
+import { Button, Card, EmptyState, Skeleton, StatusBadge } from "../../components/ui";
 import { useResource } from "../../hooks/use-resource";
+import { cleanExplanation, formatRelativeAge, priorityLabel, priorityTone, problemPerson, problemTitle, PROBLEM_STATUS_LABELS, sortProblemsByPriority } from "../../lib/problem-presentation";
 import type { Problem, ProblemDetail, ProblemStatus } from "../../types";
 
-const NEXT_ACTIONS: Partial<
-  Record<ProblemStatus, Array<[ProblemStatus, string]>>
-> = {
-  new: [
-    ["needs_confirmation", "Проверить"],
-    ["acknowledged", "Принять"],
-  ],
-  needs_confirmation: [
-    ["acknowledged", "Подтвердить"],
-    ["false_positive", "Ложное срабатывание"],
-  ],
-  acknowledged: [["assigned", "Назначить"]],
-  assigned: [
-    ["in_progress", "В работу"],
-    ["false_positive", "Не проблема"],
-  ],
-  in_progress: [
-    ["waiting", "Ждём клиента"],
-    ["resolved", "Решено"],
-    ["false_positive", "Не проблема"],
-  ],
-  waiting: [
-    ["in_progress", "Вернуть в работу"],
-    ["false_positive", "Не проблема"],
-  ],
-  resolved: [["reopened", "Открыть снова"]],
-  auto_resolved: [["reopened", "Открыть снова"]],
-  false_positive: [["reopened", "Вернуть как проблему"]],
-  reopened: [
-    ["assigned", "Назначить"],
-    ["in_progress", "В работу"],
-  ],
+type ProblemFilter = "all" | Problem["priority"] | "resolved";
+type ProblemFeed = { active: Problem[]; resolved: Problem[] };
+
+const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string, "primary" | "secondary" | "ghost"]>>> = {
+  new: [["needs_confirmation", "Проверить ситуацию", "primary"], ["acknowledged", "Подтвердить", "secondary"]],
+  needs_confirmation: [["acknowledged", "Подтвердить", "primary"], ["false_positive", "Не проблема", "ghost"]],
+  acknowledged: [["assigned", "Назначить сотруднику", "primary"]],
+  assigned: [["in_progress", "Взять в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
+  in_progress: [["resolved", "Отметить решённой", "primary"], ["waiting", "Отложить", "secondary"], ["false_positive", "Не проблема", "ghost"]],
+  waiting: [["in_progress", "Вернуть в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
+  resolved: [["reopened", "Открыть снова", "secondary"]],
+  auto_resolved: [["reopened", "Открыть снова", "secondary"]],
+  false_positive: [["reopened", "Вернуть как проблему", "secondary"]],
+  reopened: [["assigned", "Назначить сотруднику", "primary"], ["in_progress", "Взять в работу", "secondary"]],
 };
 
-const STATUS_LABELS: Record<string, string> = {
-  new: "Новая",
-  needs_confirmation: "Нужно проверить",
-  acknowledged: "Подтверждена",
-  assigned: "Назначена",
-  in_progress: "В работе",
-  waiting: "Ждём ответа",
-  resolved: "Решена",
-  auto_resolved: "Исправление подтверждено",
-  false_positive: "Не проблема",
-  reopened: "Открыта снова",
-};
-
-function problemTitle(problem: Problem) {
-  if (problem.type === "client_without_answer") return "Клиент ждёт ответа";
-  return problem.explanation.replaceAll("SLA", "установленного времени ответа");
-}
-
-function ProblemDetailPanel({
-  api,
-  problem,
-  onChanged,
-  onClose,
-}: {
+function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   api: VentrixClientApi;
   problem: ProblemDetail;
   onChanged: () => Promise<void>;
   onClose: () => void;
 }) {
   const employeesLoader = useCallback(() => api.employees(), [api]);
-  const { data: employees } = useResource(employeesLoader);
-  const [employeeId, setEmployeeId] = useState(
-    problem.responsible_employee_id ?? "",
-  );
-  const [deadline, setDeadline] = useState(
-    problem.deadline_at?.slice(0, 16) ?? "",
-  );
+  const { data: employees, loading: employeesLoading } = useResource(employeesLoader);
+  const [employeeId, setEmployeeId] = useState(problem.responsible_employee_id ?? "");
+  const [deadline, setDeadline] = useState(problem.deadline_at?.slice(0, 16) ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
 
-  async function transition(status: ProblemStatus) {
-    const actualReason =
-      status === "false_positive"
-        ? "Пользователь отметил карточку как не проблему."
-        : status === "reopened"
-          ? "Пользователь вернул карточку в работу после ошибочной отметки."
-          : `Статус изменён на ${status}`;
+  async function transition(status: ProblemStatus, label: string) {
+    if (status === "assigned" && !employeeId) {
+      setError("Выберите сотрудника перед назначением.");
+      return;
+    }
+    const reason = status === "false_positive"
+      ? "Пользователь отметил карточку как не проблему."
+      : status === "reopened"
+        ? "Пользователь вернул карточку в работу."
+        : `Действие в Mini App: ${label}.`;
     setBusy(true);
     setError("");
+    setSuccess("");
     try {
       await api.transitionProblem(problem.id, {
         status,
-        reason: actualReason,
+        reason,
         responsible_employee_id: employeeId || undefined,
         deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
       });
+      setSuccess(label);
       await onChanged();
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : "Не удалось изменить проблему",
-      );
+      setError(cause instanceof Error ? cause.message : "Не удалось изменить ситуацию");
     } finally {
       setBusy(false);
     }
   }
 
-  return (
-    <Card className="problem-detail">
-      <div className="problem-card-top">
-        <StatusBadge tone="warning">
-          {STATUS_LABELS[problem.status] ?? problem.status}
-        </StatusBadge>
-        <button className="text-action" onClick={onClose}>
-          ← К списку
-        </button>
-      </div>
-      <h3>{problemTitle(problem)}</h3>
-      <p className="problem-explanation">
-        {problem.explanation.replaceAll("SLA", "установленного времени ответа")}
-      </p>
-      <div className="dialog-context">
-        <h4>Контекст переписки</h4>
-        {problem.context_messages.map((message) => (
-          <div
-            className={`${message.outgoing ? "outgoing" : "incoming"} ${message.is_source ? "source" : ""}`}
-            key={message.id}
-          >
-            <small>
-              {message.outgoing ? "Сотрудник" : "Клиент"} ·{" "}
-              {new Date(message.sent_at).toLocaleString("ru-RU")}
-            </small>
-            <p>{message.text || "Сообщение без текста"}</p>
-          </div>
-        ))}
-      </div>
-      <p>
-        <strong>Ожидаемое действие:</strong> {problem.recommended_action}
-      </p>
-      <p>
-        <strong>Ответственный:</strong>{" "}
-        {problem.responsible_employee_name ?? "не назначен"}
-      </p>
-      <p>
-        <strong>Рабочий аккаунт:</strong>{" "}
-        {problem.connection_name ?? "не определён"}
-        {problem.connection_username
-          ? ` · @${problem.connection_username}`
-          : ""}
-      </p>
-      <p>
-        <strong>Переписка:</strong> {problem.dialog_title ?? "диалог"}
-        {problem.dialog_username ? ` · @${problem.dialog_username}` : ""}
-      </p>
-      <div className="control-form">
-        <label>
-          Ответственный
-          <select
-            value={employeeId}
-            onChange={(event) => setEmployeeId(event.target.value)}
-          >
-            <option value="">Не назначен</option>
-            {employees?.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Дедлайн
-          <input
-            type="datetime-local"
-            value={deadline}
-            onChange={(event) => setDeadline(event.target.value)}
-          />
-        </label>
-      </div>
-      {error && <p className="form-error">{error}</p>}
-      <div className="problem-actions">
-        {(NEXT_ACTIONS[problem.status] ?? []).map(([status, label]) => (
-          <button
-            key={status}
-            disabled={busy}
-            onClick={() => void transition(status)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-      <h4>История</h4>
-      <div className="timeline">
-        {problem.transitions.map((item, index) => (
-          <div key={`${item.occurred_at}-${index}`}>
-            <i />
-            <p>
-              <strong>
-                {item.from_status} → {item.to_status}
-              </strong>
-              <span>{item.reason}</span>
-              <small>
-                {new Date(item.occurred_at).toLocaleString("ru-RU")}
-              </small>
-            </p>
-          </div>
-        ))}
-      </div>
-      {!!problem.verifications.length && (
-        <>
-          <h4>Проверки исправления</h4>
-          <div className="timeline">
-            {problem.verifications.map((item) => (
-              <div key={item.checked_at}>
-                <i />
-                <p>
-                  <strong>
-                    {item.outcome} · {Math.round(item.confidence * 100)}%
-                  </strong>
-                  <span>{item.reason}</span>
-                </p>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
+  return <article className="problem-detail-view">
+    <header className="problem-detail-nav"><button className="text-action" onClick={onClose}>← Все ситуации</button><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge></header>
+
+    <Card className="problem-detail-hero">
+      <div className="problem-detail-kicker"><span>СИТУАЦИЯ</span><small>{formatRelativeAge(problem.occurred_at)}</small></div>
+      <h2>{problemTitle(problem)}</h2>
+      <div className="problem-identity"><div><strong>{problem.dialog_title ?? "Клиент"}</strong><span>{problemPerson(problem)}</span></div><StatusBadge tone={problem.status === "resolved" || problem.status === "auto_resolved" ? "success" : "neutral"}>{PROBLEM_STATUS_LABELS[problem.status] ?? problem.status}</StatusBadge></div>
     </Card>
-  );
+
+    <section className="problem-detail-flow">
+      <div className="detail-section"><p className="detail-label">ПРИЧИНА</p><h3>Почему Ventrix обратил внимание</h3><p>{cleanExplanation(problem.explanation)}</p></div>
+
+      <Card className="evidence-panel"><div className="evidence-mark" aria-hidden="true">“</div><div><p className="detail-label">ДОКАЗАТЕЛЬСТВО</p><blockquote>{problem.evidence}</blockquote></div></Card>
+
+      <div className="detail-section context-section"><p className="detail-label">КОНТЕКСТ</p><h3>Переписка вокруг ситуации</h3>{problem.context_messages.length ? <div className="dialog-context">{problem.context_messages.map((message) => <div className={`${message.outgoing ? "outgoing" : "incoming"} ${message.is_source ? "source" : ""}`} key={message.id}><small>{message.outgoing ? "Сотрудник" : problemPerson(problem)} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p>{message.is_source && <em>Исходное сообщение</em>}</div>)}</div> : <div className="context-empty">Контекст сообщений для этой ситуации не найден.</div>}</div>
+
+      <div className="detail-section assignment-section"><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? "Сотрудник пока не назначен"}</h3><div className="problem-routing"><div><span>Рабочий аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Диалог</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><div className="assignment-controls"><label>Назначить сотрудника<select disabled={employeesLoading || busy} value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Не назначен</option>{employees?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Срок решения<input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div></div>
+
+      <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
+
+      <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
+
+      {(problem.transitions.length > 0 || problem.verifications.length > 0) && <details className="problem-history"><summary>История ситуации <span>{problem.transitions.length + problem.verifications.length}</span></summary><div className="timeline">{problem.transitions.map((item, index) => <div key={`${item.occurred_at}-${index}`}><i /><p><strong>{PROBLEM_STATUS_LABELS[item.from_status] ?? item.from_status} → {PROBLEM_STATUS_LABELS[item.to_status] ?? item.to_status}</strong><span>{item.reason}</span><small>{new Date(item.occurred_at).toLocaleString("ru-RU")}</small></p></div>)}{problem.verifications.map((item) => <div key={item.checked_at}><i /><p><strong>Проверка исправления: {item.outcome}</strong><span>{item.reason}</span><small>{new Date(item.checked_at).toLocaleString("ru-RU")}</small></p></div>)}</div></details>}
+    </section>
+  </article>;
 }
 
-export function ProblemsView({
-  api,
-  initialProblemId,
-}: {
-  api: VentrixClientApi;
-  initialProblemId?: string;
-}) {
-  const [filter, setFilter] = useState<
-    "all" | Problem["priority"] | "false_positive"
-  >("all");
-  const loader = useCallback(
-    () => api.problems(filter === "false_positive" ? "false_positive" : undefined),
-    [api, filter],
-  );
+export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi; initialProblemId?: string }) {
+  const [filter, setFilter] = useState<ProblemFilter>("all");
+  const loader = useCallback(async (): Promise<ProblemFeed> => {
+    const [active, resolved, autoResolved] = await Promise.all([api.problems(), api.problems("resolved"), api.problems("auto_resolved")]);
+    return { active, resolved: [...resolved, ...autoResolved] };
+  }, [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [detail, setDetail] = useState<ProblemDetail | null>(null);
-  const initialProblemOpened = useRef(false);
-  const visible = useMemo(
-    () =>
-      (data ?? []).filter(
-        (item) =>
-          filter === "all" ||
-          filter === "false_positive" ||
-          item.priority === filter,
-      ),
-    [filter, data],
-  );
+  const [openingId, setOpeningId] = useState("");
+  const [openError, setOpenError] = useState("");
+  const openedInitialProblem = useRef<string | null>(null);
 
-  async function open(problemId: string) {
-    setDetail(await api.problem(problemId));
-  }
+  const active = useMemo(() => data?.active ?? [], [data]);
+  const resolved = useMemo(() => data?.resolved ?? [], [data]);
+  const visible = useMemo(() => sortProblemsByPriority(filter === "resolved" ? resolved : active.filter((item) => filter === "all" || item.priority === filter)), [active, filter, resolved]);
+  const criticalCount = active.filter((item) => item.priority === "critical").length;
+  const highCount = active.filter((item) => item.priority === "high").length;
+  const initialLoading = loading && !data;
+
+  const open = useCallback(async (problemId: string) => {
+    setOpeningId(problemId);
+    setOpenError("");
+    try {
+      setDetail(await api.problem(problemId));
+    } catch (cause) {
+      setOpenError(cause instanceof Error ? cause.message : "Не удалось открыть ситуацию");
+    } finally {
+      setOpeningId("");
+    }
+  }, [api]);
+
   useEffect(() => {
-    if (!initialProblemId || initialProblemOpened.current) return;
-    initialProblemOpened.current = true;
-    void api
-      .problem(initialProblemId)
-      .then(setDetail)
-      .catch(() => undefined);
-  }, [api, initialProblemId]);
+    if (!initialProblemId || openedInitialProblem.current === initialProblemId) return;
+    openedInitialProblem.current = initialProblemId;
+    void open(initialProblemId);
+  }, [initialProblemId, open]);
+
   async function refreshDetail() {
     if (!detail) return;
     const refreshed = await api.problem(detail.id).catch(() => null);
@@ -281,113 +138,33 @@ export function ProblemsView({
     await reload();
   }
 
-  if (detail)
-    return (
-      <>
-        <SectionHeading eyebrow="ПРОБЛЕМА" title="Карточка и история" />
-        <ProblemDetailPanel
-          api={api}
-          problem={detail}
-          onChanged={refreshDetail}
-          onClose={() => setDetail(null)}
-        />
-      </>
-    );
-  return (
-    <>
-      <SectionHeading
-        eyebrow="РАБОЧИЕ СИТУАЦИИ"
-        title="Что требует решения"
-        description="Только подтверждённые риски: кто отвечает, что произошло и какой следующий шаг."
-      />
-      <div className="chip-row">
-        {(["all", "critical", "high", "medium", "false_positive"] as const).map((item) => (
-          <button
-            key={item}
-            className={filter === item ? "active" : ""}
-            onClick={() => setFilter(item)}
-          >
-            {item === "all"
-              ? "Все"
-              : item === "critical"
-                ? "Критичные"
-                : item === "high"
-                  ? "Высокие"
-                  : item === "medium"
-                    ? "Средние"
-                    : "Не проблема"}
-          </button>
-        ))}
-      </div>
-      {loading ? (
-        <Skeleton lines={4} />
-      ) : (
-        <div className="problem-cards">
-          {visible.map((problem) => (
-            <button
-              className="problem-card-button"
-              key={problem.id}
-              onClick={() => void open(problem.id)}
-            >
-              <Card className="problem-card">
-                <div className="problem-card-top">
-                  <StatusBadge
-                    tone={
-                      problem.priority === "critical" ? "danger" : "warning"
-                    }
-                  >
-                    {problem.priority === "critical"
-                      ? "Критично"
-                      : problem.priority === "high"
-                        ? "Важно"
-                        : "Проверить"}
-                  </StatusBadge>
-                  <small>
-                    {STATUS_LABELS[problem.status] ?? problem.status}
-                  </small>
-                </div>
-                <h3>{problemTitle(problem)}</h3>
-                <p>
-                  {problem.explanation.replaceAll(
-                    "SLA",
-                    "установленного времени ответа",
-                  )}
-                </p>
-                <p className="problem-origin">
-                  <strong>
-                    {problem.responsible_employee_name ??
-                      "Ответственный не назначен"}
-                  </strong>
-                  {problem.connection_username
-                    ? ` · @${problem.connection_username}`
-                    : problem.connection_name
-                      ? ` · ${problem.connection_name}`
-                      : ""}
-                  {problem.dialog_username
-                    ? ` · @${problem.dialog_username}`
-                    : ""}
-                </p>
-                <blockquote>{problem.evidence}</blockquote>
-                <p>
-                  <strong>Что сделать:</strong> {problem.recommended_action}
-                </p>
-                <footer>
-                  {problem.deadline_at
-                    ? `До ${new Date(problem.deadline_at).toLocaleString("ru-RU")}`
-                    : "Без жёсткого срока"}
-                </footer>
-              </Card>
-            </button>
-          ))}
-        </div>
-      )}
-      {error && <p className="form-error">{error}</p>}
-      {!loading && !visible.length && (
-        <EmptyState
-          title="Активных проблем нет"
-          description="Список обновится после следующего анализа."
-        />
-      )}
-    </>
-  );
+  if (detail) return <ProblemDetailPanel api={api} problem={detail} onChanged={refreshDetail} onClose={() => setDetail(null)} />;
+
+  const filters: Array<{ value: ProblemFilter; label: string; count?: number }> = [
+    { value: "all", label: "Все", count: active.length },
+    { value: "critical", label: "Критичные", count: criticalCount },
+    { value: "high", label: "Высокие", count: highCount },
+    { value: "medium", label: "Средние", count: active.filter((item) => item.priority === "medium").length },
+    { value: "resolved", label: "Решённые", count: resolved.length },
+  ];
+
+  return <div className="problems-workspace">
+    <header className="problems-summary"><div><p className="eyebrow">РАБОЧИЕ СИТУАЦИИ</p><h2>{initialLoading ? "Проверяем рабочие ситуации" : active.length ? `${active.length} ${situationWord(active.length)} требуют решения` : "Сейчас всё под контролем"}</h2><p>{initialLoading ? "Собираем актуальные статусы и ответственных." : active.length ? "Сначала показаны самые важные и давно ожидающие реакции ситуации." : "Новых подтверждённых рисков в рабочих диалогах нет."}</p></div>{!initialLoading && <div className="problems-summary-facts"><span><i className="critical" />Критичные<strong>{criticalCount}</strong></span><span><i className="high" />Высокие<strong>{highCount}</strong></span></div>}</header>
+
+    {!initialLoading && <div className="problem-filters" role="tablist" aria-label="Фильтр ситуаций">{filters.map((item) => <button role="tab" aria-selected={filter === item.value} className={filter === item.value ? "active" : ""} key={item.value} onClick={() => setFilter(item.value)}><span>{item.label}</span>{item.count !== undefined && <small>{item.count}</small>}</button>)}</div>}
+
+    {loading ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <button className="problem-card-button" key={problem.id} onClick={() => void open(problem.id)} disabled={openingId === problem.id}><Card className={`problem-card priority-${problem.priority}`}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.connection_username ? `Рабочий аккаунт @${problem.connection_username}` : problem.connection_name ?? "Рабочий аккаунт не указан"}</small></div></div><div className="problem-card-copy"><p className="problem-type">{problemTitle(problem)}</p><h3>{cleanExplanation(problem.explanation)}</h3><blockquote>{problem.evidence}</blockquote></div><div className="problem-card-meta"><span><small>Ответственный</small><strong>{problem.responsible_employee_name ?? "Не назначен"}</strong></span><span><small>Статус</small><strong>{PROBLEM_STATUS_LABELS[problem.status] ?? problem.status}</strong></span></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть ситуацию"}</span><b aria-hidden="true">→</b></footer></Card></button>)}</div>}
+
+    {(error || openError) && <div className="inline-error" role="alert"><span>{openError || "Не удалось загрузить ситуации."}</span><button onClick={() => void reload()}>Повторить</button></div>}
+    {!loading && !visible.length && <EmptyState title={filter === "resolved" ? "Решённых ситуаций пока нет" : "В этом разделе всё спокойно"} description={filter === "resolved" ? "Здесь появятся ситуации после подтверждённого решения." : "Ventrix продолжает мониторинг и покажет новый риск после проверки контекста."} />}
+  </div>;
+}
+
+function situationWord(value: number) {
+  const mod100 = value % 100;
+  const mod10 = value % 10;
+  if (mod100 >= 11 && mod100 <= 14) return "ситуаций";
+  if (mod10 === 1) return "ситуация";
+  if (mod10 >= 2 && mod10 <= 4) return "ситуации";
+  return "ситуаций";
 }

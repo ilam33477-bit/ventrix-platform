@@ -3,8 +3,9 @@
 import { useEffect, useState, type PropsWithChildren } from "react";
 
 import type { VentrixClientApi } from "../../api/client";
+import { AnimatedNumber, Card, Skeleton, StatusBadge } from "../../components/ui";
+import { Icon, type IconName } from "../../components/icons";
 import type { Bootstrap, ClientSettings, OnboardingStep } from "../../types";
-import { Card, StatusBadge } from "../../components/ui";
 import { ConnectionManager } from "../connections/connection-manager";
 
 type Advance = (step: OnboardingStep, status?: "completed" | "skipped") => Promise<void>;
@@ -22,6 +23,8 @@ const stageByStep: Record<OnboardingStep, number> = {
   completed: 5,
 };
 
+const stages = ["Telegram", "Синхронизация", "Отчёты", "Группы", "Готово"];
+
 export function OnboardingFlow({ api, bootstrap, onAdvance }: {
   api: VentrixClientApi;
   bootstrap: Bootstrap;
@@ -31,22 +34,28 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
   const tenant = bootstrap.tenant;
 
   if (step === "welcome") {
-    return <OnboardingFrame step={step} title={`Добро пожаловать, ${tenant.owner_name.split(" ")[0]}`}>
+    const firstName = tenant.owner_name.trim().split(/\s+/)[0] || "Здравствуйте";
+    return <OnboardingFrame step={step} title={`Добро пожаловать, ${firstName}`}>
       <Card className="onboarding-hero onboarding-welcome">
-        <span className="onboarding-mark">V</span>
+        <div className="welcome-brand"><span className="onboarding-mark">V</span><span>Ventrix для {tenant.name}</span></div>
         <h2>{tenant.welcome.headline}</h2>
         <p className="welcome-message">{tenant.welcome.message}</p>
+        <div className="welcome-context">
+          <span>Компания</span><strong>{tenant.name}</strong>
+          {tenant.niche && <><span>Направление</span><strong>{tenant.niche}</strong></>}
+        </div>
         <ul className="welcome-benefits">
-          {tenant.welcome.benefits.map((benefit) => <li key={benefit}>{benefit}</li>)}
+          {tenant.welcome.benefits.slice(0, 3).map((benefit) => <li key={benefit}>{benefit}</li>)}
         </ul>
-        <button className="primary-action" onClick={() => void onAdvance("telegram_connection")}>Начать настройку</button>
+        <p className="setup-duration">Настройка займёт несколько минут. Её можно продолжить позже.</p>
+        <button className="primary-action" onClick={() => void onAdvance("telegram_connection")}>Настроить Ventrix</button>
       </Card>
     </OnboardingFrame>;
   }
 
   if (step === "telegram_connection") {
-    return <OnboardingFrame step={step} title="Подключите рабочий Telegram">
-      <p className="onboarding-lead">Подключите свой рабочий аккаунт или аккаунт сотрудника. Дополнительные аккаунты можно добавить позже.</p>
+    return <OnboardingFrame step={step} title="Рабочий Telegram">
+      <p className="onboarding-lead">Подключите аккаунт, в котором команда общается с клиентами. Личные рабочие диалоги будут найдены автоматически.</p>
       <ConnectionManager
         api={api}
         connections={bootstrap.connections}
@@ -58,104 +67,110 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
     </OnboardingFrame>;
   }
 
-  if (step === "monitoring_started") {
-    return <InitialSyncStep api={api} initial={bootstrap} onAdvance={onAdvance} />;
-  }
-
-  if (step === "reports") {
-    return <ReportSetup api={api} onAdvance={onAdvance} />;
-  }
+  if (step === "monitoring_started") return <InitialSyncStep api={api} initial={bootstrap} onAdvance={onAdvance} />;
+  if (step === "reports") return <ReportSetup api={api} onAdvance={onAdvance} />;
 
   if (step === "groups") {
     return <OnboardingFrame step={step} title="Рабочие группы">
-      <p className="onboarding-lead">Личные рабочие диалоги уже отслеживаются автоматически. Группы можно добавить отдельно.</p>
+      <Card className="onboarding-explainer">
+        <Icon name="message" />
+        <div><h2>Личные диалоги уже включены</h2><p>Группы — дополнительный источник. Добавьте ссылку на группу или общую папку Telegram, если backend сможет её открыть.</p></div>
+      </Card>
       {bootstrap.connections.length > 0
         ? <ConnectionManager api={api} connections={bootstrap.connections} mode="onboarding_groups" />
-        : <Card><h3>Сначала нужен Telegram-аккаунт</h3><p>Группы можно подключить позже в разделе «Аккаунты».</p></Card>}
-      <div className="onboarding-actions"><button className="primary-action" onClick={() => void onAdvance("notifications")}>Продолжить</button><button className="text-action" onClick={() => void onAdvance("notifications", "skipped")}>Пропустить</button></div>
+        : <Card className="warning-card"><h3>Telegram пока не подключён</h3><p>Группы можно добавить позже в разделе «Источники».</p></Card>}
+      <div className="onboarding-actions"><button className="primary-action" onClick={() => void onAdvance("notifications")}>Продолжить</button><button className="text-action" onClick={() => void onAdvance("notifications", "skipped")}>Пропустить этот шаг</button></div>
     </OnboardingFrame>;
   }
 
   if (step === "notifications") {
-    return <OnboardingFrame step={step} title="Ventrix bot в рабочей группе">
-      <Card className="onboarding-hero">
-        <h2>Напоминания там, где работает команда</h2>
-        <ol className="guide-list"><li>Добавьте клиентского Ventrix bot в рабочую группу.</li><li>Дайте ему право отправлять сообщения.</li><li>Включите напоминания для группы в настройках.</li></ol>
-        <p>Бот сможет напоминать о просроченных обещаниях, клиентах без ответа и важных нерешённых вопросах. Личные сообщения в группу не публикуются.</p>
+    return <OnboardingFrame step={step} title="Ventrix в рабочей группе">
+      <Card className="onboarding-hero bot-group-guide">
+        <span className="guide-icon"><Icon name="telegram" /></span>
+        <h2>Напоминания и сводки — прямо в Telegram</h2>
+        <p>Можно добавить клиентского Ventrix bot в рабочую группу и разрешить ему отправлять сообщения. Это канал уведомлений, а не источник мониторинга.</p>
+        <ol className="guide-list"><li>Добавьте Ventrix bot в нужную группу.</li><li>Разрешите ему отправлять сообщения.</li><li>Включите уведомления группы в настройках.</li></ol>
         <button className="primary-action" onClick={() => void onAdvance("mini_guide")}>Продолжить</button>
       </Card>
     </OnboardingFrame>;
   }
 
   if (step === "mini_guide") {
-    const capabilities = [
-      ["!", "Риски и клиенты", "Жалобы, обращения без ответа, потерянный интерес и сделки без следующего шага."],
-      ["✓", "Обещания и сроки", "Фиксация обязательств, ответственных и просроченных договорённостей."],
-      ["↗", "Сигналы для команды", "Приоритетные уведомления сотруднику или руководителю с контекстом ситуации."],
-      ["◎", "Работа сотрудников", "Нагрузка, скорость реакции, повторяющиеся ошибки и динамика исправлений."],
-      ["▥", "Статистика и отчёты", "Итоги по клиентам, проблемам, обязательствам и результатам за выбранный период."],
-      ["◌", "Проверка исправления", "Ventrix смотрит последующие сообщения и не закрывает ситуацию без подтверждения."],
+    const capabilities: Array<[IconName, string, string]> = [
+      ["clock", "Клиент без ответа", "Покажет незакрытый вопрос, когда команда не ответила вовремя."],
+      ["check", "Просроченное обещание", "Напомнит о договорённости, срок которой уже наступил."],
+      ["repeat", "Повторное обращение", "Свяжет новый запрос с предыдущим незавершённым разговором."],
+      ["alert", "Жалоба", "Выделит недовольство, которое требует реакции руководителя."],
+      ["document", "Важный документ", "Не даст потерять счёт, договор или файл, по которому ждут действие."],
+      ["briefcase", "Сделка без следующего шага", "Покажет интерес клиента, который остался без продолжения."],
     ];
-    return <OnboardingFrame step={step} title="Что будет под контролем">
-      <Card className="analysis-intro"><span className="onboarding-mark">V</span><h2>От сообщения — к управляемому результату</h2><p>Ventrix связывает события в диалогах с ответственными, сроками и дальнейшими действиями.</p></Card>
-      <div className="analysis-showcase">{capabilities.map(([icon, title, text]) => <Card className="analysis-capability" key={title}><span>{icon}</span><div><h3>{title}</h3><p>{text}</p></div></Card>)}</div>
-      <Card className="onboarding-note"><p>Учитываются контекст, история переписки, рабочее время и роли участников. Важные выводы сопровождаются evidence из диалога.</p></Card>
+    return <OnboardingFrame step={step} title="Что Ventrix будет замечать">
+      <div className="analysis-showcase">{capabilities.map(([icon, title, text]) => <Card className="analysis-capability" key={title}><span><Icon name={icon} /></span><div><h3>{title}</h3><p>{text}</p></div></Card>)}</div>
+      <Card className="onboarding-note"><p>Ventrix учитывает историю разговора и последующие сообщения, чтобы не превращать завершённый диалог в ложную тревогу.</p></Card>
       <button className="primary-action onboarding-next" onClick={() => void onAdvance("employees")}>Продолжить</button>
     </OnboardingFrame>;
   }
 
   if (step === "employees") {
-    const items = [["Главная", "Состояние проекта и ключевые показатели"], ["Важное", "Сигналы, которые требуют реакции"], ["Ситуации", "Ответственные, сроки и evidence"], ["Обязательства", "Открытые и просроченные обещания"], ["Отчёты", "Регулярные итоги"], ["Команда", "Сотрудники и доступ"], ["Аккаунты", "Telegram-сессии и группы"]];
-    return <OnboardingFrame step={step} title="Короткий гид">
-      <div className="guide-carousel">{items.map(([title, text]) => <Card key={title}><h3>{title}</h3><p>{text}</p></Card>)}</div>
-      <button className="primary-action onboarding-next" onClick={() => void onAdvance("final_review")}>Понятно</button>
+    const items: Array<[IconName, string, string]> = [
+      ["home", "Главная", "Состояние проекта и то, что требует внимания."],
+      ["alert", "Ситуации", "Контекст, ответственный, срок и действия."],
+      ["report", "Отчёты", "Регулярные итоги по компании и команде."],
+      ["team", "Команда", "Сотрудники, их доступ и рабочие аккаунты."],
+      ["telegram", "Источники", "Telegram-аккаунты и подключённые группы."],
+      ["settings", "Настройки", "Расписание, чувствительность и уведомления."],
+    ];
+    return <OnboardingFrame step={step} title="Где что находится">
+      <div className="quick-guide">{items.map(([icon, title, text]) => <div key={title}><Icon name={icon} /><span><strong>{title}</strong><small>{text}</small></span></div>)}</div>
+      <button className="primary-action onboarding-next" onClick={() => void onAdvance("final_review")}>Перейти к проверке</button>
     </OnboardingFrame>;
   }
 
-  if (step === "final_review") {
-    return <FinalReview api={api} initial={bootstrap} onAdvance={onAdvance} />;
-  }
-
-  return <OnboardingFrame step="completed" title="Открываем панель"><Card><p>Настройка сохранена. При следующем запуске откроется dashboard проекта.</p></Card></OnboardingFrame>;
+  if (step === "final_review") return <FinalReview api={api} initial={bootstrap} onAdvance={onAdvance} />;
+  return <OnboardingFrame step="completed" title="Открываем панель"><Card><p>Настройка сохранена. При следующем запуске откроется панель проекта.</p></Card></OnboardingFrame>;
 }
 
 function InitialSyncStep({ api, initial, onAdvance }: { api: VentrixClientApi; initial: Bootstrap; onAdvance: Advance }) {
   const [snapshot, setSnapshot] = useState(initial);
+  const [refreshError, setRefreshError] = useState("");
   useEffect(() => {
     if (!initial.connections.length) return;
     let cancelled = false;
-    const timer = window.setInterval(() => {
-      void api.bootstrap().then((value) => { if (!cancelled) setSnapshot(value); });
-    }, 2500);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    let timer = 0;
+    const refresh = async () => {
+      try {
+        const value = await api.bootstrap();
+        if (!cancelled) { setSnapshot(value); setRefreshError(""); }
+        if (!cancelled && value.progress?.status !== "completed") timer = window.setTimeout(refresh, 3000);
+      } catch {
+        if (!cancelled) { setRefreshError("Не удалось обновить прогресс. Синхронизация продолжает работать в фоне."); timer = window.setTimeout(refresh, 6000); }
+      }
+    };
+    timer = window.setTimeout(refresh, 1200);
+    return () => { cancelled = true; window.clearTimeout(timer); };
   }, [api, initial.connections.length]);
   const progress = snapshot.progress;
   if (!snapshot.connections.length) {
-    return <OnboardingFrame step="monitoring_started" title="Telegram можно подключить позже"><Card className="warning-card"><h2>Рабочий Telegram пока не подключён</h2><p>Ventrix пока нечего анализировать. После onboarding откройте раздел «Аккаунты» и подключите первый аккаунт.</p><button className="primary-action" onClick={() => void onAdvance("reports")}>Продолжить</button></Card></OnboardingFrame>;
+    return <OnboardingFrame step="monitoring_started" title="Можно продолжить без подключения"><Card className="warning-card connection-later"><Icon name="telegram" /><h2>Рабочий Telegram пока не подключён</h2><p>Ventrix пока нечего анализировать. Подключить аккаунт можно в любой момент в разделе «Источники».</p><button className="primary-action" onClick={() => void onAdvance("reports")}>Продолжить настройку</button></Card></OnboardingFrame>;
   }
+  const connected = snapshot.connections.some((item) => ["connected", "syncing", "ready"].includes(item.status));
+  const percent = progress ? Math.max(0, Math.min(100, progress.percent)) : null;
   return <OnboardingFrame step="monitoring_started" title="Первичная синхронизация">
-    <Card className="sync-progress-card"><span className="success-check">✓</span><h2>Подключение готово</h2><div className="sync-progress"><i style={{ width: `${progress?.percent ?? 10}%` }} /></div><p>{progress?.status === "completed" ? "Первичный анализ завершён" : "Загружаем рабочие диалоги и начинаем анализ"}</p><div className="sync-metrics"><Summary label="Личных диалогов" value={String(snapshot.dialog_counts.personal ?? progress?.dialogs_total ?? 0)} /><Summary label="Сообщений собрано" value={String(progress?.messages_loaded ?? 0)} />{typeof progress?.metrics?.signals_created === "number" && <Summary label="Первые сигналы" value={String(progress.metrics.signals_created)} />}{typeof progress?.metrics?.problems_created === "number" && <Summary label="Открытые ситуации" value={String(progress.metrics.problems_created)} />}</div><p className="muted-copy">Ventrix продолжит анализ в фоне. Ждать завершения не нужно.</p><button className="primary-action" onClick={() => void onAdvance("reports")}>Продолжить</button></Card>
-  </OnboardingFrame>;
-}
-
-function FinalReview({ api, initial, onAdvance }: { api: VentrixClientApi; initial: Bootstrap; onAdvance: Advance }) {
-  const [snapshot, setSnapshot] = useState(initial);
-  useEffect(() => { void api.bootstrap().then(setSnapshot); }, [api]);
-  const connection = snapshot.connections[0];
-  return <OnboardingFrame step="final_review" title="Ventrix настроен">
-    <Card className="onboarding-complete">
-      <span>✓</span><h2>Можно начинать работу</h2>
-      <div className="final-status">
-        <StatusRow label="Telegram account" value={connection ? connection.status : "не подключён"} ok={Boolean(connection)} />
-        <StatusRow label="Первичный анализ" value={snapshot.progress ? `${snapshot.progress.percent}%` : "ожидает подключения"} ok={snapshot.progress?.status === "completed"} />
-        <StatusRow label="Сотрудники" value={String(snapshot.employee_count)} />
-        <StatusRow label="Группы" value={String(snapshot.group_count)} />
-        <StatusRow label="Отчёт" value={reportLabel(snapshot)} ok />
-        <StatusRow label="Уведомления" value="включены" ok />
+    <Card className="sync-progress-card">
+      <span className="success-check"><Icon name="check" /></span>
+      <h2>{connected ? "Telegram подключён" : "Проверяем подключение"}</h2>
+      <p>{progress?.status === "completed" ? "Первичная обработка завершена." : "Ventrix собирает диалоги и начинает анализировать рабочий контекст."}</p>
+      <div className={`sync-progress ${percent === null ? "indeterminate" : ""}`} role="progressbar" aria-label="Прогресс первичной синхронизации" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined}><i style={percent === null ? undefined : { transform: `scaleX(${percent / 100})` }} /></div>
+      <div className="sync-status-line"><strong>{percent === null ? "Ожидаем первые данные" : `${percent}%`}</strong><span>{syncStageLabel(progress?.stage, progress?.status)}</span></div>
+      <div className="sync-metrics">
+        <Summary label="Найдено диалогов" value={snapshot.dialog_counts.personal ?? progress?.dialogs_total} />
+        <Summary label="Диалогов обработано" value={progress?.dialogs_completed} />
+        <Summary label="Сообщений собрано" value={progress?.messages_loaded} />
+        <Summary label="Первые ситуации" value={numericMetric(progress?.metrics, "problems_created")} />
       </div>
-      <div className="bot-guide"><h3>Client bot</h3><p>Используйте кнопки «Открыть панель», «Важные ситуации», «Отчёты», «Сотрудники» и «Настройки».</p></div>
-      <button className="primary-action" onClick={() => void onAdvance("completed")}>Завершить настройку</button>
-      <p>Ventrix продолжит обработку данных в фоне и сообщит, когда первичный анализ завершится.</p>
+      {refreshError && <p className="inline-warning">{refreshError}</p>}
+      <p className="muted-copy">Можно продолжить: синхронизация не остановится и завершится в фоне.</p>
+      <button className="primary-action" onClick={() => void onAdvance("reports")}>Продолжить</button>
     </Card>
   </OnboardingFrame>;
 }
@@ -167,23 +182,70 @@ function ReportSetup({ api, onAdvance }: { api: VentrixClientApi; onAdvance: Adv
   const [timezone, setTimezone] = useState("Europe/Moscow");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  useEffect(() => { void api.settings().then((value) => { setSettings(value); setTime(value.daily_report_time.slice(0, 5)); setTimezone(value.timezone); if (value.enabled_days.length === 7) setFrequency("daily"); else if (value.enabled_days.length === 1) setFrequency("weekly"); }).catch((reason: Error) => setError(reason.message)); }, [api]);
+  const retryLoad = () => {
+    setError("");
+    void api.settings().then((value) => {
+      setSettings(value); setTime(value.daily_report_time.slice(0, 5)); setTimezone(value.timezone);
+      setFrequency(value.enabled_days.length === 7 ? "daily" : value.enabled_days.length === 1 ? "weekly" : "weekdays");
+    }).catch(() => setError("Не удалось загрузить расписание. Проверьте соединение и повторите."));
+  };
+  useEffect(() => {
+    let cancelled = false;
+    void api.settings().then((value) => {
+      if (cancelled) return;
+      setSettings(value); setTime(value.daily_report_time.slice(0, 5)); setTimezone(value.timezone);
+      setFrequency(value.enabled_days.length === 7 ? "daily" : value.enabled_days.length === 1 ? "weekly" : "weekdays");
+    }).catch(() => !cancelled && setError("Не удалось загрузить расписание. Проверьте соединение и повторите."));
+    return () => { cancelled = true; };
+  }, [api]);
   async function save() {
     setBusy(true); setError("");
     try {
       const enabled_days = frequency === "daily" ? [0, 1, 2, 3, 4, 5, 6] : frequency === "weekdays" ? [0, 1, 2, 3, 4] : [0];
       await api.updateSettings({ daily_report_time: time, timezone, enabled_days });
       await onAdvance("groups");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось сохранить расписание"); } finally { setBusy(false); }
+    } catch { setError("Не удалось сохранить расписание. Настройки не потеряны — попробуйте ещё раз."); } finally { setBusy(false); }
   }
-  return <OnboardingFrame step="reports" title="Регулярный отчёт"><Card className="control-form"><h2>Когда присылать отчёт?</h2><div className="choice-grid">{(["daily", "weekdays", "weekly"] as const).map((value) => <button className={frequency === value ? "selected" : ""} key={value} onClick={() => setFrequency(value)}>{value === "daily" ? "Каждый день" : value === "weekdays" ? "По будням" : "Раз в неделю"}</button>)}</div><label>Время<input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label><label>Часовой пояс<input value={timezone} onChange={(event) => setTimezone(event.target.value)} /></label>{error && <p className="form-error">{error}</p>}<button className="primary-action" disabled={busy || !settings} onClick={() => void save()}>{busy ? "Сохраняем…" : "Сохранить и продолжить"}</button></Card></OnboardingFrame>;
+  if (!settings && !error) return <OnboardingFrame step="reports" title="Регулярные отчёты"><Card className="control-form"><Skeleton lines={4} /></Card></OnboardingFrame>;
+  return <OnboardingFrame step="reports" title="Регулярные отчёты"><Card className="control-form report-onboarding"><div><h2>Когда присылать сводку?</h2><p>Ventrix отправит отчёт только когда появятся новые рабочие сообщения.</p></div><div className="choice-grid" role="radiogroup" aria-label="Частота отчёта">{(["daily", "weekdays", "weekly"] as const).map((value) => <button role="radio" aria-checked={frequency === value} className={frequency === value ? "selected" : ""} key={value} onClick={() => setFrequency(value)}>{value === "daily" ? "Каждый день" : value === "weekdays" ? "По будням" : "Раз в неделю"}</button>)}</div><div className="report-time-fields"><label>Время<input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label><label>Часовой пояс<select value={timezoneOffset(timezone)} onChange={(event) => setTimezone(offsetTimezone(Number(event.target.value)))}>{UTC_OPTIONS.map((offset) => <option key={offset} value={offset}>{utcLabel(offset)}</option>)}</select><small>Для Москвы — UTC+3</small></label></div>{error && <div className="form-error" role="alert"><span>{error}</span>{!settings && <button onClick={retryLoad}>Повторить</button>}</div>}<button className="primary-action" disabled={busy || !settings} onClick={() => void save()}>{busy ? "Сохраняем расписание…" : "Сохранить и продолжить"}</button></Card></OnboardingFrame>;
 }
 
-function Summary({ label, value }: { label: string; value: string }) { return <div><small>{label}</small><strong>{value || "Не указано"}</strong></div>; }
+function FinalReview({ api, initial, onAdvance }: { api: VentrixClientApi; initial: Bootstrap; onAdvance: Advance }) {
+  const [snapshot, setSnapshot] = useState(initial);
+  const [settings, setSettings] = useState<ClientSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => { let cancelled = false; void Promise.all([api.bootstrap(), api.settings()]).then(([next, nextSettings]) => { if (!cancelled) { setSnapshot(next); setSettings(nextSettings); } }).finally(() => !cancelled && setLoading(false)); return () => { cancelled = true; }; }, [api]);
+  const connected = snapshot.connections.some((item) => ["connected", "syncing", "ready"].includes(item.status));
+  const syncReady = snapshot.progress?.status === "completed";
+  return <OnboardingFrame step="final_review" title="Проверим настройку">
+    <Card className="onboarding-complete">
+      <span><Icon name="check" /></span><h2>Ventrix готов к работе</h2><p>Все выбранные настройки сохранены на уровне проекта.</p>
+      {loading ? <Skeleton lines={5} /> : <div className="final-status">
+        <StatusRow label="Рабочий Telegram" value={connected ? "подключён" : "подключите позже"} ok={connected} />
+        <StatusRow label="Первичная синхронизация" value={connected ? (syncReady ? "готова" : "идёт в фоне") : "ожидает Telegram"} ok={syncReady} />
+        <StatusRow label="Сотрудники" value={String(snapshot.employee_count)} />
+        <StatusRow label="Рабочие группы" value={String(snapshot.group_count)} />
+        <StatusRow label="Регулярный отчёт" value={settings ? reportSchedule(settings) : "расписание сохранено"} ok={Boolean(settings)} />
+        <StatusRow label="Мониторинг" value={connected ? "активен" : "ожидает подключения"} ok={connected} />
+      </div>}
+      <button className="primary-action" onClick={() => void onAdvance("completed")}>Завершить настройку</button>
+      <p className="completion-note">Ventrix продолжит обработку данных в фоне. При следующем открытии вы сразу увидите главную панель.</p>
+    </Card>
+  </OnboardingFrame>;
+}
+
+function Summary({ label, value }: { label: string; value: number | undefined }) { return <div><small>{label}</small><strong>{typeof value === "number" ? <AnimatedNumber value={value} /> : "—"}</strong></div>; }
 function StatusRow({ label, value, ok = false }: { label: string; value: string; ok?: boolean }) { return <div><span>{label}</span><StatusBadge tone={ok ? "success" : "neutral"}>{value}</StatusBadge></div>; }
-function reportLabel(bootstrap: Bootstrap) { return bootstrap.onboarding.statuses.reports === "completed" ? "расписание сохранено" : "по расписанию"; }
+function numericMetric(metrics: Bootstrap["progress"] extends infer _ ? Record<string, number | string | null> | undefined : never, key: string) { const value = metrics?.[key]; return typeof value === "number" ? value : undefined; }
+function syncStageLabel(stage?: string, status?: string) { if (status === "completed") return "Готово"; if (!stage) return "Подготавливаем синхронизацию"; if (stage.includes("message")) return "Собираем сообщения"; if (stage.includes("analysis")) return "Анализируем диалоги"; if (stage.includes("dialog")) return "Находим рабочие диалоги"; return "Синхронизация продолжается"; }
+function reportSchedule(settings: ClientSettings) { const frequency = settings.enabled_days.length === 7 ? "ежедневно" : settings.enabled_days.length === 1 ? "раз в неделю" : "по будням"; return `${frequency}, ${settings.daily_report_time.slice(0, 5)}`; }
+
+const UTC_OPTIONS = Array.from({ length: 27 }, (_, index) => index - 12);
+function offsetTimezone(offset: number) { return offset === 0 ? "Etc/UTC" : `Etc/GMT${offset > 0 ? "-" : "+"}${Math.abs(offset)}`; }
+function timezoneOffset(timezone: string) { if (timezone === "Etc/UTC" || timezone === "UTC") return 0; if (timezone === "Europe/Moscow") return 3; const match = timezone.match(/^Etc\/GMT([+-])(\d+)$/); return match ? (match[1] === "-" ? Number(match[2]) : -Number(match[2])) : 3; }
+function utcLabel(offset: number) { return `UTC${offset >= 0 ? "+" : ""}${offset}`; }
 
 function OnboardingFrame({ step, title, children }: PropsWithChildren<{ step: OnboardingStep; title: string }>) {
   const stage = stageByStep[step];
-  return <main className="onboarding-shell"><header className="onboarding-header"><div><span className="onboarding-logo">V</span><strong>Ventrix</strong></div><small>Этап {stage} из 5</small><div className="onboarding-progress"><i style={{ width: `${stage * 20}%` }} /></div><h1>{title}</h1></header><section className="onboarding-body onboarding-step-enter">{children}</section><footer className="onboarding-security">Данные рабочих сессий защищены шифрованием. Коды подтверждения и пароль 2FA не сохраняются.</footer></main>;
+  return <main className="onboarding-shell"><header className="onboarding-header"><div className="onboarding-brand"><span className="onboarding-logo">V</span><strong>Ventrix</strong></div><div className="onboarding-stage-copy"><small>Шаг {stage} из 5</small><strong>{stages[stage - 1]}</strong></div><div className="onboarding-progress" role="progressbar" aria-label="Прогресс настройки" aria-valuemin={1} aria-valuemax={5} aria-valuenow={stage}><i style={{ transform: `scaleX(${stage / 5})` }} /></div><h1>{title}</h1></header><section className="onboarding-body onboarding-step-enter" key={step}>{children}</section><footer className="onboarding-security">Данные рабочих сессий защищены шифрованием. Коды подтверждения и пароль 2FA не сохраняются.</footer></main>;
 }

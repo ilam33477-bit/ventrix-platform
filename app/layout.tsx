@@ -3,12 +3,15 @@ import { headers } from "next/headers";
 import Script from "next/script";
 import "./globals.css";
 
-const title = "Опера — Telegram Operations Intelligence";
-const description = "Операционная прозрачность и контроль исполнения договорённостей в Telegram.";
+const title = "Ventrix — рабочие коммуникации под контролем";
+const description = "Проблемы, обязательства и контроль исполнения в рабочих Telegram-коммуникациях.";
 
 export const viewport: Viewport = {
-  colorScheme: "light",
-  themeColor: "#f4f6f3",
+  colorScheme: "light dark",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f3f5f2" },
+    { media: "(prefers-color-scheme: dark)", color: "#101513" },
+  ],
   viewportFit: "cover",
 };
 
@@ -27,5 +30,6 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="ru"><body><Script src="https://telegram.org/js/telegram-web-app.js" strategy="beforeInteractive" />{children}</body></html>;
+  const themeBootstrap = `(function(){try{var m=localStorage.getItem('ventrix-theme-mode')||'telegram';var r=m==='telegram'?(localStorage.getItem('ventrix-resolved-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')):m;document.documentElement.dataset.themeMode=m;document.documentElement.dataset.theme=r;document.documentElement.style.colorScheme=r}catch(e){}})()`;
+  return <html lang="ru" suppressHydrationWarning><body><Script src="https://telegram.org/js/telegram-web-app.js" strategy="beforeInteractive" /><Script id="ventrix-theme" strategy="beforeInteractive">{themeBootstrap}</Script>{children}</body></html>;
 }

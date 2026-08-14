@@ -6,6 +6,7 @@ type TelegramWebApp = {
   colorScheme?: "light" | "dark";
   themeParams?: TelegramTheme;
   viewportStableHeight?: number;
+  viewportHeight?: number;
   safeAreaInset?: TelegramInsets;
   contentSafeAreaInset?: TelegramInsets;
   ready?: () => void;
@@ -32,6 +33,7 @@ export function initializeTelegramMiniApp() {
 
   const applyViewport = () => {
     setCssVariable("--tg-viewport-stable-height", webApp?.viewportStableHeight ?? window.innerHeight);
+    setCssVariable("--tg-viewport-height", webApp?.viewportHeight ?? window.visualViewport?.height ?? window.innerHeight);
     const safe = webApp?.safeAreaInset;
     const content = webApp?.contentSafeAreaInset;
     setCssVariable("--tg-safe-top", safe?.top ?? 0);
@@ -39,21 +41,41 @@ export function initializeTelegramMiniApp() {
     setCssVariable("--tg-safe-bottom", safe?.bottom ?? 0);
     setCssVariable("--tg-safe-left", safe?.left ?? 0);
     setCssVariable("--tg-content-safe-top", content?.top ?? 0);
+    setCssVariable("--tg-content-safe-right", content?.right ?? 0);
     setCssVariable("--tg-content-safe-bottom", content?.bottom ?? 0);
+    setCssVariable("--tg-content-safe-left", content?.left ?? 0);
   };
   applyViewport();
   webApp?.onEvent?.("viewportChanged", applyViewport);
 
-  const theme = webApp?.themeParams ?? {};
-  setCssVariable("--tg-theme-bg", theme.bg_color);
-  setCssVariable("--tg-theme-text", theme.text_color);
-  setCssVariable("--tg-theme-hint", theme.hint_color);
-  setCssVariable("--tg-theme-button", theme.button_color);
-  setCssVariable("--tg-theme-button-text", theme.button_text_color);
-  document.documentElement.dataset.telegramTheme = webApp?.colorScheme ?? "light";
+  const applyTelegramTheme = () => {
+    const theme = webApp?.themeParams ?? {};
+    setCssVariable("--tg-theme-bg", theme.bg_color);
+    setCssVariable("--tg-theme-text", theme.text_color);
+    setCssVariable("--tg-theme-hint", theme.hint_color);
+    setCssVariable("--tg-theme-button", theme.button_color);
+    setCssVariable("--tg-theme-button-text", theme.button_text_color);
+    document.documentElement.dataset.telegramTheme = webApp?.colorScheme ?? "light";
+    window.dispatchEvent(new Event("ventrix:telegram-theme-change"));
+  };
+  applyTelegramTheme();
+  webApp?.onEvent?.("themeChanged", applyTelegramTheme);
+
+  const visualViewport = window.visualViewport;
+  const applyKeyboard = () => {
+    const visibleHeight = visualViewport?.height ?? window.innerHeight;
+    document.documentElement.dataset.keyboardVisible = window.innerHeight - visibleHeight > 120 ? "true" : "false";
+    setCssVariable("--visual-viewport-height", visibleHeight);
+  };
+  applyKeyboard();
+  visualViewport?.addEventListener("resize", applyKeyboard);
 
   return {
     initData: webApp?.initData ?? "",
-    cleanup: () => webApp?.offEvent?.("viewportChanged", applyViewport),
+    cleanup: () => {
+      webApp?.offEvent?.("viewportChanged", applyViewport);
+      webApp?.offEvent?.("themeChanged", applyTelegramTheme);
+      visualViewport?.removeEventListener("resize", applyKeyboard);
+    },
   };
 }
