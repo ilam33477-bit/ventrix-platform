@@ -400,3 +400,9 @@ input:disabled,select:disabled,textarea:disabled{opacity:1;color:var(--text-tert
 @media(max-width:430px){.problem-quick-close{align-items:stretch;flex-wrap:wrap}.problem-quick-close>span{width:100%;margin:0}.problem-quick-close button{flex:1}.managed-connections .connection-row{grid-template-columns:42px minmax(0,1fr) auto}.managed-connections .connection-row>.status-badge{grid-column:3;grid-row:1}}
 @media(prefers-reduced-motion:reduce){.problem-cards>.problem-card{animation:none!important}}
 .group-connect-guide{display:grid;grid-template-columns:42px minmax(0,1fr);gap:13px;align-items:start;padding:18px}.group-connect-guide>svg{width:42px;height:42px;padding:10px;border-radius:13px;background:var(--accent-soft);color:var(--accent)}.group-connect-guide>div{min-width:0}.group-connect-guide h3{margin:1px 0 8px;font:var(--font-section-title)}.group-connect-guide ol{margin:0;padding-left:19px;color:var(--text-primary);font:var(--font-body)}.group-connect-guide li+li{margin-top:5px}.group-connect-guide p{margin:10px 0 0;color:var(--text-secondary);font:var(--font-caption)}.group-connect-guide>button{grid-column:1/-1;width:100%}
+
+/* Team cards: keep connection state compact and give the final fact a full row. */
+.team-list .person-row{grid-template-columns:42px minmax(0,1fr) max-content;align-items:start}
+.team-list .person-row>.status-badge{grid-column:3;grid-row:1;align-self:start;justify-self:end;width:max-content;min-width:max-content;max-width:none;margin-left:0;white-space:nowrap;word-break:keep-all;border-radius:999px}
+.employee-meta{grid-template-columns:repeat(2,minmax(0,1fr))}
+.employee-meta>span:nth-child(3){grid-column:1/-1}
