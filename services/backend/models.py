@@ -699,6 +699,43 @@ class TelegramMessage(StringPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class OutboundTelegramMessage(StringPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "outbound_telegram_messages"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    problem_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("operational_problems.id", ondelete="CASCADE"), index=True
+    )
+    connection_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("telegram_connections.id", ondelete="CASCADE"), index=True
+    )
+    dialog_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("telegram_dialogs.id", ondelete="CASCADE"), index=True
+    )
+    client_request_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="pending", server_default="pending", nullable=False, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    telegram_random_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "client_request_id", name="uq_outbound_telegram_client_request"
+        ),
+        CheckConstraint("attempts >= 0", name="ck_outbound_telegram_attempts"),
+        CheckConstraint(
+            "status IN ('pending','sending','sent','failed')",
+            name="ck_outbound_telegram_status",
+        ),
+    )
+
+
 class TelegramIncrementalCursor(StringPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "telegram_incremental_cursors"
 

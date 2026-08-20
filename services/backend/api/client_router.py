@@ -10,10 +10,12 @@ from datetime import UTC, datetime
 from datetime import time as clock_time
 from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.problems import ProblemStatus
@@ -38,6 +40,7 @@ from ..models import (
     InitialAnalysisRun,
     MonitoredSource,
     OperationalProblem,
+    OutboundTelegramMessage,
     Permission,
     ProblemTransition,
     ProblemVerification,
@@ -51,6 +54,7 @@ from ..models import (
     TelegramDialog,
     TelegramMessage,
     Tenant,
+    TenantAIProfile,
     TenantMembership,
     TenantSettings,
 )
@@ -88,6 +92,21 @@ class ProblemPatch(BaseModel):
     deadline_at: datetime | None = None
 
 
+class ProblemReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=4096)
+    client_request_id: UUID
+
+    @field_validator("text")
+    @classmethod
+    def normalize_reply_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Reply text is empty")
+        return normalized
+
+
 class ClientSettingsPatch(BaseModel):
     daily_report_time: clock_time | None = None
     timezone: str | None = None
@@ -95,6 +114,7 @@ class ClientSettingsPatch(BaseModel):
     analysis_advance_minutes: int | None = Field(default=None)
     enabled_days: list[int] | None = None
     history_window_days: int | None = None
+    response_sla_minutes: int | None = Field(default=None, gt=0, le=43_200)
     signal_report_threshold: int | None = Field(default=None, ge=0, le=100)
     signal_problem_threshold: int | None = Field(default=None, ge=0, le=100)
     signal_immediate_threshold: int | None = Field(default=None, ge=0, le=100)
@@ -1162,6 +1182,184 @@ async def problem_detail(
     }
 
 
+@router.get("/problems/{problem_id}/conversation")
+async def problem_conversation(
+    problem_id: str,
+    context: ClientContext,
+    before: int | None = Query(default=None, gt=0),
+    limit: int = Query(default=30, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    problem = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
+    if problem is None or not can_read_problem(context, problem):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    dialog = await session.scalar(
+        select(TelegramDialog).where(
+            TelegramDialog.id == problem.dialog_id,
+            TelegramDialog.tenant_id == context.tenant.id,
+        )
+    )
+    connection = await session.scalar(
+        select(TelegramConnection).where(
+            TelegramConnection.id == problem.connection_id,
+            TelegramConnection.tenant_id == context.tenant.id,
+            TelegramConnection.deleted_at.is_(None),
+        )
+    )
+    if dialog is None or connection is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Диалог недоступен")
+    query = select(TelegramMessage).where(
+        TelegramMessage.tenant_id == context.tenant.id,
+        TelegramMessage.dialog_id == dialog.id,
+        TelegramMessage.deleted_at.is_(None),
+    )
+    if before is not None:
+        query = query.where(TelegramMessage.telegram_message_id < before)
+    rows = list(
+        await session.scalars(
+            query.order_by(TelegramMessage.telegram_message_id.desc()).limit(limit + 1)
+        )
+    )
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    rows.reverse()
+    return {
+        "problem_id": problem.id,
+        "client": {
+            "title": dialog.title,
+            "username": dialog.username,
+        },
+        "connection": {
+            "name": connection.display_name or connection.phone_masked,
+            "username": connection.username,
+        },
+        "can_reply": bool(
+            can_manage_problem(context, problem)
+            and dialog.dialog_type == "personal"
+            and not dialog.excluded
+            and connection.session_secret_id is not None
+            and connection.status in {"connected", "syncing", "ready"}
+        ),
+        "messages": [
+            {
+                "id": item.id,
+                "telegram_message_id": item.telegram_message_id,
+                "text": item.body_text,
+                "outgoing": item.outgoing,
+                "sender_role": item.sender_role,
+                "sent_at": item.sent_at,
+            }
+            for item in rows
+        ],
+        "next_cursor": rows[0].telegram_message_id if has_more and rows else None,
+    }
+
+
+@router.post("/problems/{problem_id}/reply", status_code=status.HTTP_202_ACCEPTED)
+async def reply_to_problem(
+    problem_id: str,
+    payload: ProblemReply,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    problem = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
+    if problem is None or not can_manage_problem(context, problem):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    dialog = await session.scalar(
+        select(TelegramDialog).where(
+            TelegramDialog.id == problem.dialog_id,
+            TelegramDialog.tenant_id == context.tenant.id,
+            TelegramDialog.connection_id == problem.connection_id,
+            TelegramDialog.excluded.is_(False),
+            TelegramDialog.dialog_type == "personal",
+        )
+    )
+    connection = await session.scalar(
+        select(TelegramConnection).where(
+            TelegramConnection.id == problem.connection_id,
+            TelegramConnection.tenant_id == context.tenant.id,
+            TelegramConnection.deleted_at.is_(None),
+            TelegramConnection.status.in_(("connected", "syncing", "ready")),
+        )
+    )
+    if dialog is None or connection is None or connection.session_secret_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Рабочая Telegram-сессия сейчас недоступна",
+        )
+    request_id = str(payload.client_request_id)
+    command = await session.scalar(
+        select(OutboundTelegramMessage).where(
+            OutboundTelegramMessage.tenant_id == context.tenant.id,
+            OutboundTelegramMessage.client_request_id == request_id,
+        )
+    )
+    if command is not None and (command.problem_id != problem.id or command.text != payload.text):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="client_request_id уже использован для другого ответа",
+        )
+    if command is None:
+        random_id = int.from_bytes(
+            hashlib.sha256(f"{context.tenant.id}:{request_id}".encode()).digest()[:8],
+            "big",
+        ) & ((1 << 63) - 1)
+        try:
+            async with session.begin_nested():
+                command = OutboundTelegramMessage(
+                    tenant_id=context.tenant.id,
+                    problem_id=problem.id,
+                    connection_id=connection.id,
+                    dialog_id=dialog.id,
+                    client_request_id=request_id,
+                    text=payload.text,
+                    telegram_random_id=random_id or 1,
+                )
+                session.add(command)
+                await session.flush()
+        except IntegrityError:
+            command = await session.scalar(
+                select(OutboundTelegramMessage).where(
+                    OutboundTelegramMessage.tenant_id == context.tenant.id,
+                    OutboundTelegramMessage.client_request_id == request_id,
+                )
+            )
+            if command is None:
+                raise
+            if command.problem_id != problem.id or command.text != payload.text:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="client_request_id уже использован для другого ответа",
+                ) from None
+        else:
+            await record_event(
+                session,
+                context,
+                "problem_reply_requested",
+                {"problem_id": problem.id, "outbound_message_id": command.id},
+            )
+            await session.commit()
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    if command.status != "sent":
+        await SQLiteJobQueue(factory).enqueue(
+            "telegram.send_message",
+            {"outbound_message_id": command.id},
+            tenant_id=context.tenant.id,
+            telegram_account_id=connection.id,
+            dialog_id=dialog.id,
+            category="telegram_rpc",
+            cost_class="light",
+            idempotency_key=f"telegram-send-message:{command.id}",
+            max_attempts=5,
+        )
+    return {
+        "id": command.id,
+        "status": command.status,
+        "telegram_message_id": command.telegram_message_id,
+        "client_request_id": command.client_request_id,
+    }
+
+
 @router.patch("/problems/{problem_id}")
 async def update_problem(
     problem_id: str,
@@ -1211,6 +1409,38 @@ async def update_problem(
         "responsible_employee_id": updated.responsible_employee_id,
         "deadline_at": updated.deadline_at,
     }
+
+
+@router.post("/problems/{problem_id}/resolve")
+async def resolve_problem(
+    problem_id: str,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    item = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    if not can_manage_problem(context, item):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    try:
+        updated = await ProblemLifecycleService(factory).resolve_by_human(
+            context.tenant.id,
+            problem_id,
+            actor_id=context.membership.id,
+            reason="Пользователь подтвердил, что ситуация завершена.",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    async with factory() as event_session:
+        await record_event(
+            event_session,
+            context,
+            "problem_resolved",
+            {"problem_id": updated.id, "source": "quick_action"},
+        )
+        await event_session.commit()
+    return {"id": updated.id, "status": updated.status}
 
 
 @router.get("/reports")
@@ -1550,20 +1780,22 @@ async def complete_connection_login(
             cost_class="light",
             max_attempts=8,
         )
-        if (getattr(connection, "progress_json", None) or {}).get(
-            "create_employee"
-        ) and not getattr(connection, "assigned_employee_id", None):
+        if not getattr(connection, "assigned_employee_id", None):
+            # Every monitored session needs an accountable person. Even a
+            # shared/owner connection is represented as an employee record so
+            # problems, reports and group mentions never lose their owner.
+            connection_user_id = getattr(connection, "telegram_user_id", None)
             employee = await session.scalar(
                 select(Employee).where(
                     Employee.tenant_id == context.tenant.id,
-                    Employee.telegram_user_id == connection.telegram_user_id,
+                    Employee.telegram_user_id == connection_user_id,
                 )
-            )
+            ) if connection_user_id else None
             if employee is None:
                 employee = Employee(
                     tenant_id=context.tenant.id,
                     display_name=connection.display_name or connection.username or "Сотрудник",
-                    telegram_user_id=connection.telegram_user_id,
+                    telegram_user_id=connection_user_id,
                     telegram_username=connection.username,
                     role="employee",
                     status="active",
@@ -2255,6 +2487,7 @@ async def get_client_settings(
         "analysis_advance_minutes": settings.analysis_advance_minutes,
         "enabled_days": settings.enabled_days,
         "history_window_days": settings.history_window_days,
+        "response_sla_minutes": settings.response_sla_minutes,
         "signal_report_threshold": settings.signal_report_threshold,
         "signal_problem_threshold": settings.signal_problem_threshold,
         "signal_immediate_threshold": settings.signal_immediate_threshold,
@@ -2308,6 +2541,14 @@ async def patch_client_settings(
         raise HTTPException(status_code=422, detail="Signal thresholds must be ordered")
     for key, value in values.items():
         setattr(settings, key, value)
+    if "response_sla_minutes" in values:
+        legacy_profile = await session.scalar(
+            select(TenantAIProfile).where(TenantAIProfile.tenant_id == context.tenant.id)
+        )
+        if legacy_profile is not None:
+            # TenantSettings is authoritative; this field remains a synchronized
+            # compatibility mirror for owner-bot/profile presentation.
+            legacy_profile.response_sla_minutes = values["response_sla_minutes"]
     schedule = await TenantClientRepository(session, context.tenant.id).schedule()
     if schedule:
         mapping = {
@@ -2346,6 +2587,27 @@ async def access(
         else context.tenant.subscription_expires_at,
         "grace_period_until": schedule.grace_period_until if schedule else None,
         "analysis_enabled": schedule.analysis_enabled if schedule else False,
+    }
+
+
+@router.get("/session")
+async def client_session(
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    app_settings: Settings = Depends(get_settings),  # noqa: B008
+) -> dict[str, Any]:
+    """Load the initial Mini App state after a single initData validation."""
+    auth_payload = await mini_app_auth(context=context, session=session)
+    bootstrap_payload = await client_bootstrap(
+        context=context,
+        session=session,
+        app_settings=app_settings,
+    )
+    access_payload = await access(context=context, session=session)
+    return {
+        "auth": auth_payload,
+        "bootstrap": bootstrap_payload,
+        "access": access_payload,
     }
 
 

@@ -43,7 +43,8 @@ TECHNICAL_RE = re.compile(
     re.IGNORECASE,
 )
 PAYMENT_RE = re.compile(
-    r"(?:сколько\s+сто|цен[ауы]|тариф|оплат|сч[её]т|invoice|подписк\w*\s+сто)", re.IGNORECASE
+    r"(?:сколько(?:\s+это)?\s+сто|цен[ауы]|тариф|оплат|сч[её]т|invoice|подписк\w*\s+сто)",
+    re.IGNORECASE,
 )
 PARTNERSHIP_RE = re.compile(
     r"(?:клиентск\w+\s+баз|привожу\s+пользовател|фикс\s+или\s+процент|"
@@ -62,6 +63,10 @@ INTEREST_RE = re.compile(
     re.IGNORECASE,
 )
 FILLER_RE = re.compile(r"^(?:а|э|мм+|\.\.\.|[!?]{1,2})$", re.IGNORECASE)
+FAREWELL_RE = re.compile(
+    r"^(?:доброй(?:\s+ночи)?|спокойной(?:\s+ночи)?|до\s+связи|до\s+завтра)[.! )🙏👍]*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +200,26 @@ def assess_conversation(messages: list[Any]) -> ConversationAssessment:
             evidence,
             ("UNANSWERED_REQUEST",),
         )
+    if (
+        last
+        and not last["outgoing"]
+        and FAREWELL_RE.fullmatch(last["text"])
+        and any(item["outgoing"] and FAREWELL_RE.search(item["text"]) for item in normalized[-3:-1])
+    ):
+        return ConversationAssessment(
+            "CLOSED_NEUTRAL",
+            False,
+            False,
+            None,
+            None,
+            0.96,
+            "FAREWELL",
+            client_text,
+            "Стороны обменялись прощальными репликами; продолжение сейчас не ожидается.",
+            None,
+            evidence,
+            ("UNANSWERED_REQUEST",),
+        )
     if last and last["outgoing"]:
         return ConversationAssessment(
             "WAITING_FOR_CLIENT",
@@ -267,6 +292,13 @@ def assess_conversation(messages: list[Any]) -> ConversationAssessment:
             "ACTIVE_SALES",
             "CONFIRMED_INTEREST",
             "Продолжить коммерческий диалог и предложить следующий шаг.",
+        )
+    elif any(item["outgoing"] for item in normalized[:-1]):
+        family, state, intent, action = (
+            "UNANSWERED_REQUEST",
+            "WAITING_FOR_EMPLOYEE",
+            "CONTINUING_CONVERSATION",
+            "Отреагировать на последнюю реплику клиента с учётом контекста диалога.",
         )
     else:
         return ConversationAssessment(

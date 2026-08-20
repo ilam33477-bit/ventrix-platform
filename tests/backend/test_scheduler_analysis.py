@@ -648,3 +648,60 @@ async def test_legacy_signal_escalation_report_job_is_suppressed(
     assert result["report_suppressed"] is True
     assert stored_run.status == "completed"
     assert reports == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_report_survives_failed_ai_batch_and_marks_partial(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        run = AnalysisRun(
+            tenant_id=tenant.id,
+            trigger="scheduled",
+            status="running",
+            stage="ai_batch_analysis",
+            started_at=now,
+            correlation_id="partial-report",
+            metrics_json={"history_window_days": 7},
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            AnalysisBatch(
+                tenant_id=tenant.id,
+                run_id=run.id,
+                batch_key="failed-batch",
+                status="failed",
+                payload_json={"dialogs": []},
+                local_features_json={},
+                last_error_code="ai_batch_failed",
+            )
+        )
+        await session.commit()
+        run_id = run.id
+
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue(
+        "report_generation",
+        {"analysis_run_id": run_id},
+        tenant_id=tenant.id,
+        category="report",
+    )
+    lease = await queue.claim_next("report-worker", allowed_categories=frozenset({"report"}))
+    assert lease is not None and lease.id == job_id
+    result = await AnalysisPipelineService(
+        session_factory,
+        EncryptionService(encryption_key),
+        queue=queue,
+    ).generate_report(lease)
+
+    async with session_factory() as session:
+        stored_run = await session.get(AnalysisRun, run_id)
+        report = await session.scalar(select(Report).where(Report.analysis_run_id == run_id))
+    assert report is not None
+    assert result["metrics"]["analysis_partial"] == 1
+    assert stored_run.status == "completed"
+    assert stored_run.failed_batches == 1
+    assert stored_run.delayed_reason == "partial_ai_batch_failure"

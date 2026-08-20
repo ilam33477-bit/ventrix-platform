@@ -222,6 +222,16 @@ async def test_owner_api_endpoints(
         assert profile.status_code == 200
         assert profile.json()["version"] == 2
 
+        sla_profile = await client.patch(
+            f"/api/v1/owner/tenants/{tenant_id}/ai-profile",
+            headers=headers,
+            json={"response_sla_minutes": 30},
+        )
+        assert sla_profile.status_code == 200
+        assert sla_profile.json()["response_sla_minutes"] == 30
+        sla_tenant = await client.get(f"/api/v1/owner/tenants/{tenant_id}", headers=headers)
+        assert sla_tenant.json()["settings"]["response_sla_minutes"] == 30
+
         bot = await client.post(
             f"/api/v1/owner/tenants/{tenant_id}/bots",
             headers=headers,
@@ -315,6 +325,13 @@ async def test_owner_api_endpoints(
         assert client_bootstrap.status_code == 200
         assert client_bootstrap.json()["onboarding"]["completed"] is True
         assert client_bootstrap.json()["onboarding"]["step"] == "completed"
+        client_session = await client.get(
+            "/api/v1/client/session", headers={"Authorization": f"tma {init_data}"}
+        )
+        assert client_session.status_code == 200, client_session.text
+        assert client_session.json()["auth"]["tenant_id"] == tenant_id
+        assert client_session.json()["bootstrap"]["onboarding"]["completed"] is True
+        assert "expires_at" in client_session.json()["access"]
 
         employee = await client.post(
             "/api/v1/client/employees",

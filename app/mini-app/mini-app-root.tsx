@@ -57,7 +57,7 @@ export function MiniAppRoot() {
     switch (activeTab) {
       case "problems": return <ProblemsView api={api} initialProblemId={dashboardProblemId ?? requestedProblemId} />;
       case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
-      case "statistics": return <StatisticsView summary={session.auth.dashboard_summary} />;
+      case "statistics": return <StatisticsView api={api} summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;
       case "employees": return <EmployeesView api={api} />;
       case "connections": return <ConnectionManager api={api} connections={session.bootstrap.connections} />;

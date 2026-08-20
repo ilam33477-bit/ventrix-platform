@@ -73,6 +73,38 @@ class ClientContext:
     employee_id: str | None = None
 
 
+PROBLEM_TYPE_LABELS = {
+    "client_without_answer": "Клиент ждёт ответа",
+    "customer_question": "Открытый вопрос клиента",
+    "customer_complaint": "Жалоба клиента",
+    "technical_problem": "Техническая проблема",
+    "payment_question": "Вопрос об оплате",
+    "commercial_opportunity": "Коммерческая возможность",
+    "overdue_commitment": "Просроченное обещание",
+    "commitment_risk": "Риск по обещанию",
+}
+PROBLEM_STATUS_LABELS = {
+    "new": "Новая",
+    "needs_confirmation": "Нужно проверить",
+    "acknowledged": "Принята",
+    "assigned": "Назначена",
+    "in_progress": "В работе",
+    "waiting": "Ожидает",
+    "resolved": "Решена",
+    "auto_resolved": "Решена автоматически",
+    "reopened": "Открыта повторно",
+    "false_positive": "Не проблема",
+}
+CONNECTION_STATUS_LABELS = {
+    "awaiting_code": "ожидает код",
+    "awaiting_2fa": "ожидает пароль 2FA",
+    "connected": "подключён",
+    "syncing": "идёт синхронизация",
+    "ready": "готов",
+    "reauthorization_required": "нужно подключить заново",
+}
+
+
 class TenantOwnerMiddleware(BaseMiddleware):
     def __init__(
         self,
@@ -563,8 +595,8 @@ def build_client_router(
             return
         await edit_screen(
             query,
-            f"<b>{escape(problem.problem_type.replace('_', ' ').title())}</b>\n\n"
-            f"Статус: <b>{escape(problem.status)}</b>\n"
+            f"<b>{escape(PROBLEM_TYPE_LABELS.get(problem.problem_type, 'Рабочая ситуация'))}</b>\n\n"
+            f"Статус: <b>{escape(PROBLEM_STATUS_LABELS.get(problem.status, 'Требует проверки'))}</b>\n"
             f"Причина: {escape(problem.explanation)}\n\n"
             f"<blockquote>{escape(problem.evidence or 'Evidence появится после проверки')}</blockquote>\n\n"
             f"Следующий шаг: {escape(problem.recommended_action)}",
@@ -1127,7 +1159,10 @@ def build_client_router(
         buttons = []
         for index, item in enumerate(rows, start=1):
             label = item.display_name or item.phone_masked or f"Аккаунт {index}"
-            details.append(f"<b>{index}. {escape(label)}</b>\nСтатус: {escape(item.status)}")
+            details.append(
+                f"<b>{index}. {escape(label)}</b>\n"
+                f"Статус: {escape(CONNECTION_STATUS_LABELS.get(item.status, 'требует проверки'))}"
+            )
             buttons.append(
                 [
                     InlineKeyboardButton(

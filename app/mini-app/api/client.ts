@@ -2,6 +2,7 @@ import type {
   Bootstrap,
   ClientSettings,
   ClientOnboarding,
+  ClientSession,
   Commitment,
   Employee,
   Folder,
@@ -10,6 +11,8 @@ import type {
   OnboardingStep,
   Problem,
   ProblemDetail,
+  ProblemConversation,
+  ProblemReplyResult,
   ProblemStatus,
   ProjectAccess,
   ReportDetail,
@@ -60,12 +63,7 @@ export class VentrixClientApi {
   }
 
   async loadSession() {
-    const [auth, bootstrap, access] = await Promise.all([
-      this.authenticate(),
-      this.bootstrap(),
-      this.access(),
-    ]);
-    return { auth, bootstrap, access };
+    return this.request<ClientSession>("/session");
   }
 
   updateOnboarding(step: OnboardingStep, status: "completed" | "skipped" = "completed") {
@@ -104,6 +102,17 @@ export class VentrixClientApi {
     return this.request<ProblemDetail>(`/problems/${problemId}`);
   }
 
+  problemConversation(problemId: string) {
+    return this.request<ProblemConversation>(`/problems/${problemId}/conversation`);
+  }
+
+  replyToProblem(problemId: string, text: string, clientRequestId: string) {
+    return this.request<ProblemReplyResult>(`/problems/${problemId}/reply`, {
+      method: "POST",
+      body: JSON.stringify({ text, client_request_id: clientRequestId }),
+    });
+  }
+
   transitionProblem(problemId: string, value: {
     status: ProblemStatus;
     reason: string;
@@ -114,6 +123,12 @@ export class VentrixClientApi {
     return this.request<{ id: string; status: ProblemStatus }>(`/problems/${problemId}`, {
       method: "PATCH",
       body: JSON.stringify(value),
+    });
+  }
+
+  resolveProblem(problemId: string) {
+    return this.request<{ id: string; status: ProblemStatus }>(`/problems/${problemId}/resolve`, {
+      method: "POST",
     });
   }
 

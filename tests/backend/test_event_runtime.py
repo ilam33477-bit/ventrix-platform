@@ -21,6 +21,7 @@ from services.backend.models import (
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
+    TenantSettings,
 )
 from services.backend.services.client_drafts import OwnerClientDraftService
 from services.backend.services.encryption import EncryptionService
@@ -245,6 +246,142 @@ async def test_sla_check_discards_stale_timer_for_automated_dialog(
         state = await session.scalar(select(DialogState))
         assert state.response_expected_message_id is None
         assert state.next_sla_check_at is None
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
+
+
+async def _sla_fixture(session_factory, make_service, tenant_payload, *, minutes_ago: int):
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.flush()
+        dialog = TelegramDialog(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            telegram_dialog_id=880001,
+            canonical_peer_id="880001",
+            title="Клиент",
+            dialog_type="personal",
+            source="live",
+            classification="human_dialog",
+            selected=True,
+            excluded=False,
+        )
+        session.add(dialog)
+        await session.flush()
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=1,
+            sender_role="customer",
+            sent_at=now - timedelta(minutes=minutes_ago),
+            outgoing=False,
+            body_text="Можно подробнее?",
+            attachments_json=[],
+        )
+        session.add(message)
+        await session.flush()
+        session.add(
+            DialogState(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                awaiting_employee_since=message.sent_at,
+                response_expected_message_id=message.id,
+                next_sla_check_at=message.sent_at + timedelta(minutes=60),
+                open_commitments_json=[],
+                unresolved_questions_json=[],
+            )
+        )
+        await session.commit()
+    return tenant, connection, dialog, message
+
+
+def _sla_lease(tenant, connection, dialog, message) -> JobLease:
+    return JobLease(
+        id="sla-regression",
+        tenant_id=tenant.id,
+        telegram_account_id=connection.id,
+        dialog_id=dialog.id,
+        correlation_id=None,
+        job_type="dialog.sla_check",
+        category="reconciliation",
+        cost_class="light",
+        payload={"dialog_id": dialog.id, "expected_message_id": message.id},
+        attempts=0,
+        max_attempts=3,
+        locked_by="test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sla_never_creates_problem_before_persisted_deadline(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, connection, dialog, message = await _sla_fixture(
+        session_factory, make_service, tenant_payload, minutes_ago=10
+    )
+    result = await ReconciliationService(session_factory, SQLiteJobQueue(session_factory)).sla_check(
+        _sla_lease(tenant, connection, dialog, message)
+    )
+    assert result == {"created": False, "problem_id": None}
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_sla_uses_frozen_deadline_and_duplicate_job_is_idempotent(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, connection, dialog, message = await _sla_fixture(
+        session_factory, make_service, tenant_payload, minutes_ago=61
+    )
+    async with session_factory() as session:
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        settings.response_sla_minutes = 180
+        await session.commit()
+    service = ReconciliationService(session_factory, SQLiteJobQueue(session_factory))
+    first = await service.sla_check(_sla_lease(tenant, connection, dialog, message))
+    second = await service.sla_check(_sla_lease(tenant, connection, dialog, message))
+    assert first["problem_id"] == second["problem_id"]
+    async with session_factory() as session:
+        problem = await session.scalar(select(OperationalProblem))
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 1
+        assert "60 мин." in problem.explanation
+        assert "180 мин." not in problem.explanation
+
+
+@pytest.mark.asyncio
+async def test_employee_reply_seconds_before_deadline_makes_sla_job_a_noop(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, connection, dialog, message = await _sla_fixture(
+        session_factory, make_service, tenant_payload, minutes_ago=61
+    )
+    async with session_factory() as session:
+        session.add(
+            TelegramMessage(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                telegram_message_id=2,
+                sender_role="account_owner",
+                sent_at=message.sent_at + timedelta(minutes=59, seconds=59),
+                outgoing=True,
+                body_text="Конечно, сейчас расскажу подробнее.",
+                attachments_json=[],
+            )
+        )
+        await session.commit()
+    result = await ReconciliationService(session_factory, SQLiteJobQueue(session_factory)).sla_check(
+        _sla_lease(tenant, connection, dialog, message)
+    )
+    assert result == {"created": False, "problem_id": None}
+    async with session_factory() as session:
         assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
 
 

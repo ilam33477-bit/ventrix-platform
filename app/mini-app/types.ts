@@ -130,6 +130,29 @@ export type ProblemDetail = Problem & {
   }>;
 };
 
+export type ProblemConversation = {
+  problem_id: string;
+  client: { title: string; username: string | null };
+  connection: { name: string | null; username: string | null };
+  can_reply: boolean;
+  messages: Array<{
+    id: string;
+    telegram_message_id: number;
+    text: string | null;
+    outgoing: boolean;
+    sender_role: string;
+    sent_at: string;
+  }>;
+  next_cursor: number | null;
+};
+
+export type ProblemReplyResult = {
+  id: string;
+  status: "pending" | "sending" | "sent" | "failed";
+  telegram_message_id: number | null;
+  client_request_id: string;
+};
+
 export type Commitment = {
   id: string;
   type: string;
@@ -208,6 +231,7 @@ export type ClientSettings = {
   analysis_enabled: boolean;
   enabled_days: number[];
   history_window_days: number;
+  response_sla_minutes: number;
   signal_report_threshold: number;
   signal_problem_threshold: number;
   signal_immediate_threshold: number;

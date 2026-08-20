@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { ButtonHTMLAttributes, PropsWithChildren, ReactNode } from "react";
 
 export function MotionSurface({ children, className = "" }: PropsWithChildren<{ className?: string }>) {
@@ -90,5 +90,6 @@ export function StatTrend({ value, label, tone = "neutral" }: { value: string; l
 }
 
 export function ChartContainer({ title, description, children, className = "" }: PropsWithChildren<{ title: string; description?: string; className?: string }>) {
-  return <Card className={`chart-container ${className}`.trim()}><header><div><h3>{title}</h3>{description && <p>{description}</p>}</div></header><div className="chart-area">{children}</div></Card>;
+  const titleId = useId();
+  return <Card className={`chart-container ${className}`.trim()}><header><div><h3 id={titleId}>{title}</h3>{description && <p>{description}</p>}</div></header><div className="chart-area" role="region" aria-labelledby={titleId}>{children}</div></Card>;
 }

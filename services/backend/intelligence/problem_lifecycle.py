@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from packages.ops_core.problems import ALLOWED_TRANSITIONS, ProblemStatus
 
 from ..database import SQLiteTransactionManager
-from ..models import Employee, OperationalProblem, ProblemTransition, Signal
+from ..models import Employee, OperationalProblem, ProblemTransition, Signal, TelegramConnection
 
 TERMINAL_PROBLEM_STATUSES = frozenset(
     {
@@ -204,6 +204,80 @@ class ProblemLifecycleService:
                 actor,
                 reason,
                 evidence=evidence,
+            ),
+        )
+
+    async def resolve_by_human(
+        self,
+        tenant_id: str,
+        problem_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> OperationalProblem:
+        """Resolve from any active workflow state without bypassing audited FSM transitions."""
+        async with self.session_factory() as session:
+            problem = await session.scalar(
+                select(OperationalProblem).where(
+                    OperationalProblem.id == problem_id,
+                    OperationalProblem.tenant_id == tenant_id,
+                )
+            )
+            if problem is None:
+                raise LookupError("problem not found in tenant")
+            if problem.status in TERMINAL_PROBLEM_STATUSES:
+                return problem
+            responsible_id = problem.responsible_employee_id
+            if responsible_id is None:
+                responsible_id = await session.scalar(
+                    select(TelegramConnection.assigned_employee_id).where(
+                        TelegramConnection.id == problem.connection_id,
+                        TelegramConnection.tenant_id == tenant_id,
+                    )
+                )
+        current = ProblemStatus(problem.status)
+        common = {
+            "actor_type": "membership",
+            "actor_id": actor_id,
+            "reason": "Пользователь подтвердил быстрое закрытие ситуации.",
+        }
+        if current in {ProblemStatus.NEW, ProblemStatus.NEEDS_CONFIRMATION}:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.ACKNOWLEDGED, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current == ProblemStatus.ACKNOWLEDGED:
+            if responsible_id is None:
+                raise ValueError("для закрытия не определён ответственный рабочий аккаунт")
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(
+                    ProblemStatus.ASSIGNED,
+                    responsible_employee_id=responsible_id,
+                    **common,
+                ),
+            )
+            current = ProblemStatus(problem.status)
+        if current in {ProblemStatus.ASSIGNED, ProblemStatus.WAITING, ProblemStatus.REOPENED}:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.IN_PROGRESS, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current != ProblemStatus.IN_PROGRESS:
+            raise ValueError(f"ситуацию в статусе {current.value} нельзя закрыть")
+        return await self.transition(
+            tenant_id,
+            problem_id,
+            TransitionRequest(
+                ProblemStatus.RESOLVED,
+                "membership",
+                actor_id,
+                reason,
             ),
         )
 

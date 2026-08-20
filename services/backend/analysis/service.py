@@ -86,7 +86,22 @@ issue_family, evidence_message_ids and close_existing_issue_families. EMPLOYEE/o
 the monitored employee; CLIENT/incoming is external. Never infer client interest from an
 employee pitch. Prefer NO_ACTION when uncertain. A main problem requires literal evidence,
 action_required=true, and confidence >=0.80 for high/critical or >=0.85 for medium.
+All user-facing summary and recommended_action values must be written in Russian.
+Do not translate names, usernames or verbatim evidence. Keep JSON keys and enum values
+in the required English schema. Emit client_without_answer only when supplied data
+explicitly proves that the configured response deadline has already passed.
 """
+
+
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+def russian_user_text(value: str, fallback: str) -> str:
+    """Keep client-visible generated copy Russian if a provider ignores the prompt."""
+    normalized = value.strip()
+    cyrillic_count = len(CYRILLIC_RE.findall(normalized))
+    latin_count = len(re.findall(r"[A-Za-z]", normalized))
+    return normalized if cyrillic_count >= max(4, latin_count) else fallback
 
 CANONICAL_PROBLEM_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
@@ -366,9 +381,7 @@ class AnalysisPipelineService:
             }
         if any(item.status in {"pending", "running"} for item in batches):
             raise JobDeferred(2, "waiting_for_required_ai_batches")
-        if any(item.status == "failed" for item in batches):
-            await self._fail_run(run_id, "required_ai_batch_failed")
-            raise RuntimeError("required AI batch failed")
+        await self._record_batch_outcome(run_id, batches)
         result = await self._build_report(run_id)
         if not result.get("report_id"):
             return result
@@ -436,24 +449,27 @@ class AnalysisPipelineService:
             raise JobDeferred(2, "waiting_for_account_analysis_runs")
         if any(item.status in {"pending", "running"} for item in batches):
             raise JobDeferred(2, "waiting_for_account_ai_batches")
-        if any(item.status == "failed" for item in batches):
-            await self._fail_run(tenant_run_id, "required_account_ai_batch_failed")
-            raise RuntimeError("required account AI batch failed")
 
         async def finish_children(session: AsyncSession) -> None:
             current = await session.get(AnalysisRun, tenant_run_id)
             current.required_batches = len(batches)
             current.completed_batches = sum(item.status == "completed" for item in batches)
+            current.failed_batches = sum(item.status == "failed" for item in batches)
             current.input_tokens = sum(item.input_tokens or 0 for item in batches)
             current.output_tokens = sum(item.output_tokens or 0 for item in batches)
             current.metrics_json = {
                 **(current.metrics_json or {}),
-                "processed_dialog_versions": self._processed_dialog_versions(batches),
+                "processed_dialog_versions": self._processed_dialog_versions(
+                    [item for item in batches if item.status == "completed"]
+                ),
+                "analysis_partial": current.failed_batches > 0,
             }
+            if current.failed_batches:
+                current.delayed_reason = "partial_ai_batch_failure"
             for child in children:
                 stored = await session.get(AnalysisRun, child.id)
                 stored.status = "completed"
-                stored.stage = "aggregated"
+                stored.stage = "aggregated_partial" if stored.failed_batches else "aggregated"
                 stored.finished_at = datetime.now(UTC)
 
         await self.transactions.run(finish_children)
@@ -713,6 +729,14 @@ class AnalysisPipelineService:
                     )
                     if source is None:
                         continue
+                    user_summary = russian_user_text(
+                        candidate.summary,
+                        "Ventrix обнаружил рабочую ситуацию, требующую проверки.",
+                    )
+                    user_action = russian_user_text(
+                        candidate.recommended_action,
+                        "Проверить переписку и определить следующий шаг.",
+                    )
                     signal_fingerprint = hashlib.sha256(
                         f"{batch.tenant_id}:{source.id}:{problem_type}".encode()
                     ).hexdigest()
@@ -739,7 +763,7 @@ class AnalysisPipelineService:
                             ai_score=criticality,
                             criticality=criticality,
                             status="triaged",
-                            reason=candidate.summary,
+                            reason=user_summary,
                             detected_at=source.sent_at,
                             processed_at=datetime.now(UTC),
                             metadata_json={
@@ -758,34 +782,11 @@ class AnalysisPipelineService:
                         signal.status = "triaged"
                         continue
                     if issue_family == "UNANSWERED_REQUEST":
-                        specific = await session.scalar(
-                            select(OperationalProblem.id).where(
-                                OperationalProblem.tenant_id == batch.tenant_id,
-                                OperationalProblem.dialog_id == dialog.id,
-                                OperationalProblem.issue_family.in_(
-                                    (
-                                        "TECHNICAL_PROBLEM",
-                                        "PAYMENT_QUESTION",
-                                        "PRODUCT_DISSATISFACTION",
-                                        "COMMERCIAL_OPPORTUNITY",
-                                    )
-                                ),
-                                OperationalProblem.status.in_(
-                                    (
-                                        "new",
-                                        "needs_confirmation",
-                                        "acknowledged",
-                                        "assigned",
-                                        "in_progress",
-                                        "waiting",
-                                        "reopened",
-                                    )
-                                ),
-                            )
-                        )
-                        if specific is not None:
-                            signal.status = "triaged"
-                            continue
+                        # Scheduled/deep analysis may identify that a response is
+                        # expected, but only dialog.sla_check owns promotion to an
+                        # unanswered problem after the persisted deadline.
+                        signal.status = "triaged"
+                        continue
                     problem_fingerprint = f"signal:{signal_fingerprint}"
                     existing_problem = await session.scalar(
                         select(OperationalProblem)
@@ -817,8 +818,8 @@ class AnalysisPipelineService:
                             existing_problem.confidence, candidate.confidence
                         )
                         existing_problem.evidence = "\n".join(candidate.evidence)[:4000]
-                        existing_problem.explanation = candidate.summary
-                        existing_problem.recommended_action = candidate.recommended_action
+                        existing_problem.explanation = user_summary
+                        existing_problem.recommended_action = user_action
                         existing_problem.last_seen_at = datetime.now(UTC)
                         existing_problem.evidence_message_ids_json = list(
                             dict.fromkeys(
@@ -844,8 +845,8 @@ class AnalysisPipelineService:
                         priority=candidate.priority,
                         confidence=candidate.confidence,
                         evidence="\n".join(candidate.evidence)[:4000],
-                        explanation=candidate.summary,
-                        recommended_action=candidate.recommended_action,
+                        explanation=user_summary,
+                        recommended_action=user_action,
                         occurred_at=source.sent_at,
                         last_seen_at=datetime.now(UTC),
                         evidence_message_ids_json=list(
@@ -968,6 +969,8 @@ class AnalysisPipelineService:
             "high": sum(item.priority in {"high", "critical"} for item in problems),
             "medium": sum(item.priority == "medium" for item in problems),
             "low": sum(item.priority in {"low", "informational"} for item in problems),
+            "analysis_partial": int(run.failed_batches > 0),
+            "failed_analysis_batches": int(run.failed_batches),
         }
 
         async def write(session: AsyncSession) -> str | None:
@@ -990,9 +993,7 @@ class AnalysisPipelineService:
                 .limit(1)
             )
             suppress_reason = None
-            if metrics["messages"] == 0:
-                suppress_reason = "no_new_reportable_messages"
-            elif report is None and duplicate is not None:
+            if report is None and duplicate is not None:
                 suppress_reason = "equivalent_report_already_created"
             if report is None:
                 if suppress_reason is None:
@@ -1059,7 +1060,13 @@ class AnalysisPipelineService:
             current.status = "completed"
             current.stage = "report_ready"
             current.finished_at = now
-            current.delayed_reason = "completed_after_due_time" if delayed else None
+            current.delayed_reason = (
+                "completed_after_due_time"
+                if delayed
+                else "partial_ai_batch_failure"
+                if current.failed_batches
+                else None
+            )
             current.metrics_json = metrics
             processed_versions = (run.metrics_json or {}).get("processed_dialog_versions", {})
             if not processed_versions:
@@ -1147,7 +1154,8 @@ class AnalysisPipelineService:
             employee_problems = [
                 item
                 for item in problems
-                if (item.signal_id and signals_by_id.get(item.signal_id) in employee_signals)
+                if item.responsible_employee_id == employee.id
+                or (item.signal_id and signals_by_id.get(item.signal_id) in employee_signals)
                 or (
                     item.commitment_id
                     and commitments_by_id.get(item.commitment_id) in employee_commitments
@@ -1218,6 +1226,28 @@ class AnalysisPipelineService:
             return list(
                 await session.scalars(select(AnalysisBatch).where(AnalysisBatch.run_id == run_id))
             )
+
+    async def _record_batch_outcome(
+        self, run_id: str, batches: list[AnalysisBatch]
+    ) -> None:
+        async def write(session: AsyncSession) -> None:
+            run = await session.get(AnalysisRun, run_id)
+            if run is None:
+                return
+            run.required_batches = len(batches)
+            run.completed_batches = sum(item.status == "completed" for item in batches)
+            run.failed_batches = sum(item.status == "failed" for item in batches)
+            run.metrics_json = {
+                **(run.metrics_json or {}),
+                "processed_dialog_versions": self._processed_dialog_versions(
+                    [item for item in batches if item.status == "completed"]
+                ),
+                "analysis_partial": run.failed_batches > 0,
+            }
+            if run.failed_batches:
+                run.delayed_reason = "partial_ai_batch_failure"
+
+        await self.transactions.run(write)
 
     @staticmethod
     def _processed_dialog_versions(batches: list[AnalysisBatch]) -> dict[str, int]:

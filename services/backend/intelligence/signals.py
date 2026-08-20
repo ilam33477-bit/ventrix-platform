@@ -139,7 +139,22 @@ class SignalService:
             dialog_classification=dialog.classification if dialog else None,
         )
         if not relevance.business_relevant:
-            await self._clear_non_business_state(session, message)
+            assessment = assess_conversation([*previous, message])
+            if (
+                relevance.message_class == "social"
+                and assessment.conversation_state
+                in {"CLOSED_SUCCESS", "CLOSED_REJECTED", "CLOSED_NEUTRAL"}
+            ):
+                await self._update_dialog_state(
+                    session,
+                    message,
+                    [],
+                    None,
+                    settings.response_sla_minutes,
+                    assessment,
+                )
+            else:
+                await self._clear_non_business_state(session, message)
             return []
         assessment = assess_conversation([*previous, message])
         candidates = self.engine.scan(

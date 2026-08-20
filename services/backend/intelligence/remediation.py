@@ -23,6 +23,7 @@ NEGATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
 
 
 class RemediationAIProvider(Protocol):
@@ -88,7 +89,8 @@ class RemediationVerifier:
                 system_prompt=(
                     "Verify whether later Telegram messages prove the expected remediation. "
                     "Return JSON only: outcome fixed|not_fixed|uncertain, confidence 0..1, reason. "
-                    "Acknowledgement alone is not proof. Prefer uncertain when evidence is weak."
+                    "Acknowledgement alone is not proof. Prefer uncertain when evidence is weak. "
+                    "Write the user-facing reason in Russian; keep names and quoted text unchanged."
                 ),
                 payload=payload,
                 max_tokens=350,
@@ -102,7 +104,11 @@ class RemediationVerifier:
         return RemediationDecision(
             outcome,
             parsed.confidence,
-            parsed.reason,
+            (
+                parsed.reason
+                if CYRILLIC_RE.search(parsed.reason)
+                else "Новые сообщения проверены, но результат требует подтверждения."
+            ),
             "ai",
             tuple(item.id for item in messages[-8:]),
         )

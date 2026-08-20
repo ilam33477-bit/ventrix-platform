@@ -72,7 +72,6 @@ class NotificationPolicyService:
         )
         group_allowed = bool(
             settings.group_reminders_enabled
-            and source_type == "group"
             and group
             and group.status == "active"
             and group.notifications_enabled
@@ -184,12 +183,19 @@ class NotificationOrchestrator:
                 select(TenantSettings).where(TenantSettings.tenant_id == signal.tenant_id)
             )
             tenant = await session.get(Tenant, signal.tenant_id)
-            employee = (
-                await session.get(Employee, signal.employee_id) if signal.employee_id else None
-            )
             dialog = await session.get(TelegramDialog, signal.dialog_id)
             if dialog is None or dialog.excluded or dialog.classification == "automated_account":
                 return []
+            problem = await session.get(OperationalProblem, problem_id) if problem_id else None
+            responsible_id = problem.responsible_employee_id if problem else signal.employee_id
+            if responsible_id is None:
+                responsible_id = await session.scalar(
+                    select(TelegramConnection.assigned_employee_id).where(
+                        TelegramConnection.id == dialog.connection_id,
+                        TelegramConnection.tenant_id == signal.tenant_id,
+                    )
+                )
+            employee = await session.get(Employee, responsible_id) if responsible_id else None
             source_message = (
                 await session.get(TelegramMessage, signal.source_message_id)
                 if signal.source_message_id
@@ -201,37 +207,52 @@ class NotificationOrchestrator:
                 return []
             if (signal.metadata_json or {}).get("source") == "scheduled_analysis":
                 return []
-            group = None
-            if dialog.dialog_type == "group":
-                group = await session.scalar(
-                    select(GroupIntegration).where(
-                        GroupIntegration.tenant_id == signal.tenant_id,
-                        GroupIntegration.telegram_chat_id == dialog.telegram_dialog_id,
-                    )
-                )
             decision = self.policy.decide(
                 settings=settings,
                 signal=signal,
                 employee=employee,
                 source_type=dialog.dialog_type,
-                group=group,
+                group=None,
                 now=datetime.now(UTC),
             )
-            problem = await session.get(OperationalProblem, problem_id) if problem_id else None
-            destinations: list[tuple[str, str, str | None]] = []
+            destinations: list[
+                tuple[str, str, str | None, GroupIntegration | None]
+            ] = []
             if decision.notify_employee and employee and employee.telegram_user_id:
-                destinations.append(("employee", str(employee.telegram_user_id), employee.id))
+                destinations.append(
+                    ("employee", str(employee.telegram_user_id), employee.id, None)
+                )
             if decision.notify_manager:
-                destinations.append(("manager", str(tenant.owner_telegram_user_id), None))
-            if decision.notify_group and group:
-                destinations.append(("group", str(group.telegram_chat_id), None))
+                destinations.append(("manager", str(tenant.owner_telegram_user_id), None, None))
+            groups = list(
+                await session.scalars(
+                    select(GroupIntegration).where(
+                        GroupIntegration.tenant_id == signal.tenant_id,
+                        GroupIntegration.status == "active",
+                        GroupIntegration.notifications_enabled.is_(True),
+                    )
+                )
+            )
+            for group in groups:
+                group_decision = self.policy.decide(
+                    settings=settings,
+                    signal=signal,
+                    employee=employee,
+                    source_type=dialog.dialog_type,
+                    group=group,
+                    now=datetime.now(UTC),
+                )
+                if group_decision.notify_group:
+                    destinations.append(
+                        ("group", str(group.telegram_chat_id), employee.id if employee else None, group)
+                    )
 
         notification_ids: list[str] = []
-        for destination_type, destination_id, employee_id in destinations:
+        for destination_type, destination_id, employee_id, destination_group in destinations:
             notification_id = await self._create_log(
                 signal,
                 problem,
-                group if destination_type == "group" else None,
+                destination_group,
                 destination_type,
                 destination_id,
                 employee_id,
@@ -327,9 +348,24 @@ class NotificationOrchestrator:
                 else "Требует внимания"
             )
             if is_group:
+                mention = (
+                    f"@{responsible.telegram_username.lstrip('@')}"
+                    if responsible and responsible.telegram_username
+                    else None
+                )
+                client = (
+                    f"@{current_dialog.username.lstrip('@')}"
+                    if current_dialog and current_dialog.username
+                    else current_dialog.title
+                    if current_dialog
+                    else "Клиент"
+                )
                 text = (
                     f"⚠️ <b>{escape(prefix + title)}</b>\n\n"
-                    f"{level}. Откройте Ventrix, чтобы проверить ситуацию и назначить ответственного."
+                    f"<b>Приоритет:</b> {level}\n"
+                    f"<b>Клиент:</b> {escape(client)}\n"
+                    + (f"<b>Ответственный:</b> {escape(mention)}\n" if mention else "")
+                    + "\nОткройте Ventrix, чтобы проверить контекст и следующий шаг."
                 )
             else:
                 person = current_dialog.title or "Собеседник"

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { ClientApiError, VentrixClientApi } from "../api/client";
 import { initializeTelegramMiniApp } from "../telegram/bridge";
+import { applyTheme } from "../theme/theme";
 import type { ClientSession, LaunchState, OnboardingStep } from "../types";
 
 export function useMiniAppSession() {
@@ -33,6 +34,7 @@ export function useMiniAppSession() {
     let cleanup: (() => void) | undefined;
     const timer = window.setTimeout(() => {
       const telegram = initializeTelegramMiniApp();
+      applyTheme();
       cleanup = telegram.cleanup;
       if (!telegram.initData) {
         setLaunchState("outside_telegram");

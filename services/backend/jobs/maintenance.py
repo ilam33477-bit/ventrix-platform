@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from html import escape
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -15,8 +16,10 @@ from ..models import (
     OperationalProblem,
     Report,
     ReportMetric,
+    ReportSection,
     TelegramDialog,
     Tenant,
+    TenantSettings,
 )
 from ..telegram_sessions.service import TelegramConnectionService
 from .queue import JobLease
@@ -106,25 +109,67 @@ class MaintenanceJobHandlers:
                     )
                 ).all()
             )
-            text = (
-                f"📊 <b>Рабочая сводка · {tenant.name}</b>\n"
-                f"{report.period_start:%d.%m.%Y} — {report.period_end:%d.%m.%Y}\n\n"
-                f"Сообщений изучено: <b>{int(metrics.get('messages', 0))}</b>\n"
-                f"Ситуаций найдено: <b>{int(metrics.get('problems', 0))}</b>\n"
-                f"Высокий приоритет: <b>{int(metrics.get('high', 0))}</b>\n\n"
-                "Подробности и данные по сотрудникам доступны в Ventrix AI."
+            employee_section = await session.scalar(
+                select(ReportSection).where(
+                    ReportSection.report_id == report.id,
+                    ReportSection.section_key == "employee_report",
+                )
             )
+            employee_rows = list((employee_section.data_json if employee_section else {}).get("employees") or [])
+            employee_blocks: list[str] = []
+            for row in employee_rows[:8]:
+                open_tasks = int(row.get("open_promises", 0)) + int(row.get("clients_waiting", 0))
+                employee_blocks.append(
+                    "<blockquote>"
+                    f"<b>{escape(str(row.get('name') or 'Сотрудник'))}</b>\n"
+                    f"Активные задачи: <b>{open_tasks}</b>\n"
+                    f"Клиенты ждут ответа: <b>{int(row.get('clients_waiting', 0))}</b>\n"
+                    f"Открытые обещания: <b>{int(row.get('open_promises', 0))}</b>\n"
+                    f"Просрочено: <b>{int(row.get('missed_deadlines', 0))}</b>"
+                    "</blockquote>"
+                )
+            no_activity = int(metrics.get("messages", 0)) == 0
+            partial_analysis = bool(metrics.get("analysis_partial", 0))
+            text = (
+                f"📊 <b>Ежедневная сводка · {escape(tenant.name)}</b>\n"
+                f"{report.period_start:%d.%m.%Y} — {report.period_end:%d.%m.%Y}\n\n"
+                "<blockquote>"
+                f"Сообщений изучено: <b>{int(metrics.get('messages', 0))}</b>\n"
+                f"Рабочих ситуаций: <b>{int(metrics.get('problems', 0))}</b>\n"
+                f"Высокого приоритета: <b>{int(metrics.get('high', 0))}</b>\n"
+                f"Среднего приоритета: <b>{int(metrics.get('medium', 0))}</b>"
+                "</blockquote>\n\n"
+                + (
+                    "Новых рабочих сообщений за период нет. Ventrix продолжает мониторинг.\n\n"
+                    if no_activity
+                    else ""
+                )
+                + (
+                    "Часть переписок будет перепроверена автоматически в следующем цикле.\n\n"
+                    if partial_analysis
+                    else ""
+                )
+                + ("<b>По сотрудникам</b>\n" + "\n".join(employee_blocks) + "\n\n" if employee_blocks else "")
+                + "Полная сводка и связанные ситуации доступны в Mini App."
+            )[:4000]
             destinations: list[tuple[str, str, str | None]] = [
                 ("manager", str(tenant.owner_telegram_user_id), None)
             ]
-            groups = list(
-                await session.scalars(
-                    select(GroupIntegration).where(
-                        GroupIntegration.tenant_id == tenant.id,
-                        GroupIntegration.status == "active",
-                        GroupIntegration.notifications_enabled.is_(True),
+            settings = await session.scalar(
+                select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+            )
+            groups = (
+                list(
+                    await session.scalars(
+                        select(GroupIntegration).where(
+                            GroupIntegration.tenant_id == tenant.id,
+                            GroupIntegration.status == "active",
+                            GroupIntegration.notifications_enabled.is_(True),
+                        )
                     )
                 )
+                if settings and settings.group_reminders_enabled
+                else []
             )
             destinations.extend(
                 ("group", str(group.telegram_chat_id), group.id) for group in groups
@@ -176,7 +221,7 @@ class MaintenanceJobHandlers:
                 priority=35,
                 idempotency_key=f"report-delivery:{notification_id}",
                 correlation_id=report_id,
-                category="notifications",
+                category="notification",
             )
         return {
             "report_id": delivered_id,

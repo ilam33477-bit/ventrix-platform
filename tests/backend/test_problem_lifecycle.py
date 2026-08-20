@@ -146,6 +146,39 @@ async def test_persistent_problem_fsm_rejects_invalid_and_audits_valid_transitio
 
 
 @pytest.mark.asyncio
+async def test_quick_resolve_uses_session_owner_and_audits_full_path(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, employee, _connection, _dialog, _message, problem = await _problem_fixture(
+        session_factory, make_service, tenant_payload
+    )
+
+    result = await ProblemLifecycleService(session_factory).resolve_by_human(
+        tenant.id,
+        problem.id,
+        actor_id="owner-membership",
+        reason="Ситуация завершена владельцем проекта.",
+    )
+
+    async with session_factory() as session:
+        transitions = list(
+            await session.scalars(
+                select(ProblemTransition)
+                .where(ProblemTransition.problem_id == problem.id)
+                .order_by(ProblemTransition.occurred_at)
+            )
+        )
+    assert result.status == "resolved"
+    assert result.responsible_employee_id == employee.id
+    assert [item.to_status for item in transitions] == [
+        "acknowledged",
+        "assigned",
+        "in_progress",
+        "resolved",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_remediation_verifier_does_not_treat_acknowledgement_as_fix(
     session_factory, make_service, tenant_payload
 ) -> None:

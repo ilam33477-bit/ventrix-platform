@@ -26,7 +26,6 @@ export function DashboardView({ api, auth, summary, bootstrap, onOpenProblems, o
   const leadProblem = attention[0];
   const waitingClients = problems.filter((problem) => problem.type === "client_without_answer").length;
   const activeConnections = bootstrap.connections.filter((connection) => ["connected", "ready", "syncing"].includes(connection.status));
-  const personalDialogs = bootstrap.connections.reduce((total, item) => total + (item.personal_dialogs ?? 0), 0);
   const messagesToday = bootstrap.connections.reduce((total, item) => total + (item.messages_today ?? 0), 0);
   const contactsToday = bootstrap.connections.reduce((total, item) => total + (item.new_contacts_today ?? 0), 0);
   const activityMax = Math.max(messagesToday, contactsToday, 1);
@@ -66,12 +65,6 @@ export function DashboardView({ api, auth, summary, bootstrap, onOpenProblems, o
           <div><header><span>Новые контакты</span><strong>{contactsToday.toLocaleString("ru-RU")}</strong></header><div><i style={{ "--activity-width": `${contactsToday / activityMax * 100}%` } as React.CSSProperties} /></div></div>
         </div> : <div className="activity-quiet"><span aria-hidden="true">—</span><strong>Новых событий сегодня нет</strong><p>Мониторинг продолжает работать в фоне.</p></div>}
       </ChartContainer>
-
-      <Card className="monitor-card">
-        <header><div><p className="eyebrow">МОНИТОРИНГ</p><h3>Telegram подключён</h3></div><span className={`monitor-pulse ${monitoringActive ? "active" : ""}`} aria-label={monitoringActive ? "Работает" : "Не работает"} /></header>
-        <div className="monitor-facts"><div><Icon name="telegram" /><span>Аккаунты<strong>{activeConnections.length} из {bootstrap.connections.length}</strong></span></div><div><Icon name="alert" /><span>Личные диалоги<strong>{personalDialogs.toLocaleString("ru-RU")}</strong></span></div><div><Icon name="groups" /><span>Рабочие группы<strong>{summary.groups}</strong></span></div></div>
-        {bootstrap.progress && <div className="monitor-progress"><div><span>Последняя проверка</span><strong>{bootstrap.progress.status === "completed" ? "Завершена" : `${bootstrap.progress.percent}%`}</strong></div><div><i style={{ width: `${bootstrap.progress.percent}%` }} /></div><small>{bootstrap.progress.dialogs_completed.toLocaleString("ru-RU")} диалогов проверено</small></div>}
-      </Card>
 
       <Card className="next-report-card"><span className="report-mark"><Icon name="report" /></span><div><p className="eyebrow">СЛЕДУЮЩИЙ ОТЧЁТ</p><strong>{formatNextReport(data?.settings.next_analysis_at)}</strong><small>{data?.settings.next_analysis_at ? "По расписанию проекта" : "Расписание пока недоступно"}</small></div></Card>
     </section>

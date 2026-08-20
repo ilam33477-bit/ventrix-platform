@@ -20,10 +20,12 @@ from ..jobs.worker import BackgroundWorker
 from ..models import (
     EncryptedSecret,
     MonitoredSource,
+    OutboundTelegramMessage,
     TelegramConnection,
     TelegramDialog,
     TelegramFolder,
     TelegramIncrementalCursor,
+    TelegramMessage,
     TenantSettings,
 )
 from ..observability import configure_structured_logging, log_event
@@ -153,6 +155,7 @@ class TelegramSessionActor:
                 "telegram.sync_chat": self._sync_chat_job,
                 "telegram.refresh_catalog": self._refresh_catalog_job,
                 "telegram.prepare_connection": self._prepare_connection_job,
+                "telegram.send_message": self._send_message_job,
             },
             allowed_categories=frozenset({"telegram_rpc"}),
             telegram_account_id=self.connection.id,
@@ -228,6 +231,140 @@ class TelegramSessionActor:
             await self.client.log_out()
         self._stopping.set()
         return {"logged_out": True}
+
+    async def _send_message_job(self, job: JobLease) -> dict[str, Any]:
+        command_id = str(job.payload["outbound_message_id"])
+
+        async def start(session: AsyncSession) -> tuple[str, int, str, str] | None:
+            command = await session.scalar(
+                select(OutboundTelegramMessage).where(
+                    OutboundTelegramMessage.id == command_id,
+                    OutboundTelegramMessage.tenant_id == job.tenant_id,
+                    OutboundTelegramMessage.connection_id == self.connection.id,
+                )
+            )
+            if command is None:
+                raise LookupError("outbound Telegram command not found")
+            if command.status == "sent":
+                return None
+            dialog = await session.scalar(
+                select(TelegramDialog).where(
+                    TelegramDialog.id == command.dialog_id,
+                    TelegramDialog.tenant_id == command.tenant_id,
+                    TelegramDialog.connection_id == command.connection_id,
+                    TelegramDialog.excluded.is_(False),
+                )
+            )
+            if dialog is None:
+                raise LookupError("outbound Telegram dialog not available")
+            command.status = "sending"
+            command.attempts += 1
+            command.last_error_code = None
+            return command.text, command.telegram_random_id, command.dialog_id, str(
+                dialog.telegram_dialog_id
+            )
+
+        prepared = await self.transactions.run(start)
+        if prepared is None:
+            async with self.transactions.session_factory() as session:
+                command = await session.get(OutboundTelegramMessage, command_id)
+                return {
+                    "outbound_message_id": command_id,
+                    "telegram_message_id": command.telegram_message_id if command else None,
+                    "deduplicated": True,
+                }
+        text, random_id, dialog_id, telegram_dialog_id = prepared
+        try:
+            async with self.rpc_lock:
+                if not await self.client.is_user_authorized():
+                    raise RuntimeError("telegram_session_unavailable")
+                peer = await self.client.get_input_entity(int(telegram_dialog_id))
+                result = await self.client(
+                    functions.messages.SendMessageRequest(
+                        peer=peer,
+                        message=text,
+                        random_id=random_id,
+                        no_webpage=True,
+                    )
+                )
+        except Exception as exc:
+            error_code = type(exc).__name__
+
+            async def fail(session: AsyncSession, code: str = error_code) -> None:
+                command = await session.get(OutboundTelegramMessage, command_id)
+                if command is not None and command.status != "sent":
+                    command.status = "failed"
+                    command.last_error_code = code
+
+            await self.transactions.run(fail)
+            raise
+
+        telegram_message = self._sent_message(result)
+        telegram_message_id = int(telegram_message.id) if telegram_message is not None else None
+        sent_at = getattr(telegram_message, "date", None) or datetime.now(UTC)
+
+        async def finish(session: AsyncSession) -> str | None:
+            command = await session.get(OutboundTelegramMessage, command_id)
+            if command is None:
+                raise LookupError("outbound Telegram command disappeared")
+            command.status = "sent"
+            command.telegram_message_id = telegram_message_id
+            command.sent_at = sent_at
+            command.last_error_code = None
+            if telegram_message_id is None:
+                return None
+            stored = await session.scalar(
+                select(TelegramMessage).where(
+                    TelegramMessage.dialog_id == dialog_id,
+                    TelegramMessage.telegram_message_id == telegram_message_id,
+                )
+            )
+            if stored is None:
+                stored = TelegramMessage(
+                    tenant_id=command.tenant_id,
+                    connection_id=command.connection_id,
+                    dialog_id=dialog_id,
+                    telegram_message_id=telegram_message_id,
+                    sender_id=self.connection.telegram_user_id,
+                    sender_username=self.connection.username,
+                    sender_role="account_owner",
+                    ingestion_source="mini_app_reply",
+                    sent_at=sent_at,
+                    outgoing=True,
+                    body_text=text,
+                    attachments_json=[],
+                )
+                session.add(stored)
+                await session.flush()
+            return stored.id
+
+        stored_message_id = await self.transactions.run(finish)
+        if stored_message_id is not None:
+            await self.queue.enqueue(
+                "signal.local_scan",
+                {"message_id": stored_message_id},
+                tenant_id=job.tenant_id,
+                telegram_account_id=self.connection.id,
+                dialog_id=dialog_id,
+                category="realtime",
+                cost_class="light",
+                idempotency_key=f"mini-app-reply-scan:{command_id}",
+            )
+        return {
+            "outbound_message_id": command_id,
+            "telegram_message_id": telegram_message_id,
+            "deduplicated": False,
+        }
+
+    @staticmethod
+    def _sent_message(result: Any) -> Any | None:
+        if getattr(result, "id", None) is not None:
+            return result
+        for update in getattr(result, "updates", ()):
+            message = getattr(update, "message", None)
+            if message is not None and getattr(message, "id", None) is not None:
+                return message
+        return None
 
     async def _sync_chat_job(self, job: JobLease) -> dict[str, object]:
         loaded = await self.sync_handlers.load_actor_context(

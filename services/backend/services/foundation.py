@@ -171,6 +171,8 @@ class FoundationService:
         tenant = await self._require_tenant(tenant_id)
         owner = await self.ensure_owner()
         values = payload.model_dump(exclude_unset=True)
+        if "response_sla_minutes" in values:
+            tenant.settings.response_sla_minutes = values["response_sla_minutes"]
         for key, value in values.items():
             setattr(tenant.ai_profile, key, value)
         tenant.ai_profile.version += 1

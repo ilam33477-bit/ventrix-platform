@@ -112,3 +112,33 @@ def test_case_l_explicit_request_requires_employee() -> None:
     )
     assert result.issue_family == "UNANSWERED_REQUEST"
     assert result.response_required
+
+
+def test_casual_greeting_expects_a_human_response() -> None:
+    result = assess_conversation(dialog(("Сап, как ты?", False)))
+    assert result.conversation_state == "WAITING_FOR_EMPLOYEE"
+    assert result.response_required
+    assert result.issue_family == "UNANSWERED_REQUEST"
+
+
+def test_farewell_reply_closes_the_conversation() -> None:
+    result = assess_conversation(dialog(("Доброй ночи", True), ("Доброй", False)))
+    assert result.conversation_state == "CLOSED_NEUTRAL"
+    assert not result.response_required
+
+
+def test_declarative_reply_in_active_conversation_starts_expectation() -> None:
+    result = assess_conversation(
+        dialog(
+            ("Как сейчас идут дела с проектом?", True),
+            ("пытаюсь вырваться в работу хоть как то", False),
+        )
+    )
+    assert result.conversation_state == "WAITING_FOR_EMPLOYEE"
+    assert result.response_required
+
+
+def test_acknowledgement_with_a_question_is_not_terminal() -> None:
+    result = assess_conversation(dialog(("Хорошо, а сколько это стоит?", False)))
+    assert result.response_required
+    assert result.issue_family == "PAYMENT_QUESTION"

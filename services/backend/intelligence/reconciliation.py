@@ -299,7 +299,7 @@ class ReconciliationService:
             ):
                 return None, None
             source = await session.get(TelegramMessage, expected_message_id)
-            if source is None:
+            if source is None or source.deleted_at is not None:
                 return None, None
             later_employee_reply = await session.scalar(
                 select(TelegramMessage.id)
@@ -344,6 +344,7 @@ class ReconciliationService:
                 dialog is None
                 or not dialog.selected
                 or dialog.excluded
+                or dialog.classification == "automated_account"
                 or not relevance.business_relevant
                 or not assessment.response_required
                 or not assessment.action_required
@@ -354,6 +355,15 @@ class ReconciliationService:
                 return None, None
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == job.tenant_id)
+            )
+            actual_deadline = self._aware(state.next_sla_check_at)
+            configured_minutes = max(
+                1,
+                round((actual_deadline - self._aware(source.sent_at)).total_seconds() / 60),
+            )
+            waited_minutes = max(
+                configured_minutes,
+                int((now - self._aware(source.sent_at)).total_seconds() // 60),
             )
             fingerprint = hashlib.sha256(
                 f"sla:{job.tenant_id}:{dialog_id}:{expected_message_id}".encode()
@@ -371,12 +381,16 @@ class ReconciliationService:
                     criticality=settings.signal_problem_threshold,
                     status="problem_created",
                     reason=(
-                        "Клиент не получил ответ за "
-                        f"{settings.response_sla_minutes} мин. — установленное время ответа."
+                        f"Клиент ждёт ответа {waited_minutes} мин. "
+                        f"Для этой ситуации установлен срок ответа {configured_minutes} мин."
                     ),
                     detected_at=now,
                     processed_at=now,
-                    metadata_json={"response_expected_message_id": expected_message_id},
+                    metadata_json={
+                        "response_expected_message_id": expected_message_id,
+                        "sla_deadline_at": actual_deadline.isoformat(),
+                        "sla_minutes": configured_minutes,
+                    },
                 )
                 session.add(signal)
                 await session.flush()
@@ -464,7 +478,7 @@ class ReconciliationService:
                         requires_confirmation=responsible is None,
                         reason=(
                             "Истекло установленное время ответа "
-                            f"({settings.response_sla_minutes} мин.)."
+                            f"({configured_minutes} мин.)."
                         ),
                     )
                 )
@@ -472,7 +486,7 @@ class ReconciliationService:
                 problem.source_message_id = source.id
                 problem.signal_id = signal.id
                 problem.evidence = (source.body_text or "")[:2000]
-                problem.explanation = assessment.reason
+                problem.explanation = signal.reason
                 problem.recommended_action = assessment.next_action or problem.recommended_action
                 problem.last_seen_at = now
                 problem.evidence_message_ids_json = list(

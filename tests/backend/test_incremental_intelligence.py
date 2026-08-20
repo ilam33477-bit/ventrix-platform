@@ -14,7 +14,7 @@ from services.backend.intelligence.message_relevance import dialogue_is_explicit
 from services.backend.intelligence.notifications import NotificationOrchestrator
 from services.backend.intelligence.reconciliation import ReconciliationService
 from services.backend.intelligence.signals import SignalService
-from services.backend.intelligence.triage import parse_triage_result
+from services.backend.intelligence.triage import TriageResult, parse_triage_result
 from services.backend.jobs.queue import JOB_PRIORITY, JobLease, SQLiteJobQueue
 from services.backend.models import (
     AIUsageCall,
@@ -268,6 +268,93 @@ async def test_dialog_sla_timer_is_durable_and_employee_reply_cancels_it(
         state = await session.scalar(select(DialogState).where(DialogState.dialog_id == dialog.id))
         assert state.response_expected_message_id is None
         assert state.next_sla_check_at is None
+
+
+@pytest.mark.asyncio
+async def test_ai_unanswered_candidate_cannot_create_problem_before_sla(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        message = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=501,
+            sender_role="customer",
+            sent_at=now,
+            outgoing=False,
+            body_text="Можно подробнее?",
+            attachments_json=[],
+        )
+        session.add(message)
+        await session.flush()
+        signal = Signal(
+            tenant_id=tenant.id,
+            telegram_connection_id=connection.id,
+            dialog_id=dialog.id,
+            source_message_id=message.id,
+            fingerprint="unanswered-before-sla",
+            signal_type="customer_question",
+            local_score=90,
+            criticality=90,
+            status="candidate",
+            reason="Клиент запросил подробности.",
+            detected_at=now,
+            metadata_json={},
+        )
+        session.add(signal)
+        session.add(
+            DialogState(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                awaiting_employee_since=now,
+                response_expected_message_id=message.id,
+                next_sla_check_at=now + timedelta(minutes=60),
+                open_commitments_json=[],
+                unresolved_questions_json=[],
+            )
+        )
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        await session.commit()
+        signal_id = signal.id
+
+    result = TriageResult(
+        criticality=92,
+        category="customer_question",
+        requires_immediate_attention=True,
+        requires_employee_notification=True,
+        requires_manager_notification=True,
+        reason="Client asked for more details.",
+        recommended_action="Employee should respond.",
+        recommended_deadline_minutes=15,
+        needs_deep_analysis=False,
+        message_class="business",
+        business_relevance=True,
+        conversation_state="WAITING_FOR_EMPLOYEE",
+        response_required=True,
+        action_required=True,
+        issue_family="UNANSWERED_REQUEST",
+        confidence=0.95,
+    )
+    problem_id = await AITriageService(
+        session_factory, SQLiteJobQueue(session_factory), None, model="test"
+    )._apply_result(signal_id, result, settings, False)
+    assert problem_id is None
+    async with session_factory() as session:
+        stored_signal = await session.get(Signal, signal_id)
+        state = await session.scalar(select(DialogState).where(DialogState.dialog_id == dialog.id))
+        assert stored_signal.status == "triaged"
+        assert stored_signal.reason == "Клиент запросил подробности."
+        assert state.response_expected_message_id == message.id
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
 
 
 @pytest.mark.asyncio

@@ -14,15 +14,66 @@ type ProblemFeed = { active: Problem[]; resolved: Problem[] };
 const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string, "primary" | "secondary" | "ghost"]>>> = {
   new: [["needs_confirmation", "Проверить ситуацию", "primary"], ["acknowledged", "Подтвердить", "secondary"]],
   needs_confirmation: [["acknowledged", "Подтвердить", "primary"], ["false_positive", "Не проблема", "ghost"]],
-  acknowledged: [["assigned", "Назначить сотруднику", "primary"]],
   assigned: [["in_progress", "Взять в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
   in_progress: [["resolved", "Отметить решённой", "primary"], ["waiting", "Отложить", "secondary"], ["false_positive", "Не проблема", "ghost"]],
   waiting: [["in_progress", "Вернуть в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
   resolved: [["reopened", "Открыть снова", "secondary"]],
   auto_resolved: [["reopened", "Открыть снова", "secondary"]],
   false_positive: [["reopened", "Вернуть как проблему", "secondary"]],
-  reopened: [["assigned", "Назначить сотруднику", "primary"], ["in_progress", "Взять в работу", "secondary"]],
+  reopened: [["in_progress", "Взять в работу", "primary"]],
 };
+
+function ProblemReplyPanel({ api, problem, onChanged }: {
+  api: VentrixClientApi;
+  problem: ProblemDetail;
+  onChanged: () => Promise<void>;
+}) {
+  const loader = useCallback(() => api.problemConversation(problem.id), [api, problem.id]);
+  const { data, loading, error: loadError, reload } = useResource(loader);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [success, setSuccess] = useState("");
+  const requestId = useRef<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void reload(), 4_000);
+    return () => window.clearInterval(timer);
+  }, [reload]);
+
+  async function send() {
+    const message = text.trim();
+    if (!message || sending) return;
+    requestId.current ??= window.crypto.randomUUID();
+    setSending(true);
+    setSendError("");
+    setSuccess("");
+    try {
+      await api.replyToProblem(problem.id, message, requestId.current);
+      requestId.current = null;
+      setText("");
+      setSuccess("Ответ поставлен в отправку через рабочий Telegram.");
+      await reload();
+      await onChanged();
+    } catch (cause) {
+      setSendError(cause instanceof Error ? cause.message : "Не удалось отправить ответ");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return <Card className="reply-panel">
+    <header><div><p className="detail-label">ОТВЕТ КЛИЕНТУ</p><h3>Переписка и ответ</h3></div>{data && <StatusBadge tone={data.can_reply ? "success" : "neutral"}>{data.can_reply ? "Сессия доступна" : "Только просмотр"}</StatusBadge>}</header>
+    {loading && !data ? <Skeleton lines={3} /> : data ? <>
+      <div className="reply-route"><span><small>Клиент</small><strong>{data.client.username ? `@${data.client.username}` : data.client.title}</strong></span><span><small>Отправитель</small><strong>{data.connection.username ? `@${data.connection.username}` : data.connection.name ?? "Рабочий аккаунт"}</strong></span></div>
+      <div className="reply-thread" aria-live="polite">{data.messages.map((message) => <div className={message.outgoing ? "outgoing" : "incoming"} key={message.id}><small>{message.outgoing ? "Сотрудник" : data.client.username ? `@${data.client.username}` : data.client.title} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p></div>)}</div>
+      {data.can_reply ? <div className="reply-composer"><label htmlFor={`problem-reply-${problem.id}`}>Ответить клиенту</label><textarea id={`problem-reply-${problem.id}`} rows={3} maxLength={4096} value={text} disabled={sending} placeholder="Введите сообщение от имени рабочего аккаунта" onChange={(event) => { setText(event.target.value); setSuccess(""); }} /><div><small>{text.length}/4096</small><Button variant="primary" disabled={sending || !text.trim()} onClick={() => void send()}>{sending ? "Отправляем…" : "Отправить"}</Button></div></div> : <p className="reply-unavailable">Ответ недоступен: проверьте права и состояние рабочей Telegram-сессии.</p>}
+    </> : null}
+    {loadError && <div className="inline-error" role="alert"><span>Не удалось обновить переписку.</span><button onClick={() => void reload()}>Повторить</button></div>}
+    {sendError && <p className="form-error" role="alert">{sendError}</p>}
+    {success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}
+  </Card>;
+}
 
 function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   api: VentrixClientApi;
@@ -30,19 +81,12 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   onChanged: () => Promise<void>;
   onClose: () => void;
 }) {
-  const employeesLoader = useCallback(() => api.employees(), [api]);
-  const { data: employees, loading: employeesLoading } = useResource(employeesLoader);
-  const [employeeId, setEmployeeId] = useState(problem.responsible_employee_id ?? "");
   const [deadline, setDeadline] = useState(problem.deadline_at?.slice(0, 16) ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
   async function transition(status: ProblemStatus, label: string) {
-    if (status === "assigned" && !employeeId) {
-      setError("Выберите сотрудника перед назначением.");
-      return;
-    }
     const reason = status === "false_positive"
       ? "Пользователь отметил карточку как не проблему."
       : status === "reopened"
@@ -55,7 +99,6 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
       await api.transitionProblem(problem.id, {
         status,
         reason,
-        responsible_employee_id: employeeId || undefined,
         deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
       });
       setSuccess(label);
@@ -83,7 +126,9 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
 
       <div className="detail-section context-section"><p className="detail-label">КОНТЕКСТ</p><h3>Переписка вокруг ситуации</h3>{problem.context_messages.length ? <div className="dialog-context">{problem.context_messages.map((message) => <div className={`${message.outgoing ? "outgoing" : "incoming"} ${message.is_source ? "source" : ""}`} key={message.id}><small>{message.outgoing ? "Сотрудник" : problemPerson(problem)} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p>{message.is_source && <em>Исходное сообщение</em>}</div>)}</div> : <div className="context-empty">Контекст сообщений для этой ситуации не найден.</div>}</div>
 
-      <div className="detail-section assignment-section"><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? "Сотрудник пока не назначен"}</h3><div className="problem-routing"><div><span>Рабочий аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Диалог</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><div className="assignment-controls"><label>Назначить сотрудника<select disabled={employeesLoading || busy} value={employeeId} onChange={(event) => setEmployeeId(event.target.value)}><option value="">Не назначен</option>{employees?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Срок решения<input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div></div>
+      <ProblemReplyPanel api={api} problem={problem} onChanged={onChanged} />
+
+      <div className="detail-section assignment-section"><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? "Определяется по рабочему аккаунту"}</h3><p className="assignment-note">Ответственный назначается автоматически: это сотрудник, через Telegram-сессию которого пришла ситуация.</p><div className="problem-routing"><div><span>Рабочий аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Диалог</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><div className="assignment-controls single"><label>Срок решения<input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div></div>
 
       <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
 
@@ -103,6 +148,8 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
   const { data, loading, error, reload } = useResource(loader);
   const [detail, setDetail] = useState<ProblemDetail | null>(null);
   const [openingId, setOpeningId] = useState("");
+  const [confirmingCloseId, setConfirmingCloseId] = useState("");
+  const [closingId, setClosingId] = useState("");
   const [openError, setOpenError] = useState("");
   const openedInitialProblem = useRef<string | null>(null);
 
@@ -124,6 +171,20 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
       setOpeningId("");
     }
   }, [api]);
+
+  async function quickClose(problemId: string) {
+    setClosingId(problemId);
+    setOpenError("");
+    try {
+      await api.resolveProblem(problemId);
+      setConfirmingCloseId("");
+      await reload();
+    } catch (cause) {
+      setOpenError(cause instanceof Error ? cause.message : "Не удалось завершить ситуацию");
+    } finally {
+      setClosingId("");
+    }
+  }
 
   useEffect(() => {
     if (!initialProblemId || openedInitialProblem.current === initialProblemId) return;
@@ -153,7 +214,7 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
 
     {!initialLoading && <div className="problem-filters" role="tablist" aria-label="Фильтр ситуаций">{filters.map((item) => <button role="tab" aria-selected={filter === item.value} className={filter === item.value ? "active" : ""} key={item.value} onClick={() => setFilter(item.value)}><span>{item.label}</span>{item.count !== undefined && <small>{item.count}</small>}</button>)}</div>}
 
-    {loading ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <button className="problem-card-button" key={problem.id} onClick={() => void open(problem.id)} disabled={openingId === problem.id}><Card className={`problem-card priority-${problem.priority}`}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.connection_username ? `Рабочий аккаунт @${problem.connection_username}` : problem.connection_name ?? "Рабочий аккаунт не указан"}</small></div></div><div className="problem-card-copy"><p className="problem-type">{problemTitle(problem)}</p><h3>{cleanExplanation(problem.explanation)}</h3><blockquote>{problem.evidence}</blockquote></div><div className="problem-card-meta"><span><small>Ответственный</small><strong>{problem.responsible_employee_name ?? "Не назначен"}</strong></span><span><small>Статус</small><strong>{PROBLEM_STATUS_LABELS[problem.status] ?? problem.status}</strong></span></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть ситуацию"}</span><b aria-hidden="true">→</b></footer></Card></button>)}</div>}
+    {loading ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <Card className={`problem-card priority-${problem.priority}`} key={problem.id}><button className="problem-card-open" onClick={() => void open(problem.id)} disabled={openingId === problem.id}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.connection_username ? `Рабочий аккаунт @${problem.connection_username}` : problem.connection_name ?? "Рабочий аккаунт не указан"}</small></div></div><div className="problem-card-copy"><p className="problem-type">{problemTitle(problem)}</p><h3>{cleanExplanation(problem.explanation)}</h3><blockquote>{problem.evidence}</blockquote></div><div className="problem-card-meta"><span><small>Ответственный</small><strong>{problem.responsible_employee_name ?? "По рабочему аккаунту"}</strong></span><span><small>Статус</small><strong>{PROBLEM_STATUS_LABELS[problem.status] ?? problem.status}</strong></span></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть ситуацию"}</span><b aria-hidden="true">→</b></footer></button><div className="problem-quick-close">{confirmingCloseId === problem.id ? <><span>Завершить эту ситуацию?</span><Button variant="primary" disabled={closingId === problem.id} onClick={() => void quickClose(problem.id)}>{closingId === problem.id ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={closingId === problem.id} onClick={() => setConfirmingCloseId("")}>Отмена</Button></> : <Button variant="secondary" onClick={() => setConfirmingCloseId(problem.id)}>Завершить</Button>}</div></Card>)}</div>}
 
     {(error || openError) && <div className="inline-error" role="alert"><span>{openError || "Не удалось загрузить ситуации."}</span><button onClick={() => void reload()}>Повторить</button></div>}
     {!loading && !visible.length && <EmptyState title={filter === "resolved" ? "Решённых ситуаций пока нет" : "В этом разделе всё спокойно"} description={filter === "resolved" ? "Здесь появятся ситуации после подтверждённого решения." : "Ventrix продолжает мониторинг и покажет новый риск после проверки контекста."} />}

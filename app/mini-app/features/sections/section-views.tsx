@@ -576,10 +576,7 @@ export function GroupsView({ api }: { api: VentrixClientApi }) {
           ))}
         </div>
       ) : (
-        <EmptyState
-          title="Группы не подключены"
-          description="Добавьте рабочую группу через раздел Telegram. После подтверждения она появится здесь."
-        />
+        <Card className="group-connect-guide"><Icon name="groups" /><div><h3>Подключите рабочую группу</h3><ol><li>Добавьте клиентского Ventrix-бота в нужную Telegram-группу.</li><li>Выдайте боту право отправлять сообщения.</li><li>Вернитесь сюда и обновите список.</li></ol><p>После подключения здесь можно разрешить персональные уведомления и регулярные отчёты.</p></div><Button variant="secondary" onClick={() => void reload()}>Обновить список</Button></Card>
       )}
       {(error || actionError) && <div className="inline-error"><p>{actionError || error}</p><Button onClick={() => void reload()}>Повторить</Button></div>}
     </section>
@@ -629,6 +626,7 @@ function SettingsForm({
           analysis_enabled: value.analysis_enabled,
           enabled_days: value.enabled_days,
           history_window_days: value.history_window_days,
+          response_sla_minutes: value.response_sla_minutes,
           signal_problem_threshold: value.signal_problem_threshold,
           signal_immediate_threshold: value.signal_immediate_threshold,
           manager_notification_threshold: value.manager_notification_threshold,
@@ -687,11 +685,12 @@ function SettingsForm({
   return (
     <div className="settings-workspace">
       <Card className="settings-section schedule-settings">
-        <header><div><h3>Регулярная сводка</h3><p>Ventrix формирует её только при наличии новых рабочих сообщений.</p></div><StatusBadge tone={value.analysis_enabled ? "success" : "neutral"}>{value.analysis_enabled ? "Включена" : "Выключена"}</StatusBadge></header>
+        <header><div><h3>Регулярная сводка</h3><p>Приходит по расписанию; если событий нет, Ventrix коротко подтвердит продолжение мониторинга.</p></div><StatusBadge tone={value.analysis_enabled ? "success" : "neutral"}>{value.analysis_enabled ? "Включена" : "Выключена"}</StatusBadge></header>
         <div className="settings-fields two-columns">
           <label>Время отправки<input type="time" value={value.daily_report_time.slice(0, 5)} onChange={(event) => patch("daily_report_time", event.target.value)} /></label>
           <label>Часовой пояс<select value={timezoneOffset(value.timezone)} onChange={(event) => patch("timezone", offsetTimezone(Number(event.target.value)))}>{UTC_OPTIONS.map((offset) => <option key={offset} value={offset}>{utcLabel(offset)}</option>)}</select><small>Для Москвы — UTC+3.</small></label>
           <label>Период анализа<select value={value.history_window_days} onChange={(event) => patch("history_window_days", Number(event.target.value))}><option value="7">Последние 7 дней</option><option value="14">Последние 14 дней</option><option value="30">Последние 30 дней</option></select></label>
+          <label>Время на ответ клиенту<select value={value.response_sla_minutes} onChange={(event) => patch("response_sla_minutes", Number(event.target.value))}><option value="15">15 минут</option><option value="30">30 минут</option><option value="60">60 минут</option><option value="120">120 минут</option><option value="180">180 минут</option></select><small>Через какое время без ответа Ventrix создаст ситуацию.</small></label>
         </div>
         <fieldset className="weekday-field"><legend>Дни работы</legend><div>{weekdays.map((day, index) => { const valueDay = index + 1; const active = value.enabled_days.includes(valueDay); return <button type="button" aria-pressed={active} className={active ? "active" : ""} key={day} onClick={() => patch("enabled_days", active ? value.enabled_days.filter((item) => item !== valueDay) : [...value.enabled_days, valueDay].sort())}>{day}</button>; })}</div></fieldset>
         <label className="toggle-row"><span><strong>Регулярный анализ</strong><small>Останавливает новые плановые проверки, не удаляя уже собранные данные.</small></span><input type="checkbox" checked={value.analysis_enabled} onChange={(event) => patch("analysis_enabled", event.target.checked)} /></label>
