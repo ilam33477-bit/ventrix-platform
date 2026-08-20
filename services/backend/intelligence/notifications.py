@@ -22,6 +22,7 @@ from ..models import (
     InitialAnalysisRun,
     NotificationLog,
     OperationalProblem,
+    Report,
     Signal,
     TelegramConnection,
     TelegramDialog,
@@ -774,5 +775,23 @@ class NotificationDispatcher:
             log.last_error_code = error
             if status == "sent":
                 log.sent_at = datetime.now(UTC)
+                report_id = str((log.payload_json or {}).get("report_id") or "")
+                if report_id:
+                    await session.flush()
+                    unsent = int(
+                        await session.scalar(
+                            select(func.count(NotificationLog.id)).where(
+                                NotificationLog.tenant_id == log.tenant_id,
+                                NotificationLog.deduplication_key.like(f"report:{report_id}:%"),
+                                NotificationLog.status != "sent",
+                            )
+                        )
+                        or 0
+                    )
+                    if unsent == 0:
+                        report = await session.get(Report, report_id)
+                        if report is not None and report.tenant_id == log.tenant_id:
+                            report.delivery_status = "sent"
+                            report.delivered_at = log.sent_at
 
         await self.transactions.run(write)

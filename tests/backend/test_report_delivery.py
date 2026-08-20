@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import func, select
 
+from services.backend.intelligence.notifications import NotificationDispatcher
 from services.backend.jobs.maintenance import MaintenanceJobHandlers
 from services.backend.jobs.queue import JobLease
 from services.backend.models import (
@@ -24,6 +25,11 @@ class RecordingQueue:
     async def enqueue(self, job_type: str, payload: dict[str, object], **kwargs) -> str:
         self.calls.append({"job_type": job_type, "payload": payload, **kwargs})
         return f"job-{len(self.calls)}"
+
+
+class RecordingSender:
+    async def send(self, tenant_id, destination_id, text, reply_markup=None) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -118,4 +124,27 @@ async def test_report_delivery_uses_notification_pool_and_deduplicates_log(
         text = notification.payload_json["text"]
         assert "Ежедневная сводка" in text
         assert "Мария" in text
+        assert notification.payload_json["report_id"] == report.id
+
+    dispatcher = NotificationDispatcher(session_factory, RecordingSender())
+    await dispatcher.dispatch(
+        JobLease(
+            id="notification-delivery",
+            tenant_id=tenant.id,
+            telegram_account_id=None,
+            dialog_id=None,
+            correlation_id=report.id,
+            job_type="notification.manager",
+            category="notification",
+            cost_class="light",
+            payload={"notification_id": notification.id},
+            attempts=0,
+            max_attempts=3,
+            locked_by="test",
+        )
+    )
+    async with session_factory() as session:
+        stored_report = await session.get(Report, report.id)
+        assert stored_report.delivery_status == "sent"
+        assert stored_report.delivered_at is not None
         assert "Активные задачи: <b>3</b>" in text

@@ -191,6 +191,7 @@ class MaintenanceJobHandlers:
                         payload_json={
                             "text": text,
                             "privacy_safe": True,
+                            "report_id": report.id,
                             "reply_markup": {
                                 "inline_keyboard": [
                                     [
