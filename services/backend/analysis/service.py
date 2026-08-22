@@ -39,6 +39,7 @@ from ..models import (
     TenantDailyMetric,
     TenantSettings,
 )
+from ..reporting.business_metrics import build_employee_business_performance
 from ..services.encryption import EncryptionService
 from ..services.product_events import add_system_event
 from ..telegram_sessions.service import TelegramConnectionService
@@ -62,7 +63,7 @@ class JSONAIProvider(Protocol):
 
 SYSTEM_PROMPT = """Analyze each Telegram business dialog in the supplied dialogs array independently. Return json only.
 Use schema_version 1.0 and exactly this structure:
-{"schema_version":"1.0","tenant_id":"...","batch_id":"...","dialog_results":[{"chat_id":"...","dialog_type":"...","summary":"...","participants":[],"detected_patterns":[],"problems":[{"event_type":"...","is_problem":true,"priority":"medium","confidence":0.8,"requires_review":false,"source_message_ids":[],"evidence":[],"summary":"...","recommended_action":"..."}]}],"usage":{"input_tokens":0,"output_tokens":0}}.
+{"schema_version":"1.0","tenant_id":"...","batch_id":"...","dialog_results":[{"chat_id":"...","dialog_type":"...","summary":"...","participants":[],"detected_patterns":[],"problems":[{"event_type":"...","is_problem":true,"priority":"medium","confidence":0.8,"requires_review":false,"source_message_ids":[],"evidence":[],"summary":"...","recommended_action":"..."}],"business_outcomes":[{"outcome_type":"call_scheduled","explicitly_supported":true,"confidence":0.9,"source_message_ids":[],"summary":"...","amount":null,"currency":null}]}],"usage":{"input_tokens":0,"output_tokens":0}}.
 Never invent source message IDs or facts. Use the tenant profile and local features supplied.
 Never transfer facts, participants, message IDs, evidence, or conclusions between dialogs. Return one dialog_result for every supplied dialog id.
 Use only these event_type values: client_without_answer, customer_complaint,
@@ -90,6 +91,12 @@ All user-facing summary and recommended_action values must be written in Russian
 Do not translate names, usernames or verbatim evidence. Keep JSON keys and enum values
 in the required English schema. Emit client_without_answer only when supplied data
 explicitly proves that the configured response deadline has already passed.
+Extract business_outcomes only from literal evidence in the same dialog. A call is
+scheduled only when its time/date or explicit agreement is confirmed. A sale is
+confirmed only when purchase, payment or order acceptance is explicit; never treat a
+pitch, price discussion or client interest as a sale. Set explicitly_supported=false
+when uncertain. Include exact source_message_ids. amount and currency are allowed only
+when the confirmed sale explicitly states them. Do not estimate revenue or working hours.
 """
 
 
@@ -102,6 +109,7 @@ def russian_user_text(value: str, fallback: str) -> str:
     cyrillic_count = len(CYRILLIC_RE.findall(normalized))
     latin_count = len(re.findall(r"[A-Za-z]", normalized))
     return normalized if cyrillic_count >= max(4, latin_count) else fallback
+
 
 CANONICAL_PROBLEM_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
@@ -875,7 +883,7 @@ class AnalysisPipelineService:
         async with self.session_factory() as session:
             run = await session.get(AnalysisRun, run_id)
             history_window_days = int((run.metrics_json or {}).get("history_window_days", 30))
-            period_start = run.started_at - timedelta(days=history_window_days)
+            period_start = self._aware(run.started_at) - timedelta(days=history_window_days)
             monitored_dialog_ids = select(TelegramDialog.id).where(
                 TelegramDialog.tenant_id == run.tenant_id,
                 TelegramDialog.selected.is_(True),
@@ -922,6 +930,15 @@ class AnalysisPipelineService:
                     )
                 )
             )
+            connections = {
+                item.id: item
+                for item in await session.scalars(
+                    select(TelegramConnection).where(
+                        TelegramConnection.tenant_id == run.tenant_id,
+                        TelegramConnection.deleted_at.is_(None),
+                    )
+                )
+            }
             groups = list(
                 await session.scalars(
                     select(GroupIntegration).where(GroupIntegration.tenant_id == run.tenant_id)
@@ -940,6 +957,54 @@ class AnalysisPipelineService:
                     )
                 )
             )
+            period_end = datetime.now(UTC)
+            period_span = period_end - period_start
+            previous_period_start = period_start - period_span
+            current_messages = list(
+                await session.scalars(
+                    select(TelegramMessage).where(
+                        TelegramMessage.tenant_id == run.tenant_id,
+                        TelegramMessage.dialog_id.in_(monitored_dialog_ids),
+                        TelegramMessage.deleted_at.is_(None),
+                        TelegramMessage.sent_at >= period_start,
+                        TelegramMessage.sent_at <= period_end,
+                    )
+                )
+            )
+            previous_messages = list(
+                await session.scalars(
+                    select(TelegramMessage).where(
+                        TelegramMessage.tenant_id == run.tenant_id,
+                        TelegramMessage.dialog_id.in_(monitored_dialog_ids),
+                        TelegramMessage.deleted_at.is_(None),
+                        TelegramMessage.sent_at >= previous_period_start,
+                        TelegramMessage.sent_at < period_start,
+                    )
+                )
+            )
+        batches = await self._batches(run_id)
+        dialog_outcomes: dict[str, list[dict[str, Any]]] = {}
+        for batch in batches:
+            for result in (batch.result_json or {}).get("dialog_results", []):
+                dialog_id = str(result.get("chat_id") or "")
+                dialog_outcomes.setdefault(dialog_id, []).extend(
+                    list(result.get("business_outcomes") or [])
+                )
+        dialog_employee_ids = {
+            dialog.id: (
+                connections.get(dialog.connection_id).assigned_employee_id
+                if connections.get(dialog.connection_id)
+                else None
+            )
+            for dialog in dialogs
+        }
+        business_performance = build_employee_business_performance(
+            current_messages=current_messages,
+            previous_messages=previous_messages,
+            dialog_employee_ids=dialog_employee_ids,
+            employees=employees,
+            dialog_outcomes=dialog_outcomes,
+        )
         employee_report = self._employee_report(
             employees,
             signals,
@@ -947,7 +1012,41 @@ class AnalysisPipelineService:
             problems,
             tenant_settings.signal_immediate_threshold,
         )
+        performance_by_employee = {
+            item["employee_id"]: item for item in business_performance["rows"]
+        }
+        for row in employee_report["employees"]:
+            row.update(performance_by_employee.get(row["employee_id"], {}))
         client_report = self._client_report(dialogs, commitments, problems)
+        dialog_by_id = {item.id: item for item in dialogs}
+        employee_by_id = {item.id: item for item in employees}
+        important_dialogs = {
+            "rows": [
+                {
+                    "problem_id": item.id,
+                    "priority": item.priority,
+                    "title": item.explanation,
+                    "recommended_action": item.recommended_action,
+                    "dialog_title": dialog_by_id[item.dialog_id].title
+                    if item.dialog_id in dialog_by_id
+                    else "Диалог",
+                    "dialog_username": dialog_by_id[item.dialog_id].username
+                    if item.dialog_id in dialog_by_id
+                    else None,
+                    "employee": employee_by_id[item.responsible_employee_id].display_name
+                    if item.responsible_employee_id in employee_by_id
+                    else None,
+                }
+                for item in sorted(
+                    problems,
+                    key=lambda problem: (
+                        {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(problem.priority, 0),
+                        problem.occurred_at,
+                    ),
+                    reverse=True,
+                )[:20]
+            ]
+        }
         company_report = {
             "critical_situations": sum(
                 item.criticality >= tenant_settings.signal_immediate_threshold for item in signals
@@ -962,8 +1061,7 @@ class AnalysisPipelineService:
         metrics = {
             "messages": message_count,
             "patterns": sum(
-                len((batch.result_json or {}).get("dialog_results", []))
-                for batch in await self._batches(run_id)
+                len((batch.result_json or {}).get("dialog_results", [])) for batch in batches
             ),
             "problems": len(problems),
             "high": sum(item.priority in {"high", "critical"} for item in problems),
@@ -1015,6 +1113,8 @@ class AnalysisPipelineService:
                     "employee_report": employee_report,
                     "client_report": client_report,
                     "company_report": company_report,
+                    "business_performance": business_performance,
+                    "important_dialogs": important_dialogs,
                     "recommendations": {
                         "items": [item.recommended_action for item in problems[:20]]
                     },
@@ -1227,9 +1327,7 @@ class AnalysisPipelineService:
                 await session.scalars(select(AnalysisBatch).where(AnalysisBatch.run_id == run_id))
             )
 
-    async def _record_batch_outcome(
-        self, run_id: str, batches: list[AnalysisBatch]
-    ) -> None:
+    async def _record_batch_outcome(self, run_id: str, batches: list[AnalysisBatch]) -> None:
         async def write(session: AsyncSession) -> None:
             run = await session.get(AnalysisRun, run_id)
             if run is None:

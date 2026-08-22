@@ -140,6 +140,32 @@ class SQLiteJobQueue:
 
         return await self.transactions.run(write)
 
+    async def has_unfinished(
+        self,
+        job_type: str,
+        *,
+        telegram_account_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Return whether the same logical job is already queued or running.
+
+        Periodic producers use this guard to avoid adding a fresh reconciliation
+        job while Telegram has asked an earlier attempt to wait.
+        """
+
+        async with self.session_factory() as session:
+            query = select(BackgroundJob.id).where(
+                BackgroundJob.job_type == job_type,
+                BackgroundJob.status.in_(
+                    ("pending", "scheduled", "waiting", "retry", "retry_scheduled", "running")
+                ),
+            )
+            if telegram_account_id is not None:
+                query = query.where(BackgroundJob.telegram_account_id == telegram_account_id)
+            if tenant_id is not None:
+                query = query.where(BackgroundJob.tenant_id == tenant_id)
+            return await session.scalar(query.limit(1)) is not None
+
     async def claim_next(
         self,
         worker_id: str,

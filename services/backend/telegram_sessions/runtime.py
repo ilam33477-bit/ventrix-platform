@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 import re
@@ -38,6 +39,7 @@ from .sync import TelegramSyncHandlers
 
 logger = logging.getLogger(__name__)
 CATCH_UP_PAGE_SIZE = 500
+CATCH_UP_CATALOG_TTL = timedelta(hours=1)
 
 
 def is_automated_private_entity(entity: Any) -> bool:
@@ -79,6 +81,8 @@ class TelegramSessionActor:
         self._updates_received = 0
         self._edited_received = 0
         self._monitored_peer_ids: set[str] | None = None
+        self._remote_catalog: dict[int, dict[str, Any]] | None = None
+        self._catalog_refreshed_at: datetime | None = None
 
     async def run(self) -> None:
         try:
@@ -106,16 +110,23 @@ class TelegramSessionActor:
             try:
                 await self.client.connect()
                 await self._health("running", reconnects=reconnects)
-                await self.queue.enqueue(
-                    "telegram.catch_up",
-                    {},
-                    tenant_id=self.connection.tenant_id,
-                    telegram_account_id=self.connection.id,
-                    priority=JOB_PRIORITY["P2"],
-                    idempotency_key=f"telegram-catchup:{self.connection.id}:{datetime.now(UTC):%Y%m%d%H%M}",
-                    category="telegram_rpc",
-                    cost_class="light",
-                )
+                if not await self.queue.has_unfinished(
+                    "telegram.catch_up", telegram_account_id=self.connection.id
+                ):
+                    await self.queue.enqueue(
+                        "telegram.catch_up",
+                        {},
+                        tenant_id=self.connection.tenant_id,
+                        telegram_account_id=self.connection.id,
+                        priority=JOB_PRIORITY["P2"],
+                        scheduled_at=datetime.now(UTC)
+                        + timedelta(seconds=self._startup_catch_up_delay()),
+                        idempotency_key=(
+                            f"telegram-catchup:{self.connection.id}:{datetime.now(UTC):%Y%m%d%H%M}"
+                        ),
+                        category="telegram_rpc",
+                        cost_class="light",
+                    )
                 await self.client.run_until_disconnected()
                 if self._stopping.is_set():
                     break
@@ -189,6 +200,11 @@ class TelegramSessionActor:
     async def _catch_up_job(self, _: JobLease) -> dict[str, int]:
         return await self.catch_up()
 
+    def _startup_catch_up_delay(self) -> int:
+        """Spread reconnect recovery across accounts sharing one Telegram API app."""
+
+        return int(hashlib.sha256(self.connection.id.encode()).hexdigest()[:4], 16) % 45
+
     async def _preview_source_job(self, job: JobLease) -> dict[str, Any]:
         return await self.preview_source(str(job.payload["link"]))
 
@@ -260,8 +276,11 @@ class TelegramSessionActor:
             command.status = "sending"
             command.attempts += 1
             command.last_error_code = None
-            return command.text, command.telegram_random_id, command.dialog_id, str(
-                dialog.telegram_dialog_id
+            return (
+                command.text,
+                command.telegram_random_id,
+                command.dialog_id,
+                str(dialog.telegram_dialog_id),
             )
 
         prepared = await self.transactions.run(start)
@@ -666,31 +685,44 @@ class TelegramSessionActor:
         # per catch-up pass and use InputPeer objects instead of unresolved raw IDs.
         # The full iter_dialogs pass is also the recovery path for newly discovered
         # personal chats. Groups/channels remain explicit opt-in sources.
-        remote_catalog: dict[int, dict[str, Any]] = {}
+        now = datetime.now(UTC)
+        cached_catalog = getattr(self, "_remote_catalog", None)
+        refreshed_at = getattr(self, "_catalog_refreshed_at", None)
+        catalog_is_fresh = bool(
+            cached_catalog
+            and refreshed_at is not None
+            and now - refreshed_at < CATCH_UP_CATALOG_TTL
+        )
+        remote_catalog: dict[int, dict[str, Any]] = cached_catalog or {}
         try:
-            async with self.rpc_lock:
-                async for remote_dialog in self.client.iter_dialogs():
-                    entity = remote_dialog.entity
-                    source_type = (
-                        "personal"
-                        if remote_dialog.is_user
-                        else "channel"
-                        if remote_dialog.is_channel and getattr(entity, "broadcast", False)
-                        else "group"
-                    )
-                    remote_id = int(remote_dialog.id)
-                    remote_catalog[remote_id] = {
-                        "input_entity": getattr(
-                            remote_dialog, "input_entity", remote_dialog.entity
-                        ),
-                        "title": str(remote_dialog.name or "Telegram dialog")[:300],
-                        "username": getattr(entity, "username", None),
-                        "source_type": source_type,
-                        "last_message_at": getattr(remote_dialog.message, "date", None),
-                        "is_automated": bool(
-                            source_type == "personal" and is_automated_private_entity(entity)
-                        ),
-                    }
+            if not catalog_is_fresh:
+                refreshed_catalog: dict[int, dict[str, Any]] = {}
+                async with self.rpc_lock:
+                    async for remote_dialog in self.client.iter_dialogs():
+                        entity = remote_dialog.entity
+                        source_type = (
+                            "personal"
+                            if remote_dialog.is_user
+                            else "channel"
+                            if remote_dialog.is_channel and getattr(entity, "broadcast", False)
+                            else "group"
+                        )
+                        remote_id = int(remote_dialog.id)
+                        refreshed_catalog[remote_id] = {
+                            "input_entity": getattr(
+                                remote_dialog, "input_entity", remote_dialog.entity
+                            ),
+                            "title": str(remote_dialog.name or "Telegram dialog")[:300],
+                            "username": getattr(entity, "username", None),
+                            "source_type": source_type,
+                            "last_message_at": getattr(remote_dialog.message, "date", None),
+                            "is_automated": bool(
+                                source_type == "personal" and is_automated_private_entity(entity)
+                            ),
+                        }
+                remote_catalog = refreshed_catalog
+                self._remote_catalog = refreshed_catalog
+                self._catalog_refreshed_at = now
         except errors.FloodWaitError as exc:
             await self._rate_limited(int(exc.seconds))
             raise TelegramFloodWait(int(exc.seconds)) from None

@@ -28,8 +28,10 @@ class CatchUpClient:
         self.dialogs = dialogs
         self.messages = messages
         self.min_ids: dict[int, list[int]] = {}
+        self.dialog_catalog_requests = 0
 
     async def iter_dialogs(self):
+        self.dialog_catalog_requests += 1
         for dialog in self.dialogs:
             yield dialog
 
@@ -156,6 +158,7 @@ async def test_catch_up_paginates_entire_1200_message_gap_without_duplicates(
     actor = actor_for(connection, client, queue, session_factory)
     first = await actor.catch_up()
     second = await actor.catch_up()
+    assert client.dialog_catalog_requests == 1
 
     async with session_factory() as session:
         queued = int(

@@ -225,6 +225,33 @@ async def test_telegram_rpc_bypasses_tenant_general_concurrency(
 
 
 @pytest.mark.asyncio
+async def test_queue_detects_unfinished_job_for_telegram_account(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.commit()
+        tenant_id = tenant.id
+        account_id = connection.id
+
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue(
+        "telegram.catch_up",
+        {},
+        tenant_id=tenant_id,
+        telegram_account_id=account_id,
+        category="telegram_rpc",
+    )
+    assert await queue.has_unfinished("telegram.catch_up", telegram_account_id=account_id)
+    lease = await queue.claim_next("telegram-test", telegram_account_id=account_id)
+    assert lease is not None and lease.id == job_id
+    await queue.complete(lease)
+    assert not await queue.has_unfinished("telegram.catch_up", telegram_account_id=account_id)
+
+
+@pytest.mark.asyncio
 async def test_telegram_runtime_lease_fences_previous_owner(
     session_factory, make_service, tenant_payload
 ) -> None:

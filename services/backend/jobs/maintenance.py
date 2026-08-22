@@ -115,18 +115,58 @@ class MaintenanceJobHandlers:
                     ReportSection.section_key == "employee_report",
                 )
             )
-            employee_rows = list((employee_section.data_json if employee_section else {}).get("employees") or [])
+            employee_rows = list(
+                (employee_section.data_json if employee_section else {}).get("employees")
+                or (employee_section.data_json if employee_section else {}).get("rows")
+                or []
+            )
             employee_blocks: list[str] = []
             for row in employee_rows[:8]:
                 open_tasks = int(row.get("open_promises", 0)) + int(row.get("clients_waiting", 0))
+                response_minutes = row.get("average_response_minutes")
+                response_change = row.get("response_time_change_percent")
+                response_line = ""
+                if response_minutes is not None:
+                    response_line = (
+                        f"\nСреднее время ответа: <b>{float(response_minutes):g} мин.</b>"
+                    )
+                    if response_change is not None:
+                        direction = "медленнее" if float(response_change) > 0 else "быстрее"
+                        response_line += (
+                            f" ({abs(float(response_change)):g}% {direction} прошлого периода)"
+                        )
+                outcome_lines: list[str] = []
+                if int(row.get("calls_scheduled", 0)):
+                    outcome_lines.append(
+                        f"Подтверждённых созвонов: <b>{int(row['calls_scheduled'])}</b>"
+                    )
+                if int(row.get("sales_confirmed", 0)):
+                    sales_line = f"Подтверждённых продаж: <b>{int(row['sales_confirmed'])}</b>"
+                    amounts = row.get("confirmed_sales_amounts") or {}
+                    if amounts:
+                        rendered = ", ".join(
+                            f"{float(value):g} {escape(str(currency))}"
+                            for currency, value in amounts.items()
+                        )
+                        sales_line += f" · {rendered}"
+                    outcome_lines.append(sales_line)
+                outcomes = list(row.get("business_outcomes") or [])
+                if outcomes:
+                    outcome_lines.append(
+                        f"Факт периода: {escape(str(outcomes[0].get('summary') or ''))}"
+                    )
                 employee_blocks.append(
                     "<blockquote>"
                     f"<b>{escape(str(row.get('name') or 'Сотрудник'))}</b>\n"
+                    f"Активность: <b>{int(row.get('messages_sent', 0))}</b> сообщений "
+                    f"в <b>{int(row.get('active_dialogs', 0))}</b> диалогах"
+                    f"{response_line}\n"
                     f"Активные задачи: <b>{open_tasks}</b>\n"
                     f"Клиенты ждут ответа: <b>{int(row.get('clients_waiting', 0))}</b>\n"
                     f"Открытые обещания: <b>{int(row.get('open_promises', 0))}</b>\n"
                     f"Просрочено: <b>{int(row.get('missed_deadlines', 0))}</b>"
-                    "</blockquote>"
+                    + ("\n" + "\n".join(outcome_lines) if outcome_lines else "")
+                    + "</blockquote>"
                 )
             no_activity = int(metrics.get("messages", 0)) == 0
             partial_analysis = bool(metrics.get("analysis_partial", 0))
@@ -149,7 +189,11 @@ class MaintenanceJobHandlers:
                     if partial_analysis
                     else ""
                 )
-                + ("<b>По сотрудникам</b>\n" + "\n".join(employee_blocks) + "\n\n" if employee_blocks else "")
+                + (
+                    "<b>По сотрудникам</b>\n" + "\n".join(employee_blocks) + "\n\n"
+                    if employee_blocks
+                    else ""
+                )
                 + "Полная сводка и связанные ситуации доступны в Mini App."
             )[:4000]
             destinations: list[tuple[str, str, str | None]] = [

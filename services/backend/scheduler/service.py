@@ -284,7 +284,14 @@ class TenantAnalysisScheduler:
         fetch_bucket = int(now.timestamp() // self.incremental_interval_seconds)
         reconcile_bucket = int(now.timestamp() // self.reconciliation_interval_seconds)
         job_ids: list[str] = []
-        for connection in connections:
+        for position, connection in enumerate(sorted(connections, key=lambda item: item.id)):
+            if await self.queue.has_unfinished(
+                "telegram.catch_up", telegram_account_id=connection.id
+            ):
+                continue
+            # Keep one API credential from enumerating every account at the same
+            # instant. The live-update path remains immediate; this is recovery.
+            stagger_seconds = min(max(0, self.incremental_interval_seconds - 1), position * 20)
             job_ids.append(
                 await self.queue.enqueue(
                     "telegram.catch_up",
@@ -292,6 +299,7 @@ class TenantAnalysisScheduler:
                     tenant_id=connection.tenant_id,
                     telegram_account_id=connection.id,
                     priority=JOB_PRIORITY["P1"],
+                    scheduled_at=now + timedelta(seconds=stagger_seconds),
                     idempotency_key=f"telegram-fetch:{connection.id}:bucket:{fetch_bucket}",
                     correlation_id=str(uuid4()),
                     is_heavy=False,

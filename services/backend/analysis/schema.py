@@ -27,6 +27,18 @@ class DetectedProblem(BaseModel):
     close_existing_issue_families: list[str] = Field(default_factory=list)
 
 
+class BusinessOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcome_type: Literal["call_scheduled", "sale_confirmed", "follow_up_agreed"]
+    explicitly_supported: bool = False
+    confidence: float = Field(ge=0, le=1)
+    source_message_ids: list[str | int] = Field(default_factory=list)
+    summary: str = Field(min_length=1, max_length=1000)
+    amount: float | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, max_length=12)
+
+
 class DialogAnalysisResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -36,6 +48,7 @@ class DialogAnalysisResult(BaseModel):
     participants: list[str | int] = Field(default_factory=list)
     detected_patterns: list[str] = Field(default_factory=list)
     problems: list[DetectedProblem] = Field(default_factory=list)
+    business_outcomes: list[BusinessOutcome] = Field(default_factory=list)
 
 
 class AIUsage(BaseModel):
