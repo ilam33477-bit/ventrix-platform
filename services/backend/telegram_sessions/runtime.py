@@ -832,7 +832,23 @@ class TelegramSessionActor:
                             page.append(message)
                 except errors.FloodWaitError as exc:
                     await self._rate_limited(int(exc.seconds))
-                    raise TelegramFloodWait(int(exc.seconds)) from None
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_catchup_rate_limited",
+                        tenant_id=self.connection.tenant_id,
+                        account_id=self.connection.id,
+                        dialog_id=dialog.id,
+                        stage="telegram.catch_up",
+                        events_enqueued=seen,
+                        retry_after_seconds=int(exc.seconds),
+                    )
+                    # Catch-up is periodic reconciliation, not a user-blocking RPC.
+                    # Keep every durable enqueue/checkpoint completed so far and let
+                    # the next scheduled pass resume from its cursors. Retrying the
+                    # whole job during FloodWait creates a hot loop across hundreds
+                    # of dialogs and competes with Mini App/API work on small VPSes.
+                    return {"events": seen, "discovered_dialogs": discovered}
                 if not page:
                     break
                 for message in page:

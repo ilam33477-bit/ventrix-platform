@@ -60,6 +60,18 @@ class ImmediatelyRateLimitedCatalogClient(CatchUpClient):
         raise errors.FloodWaitError(request=None, capture=30)
 
 
+class RateLimitedMessagesClient(CatchUpClient):
+    async def iter_messages(self, input_entity, *, min_id: int, reverse: bool, limit: int):
+        if int(input_entity) == 1002:
+            if False:
+                yield None
+            raise errors.FloodWaitError(request=None, capture=30)
+        async for message in super().iter_messages(
+            input_entity, min_id=min_id, reverse=reverse, limit=limit
+        ):
+            yield message
+
+
 def remote_dialog(remote_id: int, source_type: str) -> SimpleNamespace:
     entity = SimpleNamespace(
         username=f"user_{remote_id}",
@@ -239,6 +251,56 @@ async def test_empty_rate_limited_catalog_defers_to_next_reconciliation(
 
     actor._rate_limited = ignore_rate_limit
     assert await actor.catch_up() == {"events": 0, "discovered_dialogs": 0}
+
+
+@pytest.mark.asyncio
+async def test_message_flood_wait_keeps_partial_progress_without_retry_storm(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.flush()
+        for remote_id in (1001, 1002):
+            session.add(
+                TelegramDialog(
+                    tenant_id=tenant.id,
+                    connection_id=connection.id,
+                    telegram_dialog_id=remote_id,
+                    canonical_peer_id=str(remote_id),
+                    title=f"Dialog {remote_id}",
+                    dialog_type="personal",
+                    source="personal",
+                    selected=True,
+                    excluded=False,
+                )
+            )
+        await session.commit()
+
+    client = RateLimitedMessagesClient(
+        [remote_dialog(1001, "personal"), remote_dialog(1002, "personal")],
+        {1001: remote_messages(2), 1002: remote_messages(1)},
+    )
+    actor = actor_for(connection, client, SQLiteJobQueue(session_factory), session_factory)
+
+    async def ignore_rate_limit(_: int) -> None:
+        return None
+
+    actor._rate_limited = ignore_rate_limit
+    result = await actor.catch_up()
+
+    assert result == {"events": 2, "discovered_dialogs": 0}
+    async with session_factory() as session:
+        queued = int(
+            await session.scalar(
+                select(func.count(BackgroundJob.id)).where(
+                    BackgroundJob.job_type == "telegram.ingest_event"
+                )
+            )
+            or 0
+        )
+    assert queued == 2
 
 
 @pytest.mark.asyncio
