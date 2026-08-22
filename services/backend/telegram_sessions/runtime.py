@@ -16,7 +16,7 @@ from telethon import TelegramClient, errors, events, functions, utils
 
 from ..config import get_settings
 from ..database import SQLiteTransactionManager, get_session_factory
-from ..jobs.queue import JOB_PRIORITY, JobLease, SQLiteJobQueue
+from ..jobs.queue import JOB_PRIORITY, JobDeferred, JobLease, SQLiteJobQueue
 from ..jobs.worker import BackgroundWorker
 from ..models import (
     EncryptedSecret,
@@ -198,6 +198,8 @@ class TelegramSessionActor:
             await self._flush_counters()
 
     async def _catch_up_job(self, _: JobLease) -> dict[str, int]:
+        if not self.client.is_connected():
+            raise JobDeferred(15, "telegram_client_connecting")
         return await self.catch_up()
 
     def _startup_catch_up_delay(self) -> int:

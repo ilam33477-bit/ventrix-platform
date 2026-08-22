@@ -10,7 +10,7 @@ from telethon import errors
 
 from services.backend.database import SQLiteTransactionManager
 from services.backend.intelligence.signals import SignalService
-from services.backend.jobs.queue import SQLiteJobQueue
+from services.backend.jobs.queue import JobDeferred, SQLiteJobQueue
 from services.backend.models import (
     BackgroundJob,
     MonitoredSource,
@@ -239,6 +239,15 @@ async def test_empty_rate_limited_catalog_defers_to_next_reconciliation(
 
     actor._rate_limited = ignore_rate_limit
     assert await actor.catch_up() == {"events": 0, "discovered_dialogs": 0}
+
+
+@pytest.mark.asyncio
+async def test_catch_up_job_waits_for_connected_client() -> None:
+    actor = TelegramSessionActor.__new__(TelegramSessionActor)
+    actor.client = SimpleNamespace(is_connected=lambda: False)
+    with pytest.raises(JobDeferred) as raised:
+        await actor._catch_up_job(SimpleNamespace())
+    assert raised.value.delay_seconds == 15
 
 
 @pytest.mark.asyncio
