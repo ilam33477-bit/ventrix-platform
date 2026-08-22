@@ -52,6 +52,14 @@ class PartiallyRateLimitedCatalogClient(CatchUpClient):
         raise errors.FloodWaitError(request=None, capture=30)
 
 
+class ImmediatelyRateLimitedCatalogClient(CatchUpClient):
+    async def iter_dialogs(self):
+        self.dialog_catalog_requests += 1
+        if False:
+            yield None
+        raise errors.FloodWaitError(request=None, capture=30)
+
+
 def remote_dialog(remote_id: int, source_type: str) -> SimpleNamespace:
     entity = SimpleNamespace(
         username=f"user_{remote_id}",
@@ -211,6 +219,26 @@ async def test_partial_catalog_is_kept_without_retrying_more_rpc(
     assert result == {"events": 0, "discovered_dialogs": 1}
     assert client.min_ids == {}
     assert set(actor._remote_catalog or {}) == {1001}
+
+
+@pytest.mark.asyncio
+async def test_empty_rate_limited_catalog_defers_to_next_reconciliation(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.commit()
+
+    client = ImmediatelyRateLimitedCatalogClient([], {})
+    actor = actor_for(connection, client, SQLiteJobQueue(session_factory), session_factory)
+
+    async def ignore_rate_limit(_: int) -> None:
+        return None
+
+    actor._rate_limited = ignore_rate_limit
+    assert await actor.catch_up() == {"events": 0, "discovered_dialogs": 0}
 
 
 @pytest.mark.asyncio

@@ -725,8 +725,6 @@ class TelegramSessionActor:
                             }
                 except errors.FloodWaitError as exc:
                     await self._rate_limited(int(exc.seconds))
-                    if not refreshed_catalog:
-                        raise TelegramFloodWait(int(exc.seconds)) from None
                     catalog_rate_limited = True
                     log_event(
                         logger,
