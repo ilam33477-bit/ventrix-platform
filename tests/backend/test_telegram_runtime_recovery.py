@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
+from telethon import errors
 
 from services.backend.database import SQLiteTransactionManager
 from services.backend.intelligence.signals import SignalService
@@ -42,6 +43,13 @@ class CatchUpClient:
         available = [item for item in self.messages.get(remote_id, []) if item.id > min_id]
         for message in available[:limit]:
             yield message
+
+
+class PartiallyRateLimitedCatalogClient(CatchUpClient):
+    async def iter_dialogs(self):
+        self.dialog_catalog_requests += 1
+        yield self.dialogs[0]
+        raise errors.FloodWaitError(request=None, capture=30)
 
 
 def remote_dialog(remote_id: int, source_type: str) -> SimpleNamespace:
@@ -176,6 +184,33 @@ async def test_catch_up_paginates_entire_1200_message_gap_without_duplicates(
     async with session_factory() as session:
         cursor = await session.scalar(select(TelegramIncrementalCursor))
         assert cursor is not None and cursor.last_message_id == 1210
+
+
+@pytest.mark.asyncio
+async def test_partial_catalog_is_kept_without_retrying_more_rpc(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(tenant_id=tenant.id, status="ready")
+        session.add(connection)
+        await session.commit()
+
+    client = PartiallyRateLimitedCatalogClient(
+        [remote_dialog(1001, "personal"), remote_dialog(1002, "personal")],
+        {1001: remote_messages(1)},
+    )
+    actor = actor_for(connection, client, SQLiteJobQueue(session_factory), session_factory)
+
+    async def ignore_rate_limit(_: int) -> None:
+        return None
+
+    actor._rate_limited = ignore_rate_limit
+    result = await actor.catch_up()
+
+    assert result == {"events": 0, "discovered_dialogs": 1}
+    assert client.min_ids == {}
+    assert set(actor._remote_catalog or {}) == {1001}
 
 
 @pytest.mark.asyncio

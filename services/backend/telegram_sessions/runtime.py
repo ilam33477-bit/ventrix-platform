@@ -694,32 +694,50 @@ class TelegramSessionActor:
             and now - refreshed_at < CATCH_UP_CATALOG_TTL
         )
         remote_catalog: dict[int, dict[str, Any]] = cached_catalog or {}
+        catalog_rate_limited = False
         try:
             if not catalog_is_fresh:
                 refreshed_catalog: dict[int, dict[str, Any]] = {}
-                async with self.rpc_lock:
-                    async for remote_dialog in self.client.iter_dialogs():
-                        entity = remote_dialog.entity
-                        source_type = (
-                            "personal"
-                            if remote_dialog.is_user
-                            else "channel"
-                            if remote_dialog.is_channel and getattr(entity, "broadcast", False)
-                            else "group"
-                        )
-                        remote_id = int(remote_dialog.id)
-                        refreshed_catalog[remote_id] = {
-                            "input_entity": getattr(
-                                remote_dialog, "input_entity", remote_dialog.entity
-                            ),
-                            "title": str(remote_dialog.name or "Telegram dialog")[:300],
-                            "username": getattr(entity, "username", None),
-                            "source_type": source_type,
-                            "last_message_at": getattr(remote_dialog.message, "date", None),
-                            "is_automated": bool(
-                                source_type == "personal" and is_automated_private_entity(entity)
-                            ),
-                        }
+                try:
+                    async with self.rpc_lock:
+                        async for remote_dialog in self.client.iter_dialogs():
+                            entity = remote_dialog.entity
+                            source_type = (
+                                "personal"
+                                if remote_dialog.is_user
+                                else "channel"
+                                if remote_dialog.is_channel and getattr(entity, "broadcast", False)
+                                else "group"
+                            )
+                            remote_id = int(remote_dialog.id)
+                            refreshed_catalog[remote_id] = {
+                                "input_entity": getattr(
+                                    remote_dialog, "input_entity", remote_dialog.entity
+                                ),
+                                "title": str(remote_dialog.name or "Telegram dialog")[:300],
+                                "username": getattr(entity, "username", None),
+                                "source_type": source_type,
+                                "last_message_at": getattr(remote_dialog.message, "date", None),
+                                "is_automated": bool(
+                                    source_type == "personal"
+                                    and is_automated_private_entity(entity)
+                                ),
+                            }
+                except errors.FloodWaitError as exc:
+                    await self._rate_limited(int(exc.seconds))
+                    if not refreshed_catalog:
+                        raise TelegramFloodWait(int(exc.seconds)) from None
+                    catalog_rate_limited = True
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_catalog_partially_refreshed",
+                        tenant_id=self.connection.tenant_id,
+                        account_id=self.connection.id,
+                        stage="telegram.catch_up",
+                        catalog_size=len(refreshed_catalog),
+                        retry_after_seconds=int(exc.seconds),
+                    )
                 remote_catalog = refreshed_catalog
                 self._remote_catalog = refreshed_catalog
                 self._catalog_refreshed_at = now
@@ -769,6 +787,8 @@ class TelegramSessionActor:
             return discovered
 
         discovered = await self.transactions.run(discover_personal_dialogs)
+        if catalog_rate_limited:
+            return {"events": 0, "discovered_dialogs": discovered}
         async with self.transactions.session_factory() as session:
             rows = (
                 await session.execute(
