@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -60,6 +60,28 @@ async def test_runtime_synchronizes_web_app_menu_button() -> None:
     configured = runtime.bot.set_chat_menu_button.await_args.kwargs["menu_button"]
     assert configured.text == "Ventrix AI"
     assert configured.web_app.url == runtime.mini_app_url
+
+
+@pytest.mark.asyncio
+async def test_runtime_registers_tenant_context_for_group_membership_updates(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    tenant_id, bot_ids = await add_bots(
+        session_factory, make_service, tenant_payload, encryption_key, 1
+    )
+    runtime = AiogramPollingRuntime(
+        "123456789:abcdefghijklmnopqrstuvwxyzABCDE",
+        tenant_id,
+        bot_ids[0],
+        session_factory,
+        ProductEventService(session_factory),
+        mini_app_url="https://ventrix.example.app",
+        fsm_ttl=timedelta(minutes=10),
+    )
+    router = runtime.dispatcher.sub_routers[0]
+    middlewares = router.observers["my_chat_member"].middleware._middlewares
+    assert any(isinstance(item, TenantOwnerMiddleware) for item in middlewares)
+    await runtime.bot.session.close()
 
 
 async def add_bots(session_factory, make_service, tenant_payload, encryption_key, count: int):

@@ -759,7 +759,7 @@ export function GroupsView({ api }: { api: VentrixClientApi }) {
           ))}
         </div>
       ) : (
-        <Card className="group-connect-guide"><Icon name="groups" /><div><h3>Подключите рабочую группу</h3><ol><li>Добавьте клиентского Ventrix-бота в нужную Telegram-группу.</li><li>Выдайте боту право отправлять сообщения.</li><li>Вернитесь сюда и обновите список.</li></ol><p>После подключения здесь можно разрешить персональные уведомления и регулярные отчёты.</p></div><Button variant="secondary" onClick={() => void reload()}>Обновить список</Button></Card>
+        <Card className="group-connect-guide"><Icon name="groups" /><div><h3>Подключите рабочую группу</h3><ol><li>Добавьте клиентского Ventrix-бота непосредственно в нужную группу.</li><li>Назначьте его администратором и оставьте право отправлять сообщения.</li><li>Напишите в группе команду <code>/ventrix_connect</code>.</li><li>Вернитесь сюда и обновите список.</li></ol><p>Для приватной группы ссылка-приглашение не требуется: одной ссылки недостаточно — бот должен состоять в группе. После подключения здесь можно включить карточки ситуаций и регулярные отчёты.</p></div><Button variant="secondary" onClick={() => void reload()}>Обновить список</Button></Card>
       )}
       {(error || actionError) && <div className="inline-error"><p>{actionError || error}</p><Button onClick={() => void reload()}>Повторить</Button></div>}
     </section>

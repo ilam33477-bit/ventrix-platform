@@ -85,6 +85,11 @@ class AiogramPollingRuntime:
         )
         router.message.middleware(middleware)
         router.callback_query.middleware(middleware)
+        # Telegram emits bot role changes through the my_chat_member observer,
+        # not through ordinary messages. Without the same tenant middleware the
+        # group registration handler receives no ClientContext and the update is
+        # discarded after Telegram has delivered it once.
+        router.my_chat_member.middleware(middleware)
         self.dispatcher.include_router(router)
 
     async def run(self) -> None:

@@ -8,7 +8,7 @@ from typing import Any
 
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     BufferedInputFile,
@@ -161,7 +161,21 @@ class TenantOwnerMiddleware(BaseMiddleware):
                     )
                     if membership is not None:
                         await session.commit()
-        if tenant is None or user_id is None or membership is None:
+        group_membership_update = isinstance(event, ChatMemberUpdated)
+        group_connect_command = (
+            isinstance(event, Message)
+            and event.chat.type in {"group", "supergroup"}
+            and (event.text or "").split("@", 1)[0].strip() == "/ventrix_connect"
+        )
+        verified_group_admin = False
+        if tenant is not None and user_id is not None and membership is None and group_connect_command:
+            try:
+                actor_member = await event.bot.get_chat_member(event.chat.id, user_id)
+                verified_group_admin = actor_member.status in {"administrator", "creator"}
+            except TelegramBadRequest:
+                verified_group_admin = False
+        tenant_scoped_group_event = group_membership_update or verified_group_admin
+        if tenant is None or user_id is None or (membership is None and not tenant_scoped_group_event):
             await self.events.record(
                 tenant_id=self.tenant_id,
                 bot_instance_id=self.bot_instance_id,
@@ -185,9 +199,9 @@ class TenantOwnerMiddleware(BaseMiddleware):
             bot_instance_id=self.bot_instance_id,
             tenant_id=self.tenant_id,
             telegram_user_id=user_id,
-            role=membership.role,
+            role=membership.role if membership is not None else "manager",
             tenant=tenant,
-            employee_id=membership.employee_id,
+            employee_id=membership.employee_id if membership is not None else None,
         )
         return await handler(event, data)
 
@@ -1951,9 +1965,11 @@ def build_client_router(
             query,
             "<b>Рабочие группы</b>\n\n"
             "1. Откройте нужную Telegram-группу.\n"
-            "2. Добавьте этого Ventrix-бота.\n"
-            "3. Разрешите читать сообщения и отправлять напоминания.\n"
-            "4. Вернитесь сюда и нажмите «Проверить подключение».\n\n"
+            "2. Добавьте этого Ventrix-бота и назначьте его администратором.\n"
+            "3. Оставьте боту право отправлять сообщения — так он сможет публиковать карточки и отчёты.\n"
+            "4. Отправьте в группе команду <code>/ventrix_connect</code>.\n"
+            "5. Вернитесь сюда и нажмите «Проверить подключение».\n\n"
+            "<i>Для приватной группы ссылка-приглашение не нужна: бот должен быть добавлен в участники напрямую. Одной пересланной ссылки недостаточно.</i>\n\n"
             + ("\n".join(lines) if lines else "Подключённых групп пока нет."),
             groups_markup(),
         )
@@ -1972,7 +1988,11 @@ def build_client_router(
                 try:
                     member = await query.bot.get_chat_member(item.telegram_chat_id, query.bot.id)
                     item.status = (
-                        "active" if member.status in {"member", "administrator"} else "revoked"
+                        "active"
+                        if member.status == "administrator"
+                        else "pending"
+                        if member.status == "member"
+                        else "revoked"
                     )
                     item.participants_count = await query.bot.get_chat_member_count(
                         item.telegram_chat_id
@@ -1983,29 +2003,86 @@ def build_client_router(
             await session.commit()
         await groups(query, client_context)
 
-    @router.my_chat_member()
-    async def group_membership(event: ChatMemberUpdated, client_context: ClientContext) -> None:
-        if event.chat.type not in {"group", "supergroup"}:
-            return
-        active = event.new_chat_member.status in {"member", "administrator"}
+    async def persist_group(
+        client_context: ClientContext,
+        *,
+        chat_id: int,
+        title: str,
+        active: bool,
+        participants_count: int | None = None,
+    ) -> GroupIntegration:
         async with events.session_factory() as session:
             row = await session.scalar(
                 select(GroupIntegration).where(
                     GroupIntegration.tenant_id == client_context.tenant_id,
-                    GroupIntegration.telegram_chat_id == event.chat.id,
+                    GroupIntegration.telegram_chat_id == chat_id,
                 )
             )
             if row is None:
                 row = GroupIntegration(
                     tenant_id=client_context.tenant_id,
                     bot_instance_id=client_context.bot_instance_id,
-                    telegram_chat_id=event.chat.id,
-                    title=event.chat.title or "Рабочая группа",
+                    telegram_chat_id=chat_id,
+                    title=title or "Рабочая группа",
                 )
                 session.add(row)
-            row.status = "active" if active else "revoked"
+            row.title = title or row.title
+            row.bot_instance_id = client_context.bot_instance_id
+            row.status = "active" if active else "pending"
+            row.participants_count = participants_count
             row.last_verified_at = datetime.now(UTC)
             await session.commit()
+            return row
+
+    @router.message(Command("ventrix_connect"), F.chat.type.in_({"group", "supergroup"}))
+    async def connect_group(message: Message, client_context: ClientContext) -> None:
+        member = await message.bot.get_chat_member(message.chat.id, message.bot.id)
+        is_admin = member.status == "administrator"
+        participants = await message.bot.get_chat_member_count(message.chat.id)
+        await persist_group(
+            client_context,
+            chat_id=message.chat.id,
+            title=message.chat.title or "Рабочая группа",
+            active=is_admin,
+            participants_count=participants,
+        )
+        if not is_admin:
+            await message.answer(
+                "Ventrix видит группу, но бот ещё не назначен администратором. "
+                "Назначьте его администратором с правом отправлять сообщения и повторите "
+                "<code>/ventrix_connect</code>."
+            )
+            return
+        await message.answer(
+            "✅ <b>Группа подключена к Ventrix.</b>\n\n"
+            "Теперь в Mini App можно включить карточки ситуаций и регулярные отчёты для этой группы."
+        )
+
+    @router.my_chat_member()
+    async def group_membership(event: ChatMemberUpdated, client_context: ClientContext) -> None:
+        if event.chat.type not in {"group", "supergroup"}:
+            return
+        is_present = event.new_chat_member.status in {"member", "administrator"}
+        is_admin = event.new_chat_member.status == "administrator"
+        participants = None
+        if is_present:
+            try:
+                participants = await event.bot.get_chat_member_count(event.chat.id)
+            except TelegramBadRequest:
+                pass
+        row = await persist_group(
+            client_context,
+            chat_id=event.chat.id,
+            title=event.chat.title or "Рабочая группа",
+            active=is_admin,
+            participants_count=participants,
+        )
+        if not is_present:
+            async with events.session_factory() as session:
+                stored = await session.get(GroupIntegration, row.id)
+                if stored is not None:
+                    stored.status = "revoked"
+                    await session.commit()
 
     @router.callback_query(F.data == "client:panel")
     async def panel(query: CallbackQuery, client_context: ClientContext) -> None:
