@@ -456,6 +456,8 @@ class TelegramConnection(StringPrimaryKeyMixin, TimestampMixin, Base):
     history_days: Mapped[int] = mapped_column(
         Integer, default=7, server_default="7", nullable=False
     )
+    response_sla_minutes_override: Mapped[int | None] = mapped_column(Integer)
+    signal_problem_threshold_override: Mapped[int | None] = mapped_column(Integer)
     selected_folder_id: Mapped[int | None] = mapped_column(Integer)
     selected_folder_ids: Mapped[list[int]] = mapped_column(
         JSON, default=list, server_default="[]", nullable=False
@@ -503,6 +505,16 @@ class TelegramConnection(StringPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint(
             "history_days BETWEEN 0 AND 180", name="ck_telegram_connections_history_days"
+        ),
+        CheckConstraint(
+            "response_sla_minutes_override IS NULL OR "
+            "response_sla_minutes_override BETWEEN 5 AND 1440",
+            name="ck_telegram_connections_sla_override",
+        ),
+        CheckConstraint(
+            "signal_problem_threshold_override IS NULL OR "
+            "signal_problem_threshold_override BETWEEN 0 AND 100",
+            name="ck_telegram_connections_problem_threshold_override",
         ),
         CheckConstraint(
             "progress_percent BETWEEN 0 AND 100", name="ck_telegram_connections_progress"

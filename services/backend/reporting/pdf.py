@@ -166,6 +166,22 @@ def build_report_pdf(
     )
     story.append(card_table)
 
+    narrative = sections.get("ai_narrative", {})
+    executive_summary = str(narrative.get("executive_summary") or "").strip()
+    if executive_summary:
+        story.append(Paragraph("Управленческий вывод", heading))
+        story.append(Paragraph(_text(executive_summary), body))
+    highlights = list(narrative.get("highlights") or [])[:8]
+    risks = list(narrative.get("risks") or [])[:8]
+    if highlights:
+        story.append(Paragraph("Главное за период", heading))
+        for item in highlights:
+            story.append(Paragraph(f"• {_text(str(item))}", body))
+    if risks:
+        story.append(Paragraph("Что требует внимания", heading))
+        for item in risks:
+            story.append(Paragraph(f"• {_text(str(item))}", body))
+
     company = sections.get("company_report", {})
     story.append(Paragraph("Итоги компании", heading))
     company_rows = [

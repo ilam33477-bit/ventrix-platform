@@ -81,6 +81,20 @@ export class VentrixClientApi {
     return this.request<TelegramConnection[]>("/connections");
   }
 
+  updateConnectionAnalysisSettings(
+    connectionId: string,
+    value: { response_sla_minutes: number; signal_problem_threshold: number },
+  ) {
+    return this.request<{
+      id: string;
+      response_sla_minutes: number;
+      signal_problem_threshold: number;
+    }>(`/connections/${connectionId}/analysis-settings`, {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    });
+  }
+
   groups() {
     return this.request<GroupIntegration[]>("/group-integrations");
   }

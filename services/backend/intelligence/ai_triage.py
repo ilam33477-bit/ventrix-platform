@@ -23,6 +23,7 @@ from ..models import (
     TenantAIFeedbackProfile,
     TenantSettings,
 )
+from .connection_settings import effective_connection_settings
 from .conversation_state import assess_conversation
 from .message_relevance import classify_message_relevance, dialogue_is_explicitly_closed
 from .notifications import NotificationOrchestrator
@@ -121,7 +122,7 @@ class AITriageService:
         if self.provider is None:
             raise RuntimeError("AI provider is not configured")
         signal_id = str(job.payload["signal_id"])
-        payload, signal, settings = await self._payload(signal_id, job.tenant_id)
+        payload, signal, settings, problem_threshold = await self._payload(signal_id, job.tenant_id)
         if signal.status in {"triaged", "problem_created", "history", "suppressed"}:
             return {"signal_id": signal.id, "status": signal.status, "deduplicated": True}
         relevance = classify_message_relevance(
@@ -201,7 +202,13 @@ class AITriageService:
             "completed",
             None,
         )
-        problem_id = await self._apply_result(signal.id, result, settings, repaired)
+        problem_id = await self._apply_result(
+            signal.id,
+            result,
+            settings,
+            repaired,
+            problem_threshold=problem_threshold,
+        )
         if not result.business_relevance or result.message_class in {
             "service",
             "advertising",
@@ -269,7 +276,7 @@ class AITriageService:
 
     async def _payload(
         self, signal_id: str, tenant_id: str | None
-    ) -> tuple[dict[str, object], Signal, TenantSettings]:
+    ) -> tuple[dict[str, object], Signal, TenantSettings, int]:
         async with self.session_factory() as session:
             signal = await session.scalar(
                 select(Signal).where(Signal.id == signal_id, Signal.tenant_id == tenant_id)
@@ -283,6 +290,12 @@ class AITriageService:
             )
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == signal.tenant_id)
+            )
+            effective = await effective_connection_settings(
+                session,
+                tenant_id=signal.tenant_id,
+                connection_id=signal.telegram_connection_id,
+                tenant_settings=settings,
             )
             messages = list(
                 await session.scalars(
@@ -356,7 +369,7 @@ class AITriageService:
                 }
                 for item in commitments
             ],
-            "sla_minutes": settings.response_sla_minutes,
+            "sla_minutes": effective.response_sla_minutes,
             "tenant_feedback": {
                 "same_type_reviewed": same_type_total,
                 "same_type_false_positives": same_type_false,
@@ -369,7 +382,7 @@ class AITriageService:
                 "guidance_version": feedback_profile.version if feedback_profile is not None else 0,
             },
         }
-        return payload, signal, settings
+        return payload, signal, settings, effective.signal_problem_threshold
 
     async def _enforce_budget(self, signal: Signal, settings: TenantSettings) -> None:
         if settings.ai_daily_hard_limit is None:
@@ -400,7 +413,14 @@ class AITriageService:
         result: TriageResult,
         settings: TenantSettings,
         repaired: bool,
+        problem_threshold: int | None = None,
     ) -> str | None:
+        effective_problem_threshold = (
+            problem_threshold
+            if problem_threshold is not None
+            else settings.signal_problem_threshold
+        )
+
         async def write(session: AsyncSession) -> str | None:
             signal = await session.get(Signal, signal_id)
             issue_family = result.issue_family or self._issue_family(result.category)
@@ -452,7 +472,7 @@ class AITriageService:
                 signal.status = "history"
                 return None
             signal.status = "triaged"
-            if result.criticality < settings.signal_problem_threshold:
+            if result.criticality < effective_problem_threshold:
                 return None
             if issue_family == "UNANSWERED_REQUEST":
                 # Only the durable deadline check may promote this candidate.
@@ -511,7 +531,9 @@ class AITriageService:
                     problem_type=problem_type,
                     issue_family=issue_family,
                     responsible_employee_id=signal.employee_id,
-                    priority=self._priority(result.criticality, settings),
+                    priority=self._priority(
+                        result.criticality, settings, effective_problem_threshold
+                    ),
                     confidence=result.criticality / 100,
                     evidence=(source.body_text or "")[:2000],
                     explanation=user_reason,
@@ -540,7 +562,9 @@ class AITriageService:
                 problem.signal_id = signal.id
                 problem.source_message_id = signal.source_message_id
                 problem.problem_type = problem_type
-                problem.priority = self._priority(result.criticality, settings)
+                problem.priority = self._priority(
+                    result.criticality, settings, effective_problem_threshold
+                )
                 problem.confidence = max(problem.confidence, result.confidence)
                 problem.evidence = (source.body_text or "")[:2000]
                 problem.explanation = user_reason
@@ -681,10 +705,17 @@ class AITriageService:
         }
 
     @staticmethod
-    def _priority(criticality: int, settings: TenantSettings) -> str:
+    def _priority(
+        criticality: int, settings: TenantSettings, problem_threshold: int | None = None
+    ) -> str:
+        effective_problem_threshold = (
+            problem_threshold
+            if problem_threshold is not None
+            else settings.signal_problem_threshold
+        )
         if criticality >= settings.signal_immediate_threshold:
             return "critical"
-        if criticality >= settings.signal_problem_threshold:
+        if criticality >= effective_problem_threshold:
             return "high"
         if criticality >= settings.signal_report_threshold:
             return "medium"

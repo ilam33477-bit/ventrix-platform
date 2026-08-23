@@ -183,6 +183,8 @@ export type TelegramConnection = {
   personal_dialogs?: number;
   new_contacts_today?: number;
   messages_today?: number;
+  response_sla_minutes: number;
+  signal_problem_threshold: number;
 };
 
 export type Employee = {

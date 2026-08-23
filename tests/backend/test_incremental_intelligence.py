@@ -587,6 +587,13 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     group_payload = next(item.payload_json for item in logs if item.destination_type == "group")
     assert group_payload["privacy_safe"] is True
     assert "Секретные условия" not in group_payload["text"]
+    group_buttons = [
+        button for row in group_payload["reply_markup"]["inline_keyboard"] for button in row
+    ]
+    group_system_button = next(
+        button for button in group_buttons if button["text"] == "Открыть в Ventrix AI"
+    )
+    assert group_system_button["url"].startswith("https://mini.example")
     manager_payload = next(item.payload_json for item in logs if item.destination_type == "manager")
     assert "Рабочий аккаунт:</b> @employee_account" in manager_payload["text"]
     assert "Контекст диалога" in manager_payload["text"]

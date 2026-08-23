@@ -260,6 +260,11 @@ class TelegramConnectionScope(BaseModel):
     personal_dialogs_consent: bool = False
 
 
+class TelegramConnectionAnalysisSettingsPatch(BaseModel):
+    response_sla_minutes: int = Field(ge=5, le=1440)
+    signal_problem_threshold: int = Field(ge=0, le=100)
+
+
 class TelegramSourcePreview(BaseModel):
     link: str = Field(min_length=5, max_length=500)
 
@@ -1579,6 +1584,9 @@ async def connections(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
+    settings = await session.scalar(
+        select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
+    )
     rows = list(
         await session.scalars(
             select(TelegramConnection)
@@ -1643,10 +1651,57 @@ async def connections(
                 "personal_dialogs": personal_dialogs,
                 "new_contacts_today": new_contacts_today,
                 "messages_today": messages_today,
+                "response_sla_minutes": (
+                    item.response_sla_minutes_override
+                    if item.response_sla_minutes_override is not None
+                    else settings.response_sla_minutes
+                ),
+                "signal_problem_threshold": (
+                    item.signal_problem_threshold_override
+                    if item.signal_problem_threshold_override is not None
+                    else settings.signal_problem_threshold
+                ),
                 **login_delivery_payload(item),
             }
         )
     return result
+
+
+@router.patch("/connections/{connection_id}/analysis-settings")
+async def update_connection_analysis_settings(
+    connection_id: str,
+    payload: TelegramConnectionAnalysisSettingsPatch,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, int | str]:
+    require_permission(context, "employees.manage")
+    connection = await session.scalar(
+        select(TelegramConnection).where(
+            TelegramConnection.id == connection_id,
+            TelegramConnection.tenant_id == context.tenant.id,
+            TelegramConnection.deleted_at.is_(None),
+        )
+    )
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Telegram connection not found")
+    connection.response_sla_minutes_override = payload.response_sla_minutes
+    connection.signal_problem_threshold_override = payload.signal_problem_threshold
+    await record_event(
+        session,
+        context,
+        "connection_analysis_settings_updated",
+        {
+            "connection_id": connection.id,
+            "response_sla_minutes": payload.response_sla_minutes,
+            "signal_problem_threshold": payload.signal_problem_threshold,
+        },
+    )
+    await session.commit()
+    return {
+        "id": connection.id,
+        "response_sla_minutes": payload.response_sla_minutes,
+        "signal_problem_threshold": payload.signal_problem_threshold,
+    }
 
 
 def login_delivery_payload(connection: TelegramConnection) -> dict[str, Any]:
@@ -1831,12 +1886,16 @@ async def complete_connection_login(
             # shared/owner connection is represented as an employee record so
             # problems, reports and group mentions never lose their owner.
             connection_user_id = getattr(connection, "telegram_user_id", None)
-            employee = await session.scalar(
-                select(Employee).where(
-                    Employee.tenant_id == context.tenant.id,
-                    Employee.telegram_user_id == connection_user_id,
+            employee = (
+                await session.scalar(
+                    select(Employee).where(
+                        Employee.tenant_id == context.tenant.id,
+                        Employee.telegram_user_id == connection_user_id,
+                    )
                 )
-            ) if connection_user_id else None
+                if connection_user_id
+                else None
+            )
             if employee is None:
                 employee = Employee(
                     tenant_id=context.tenant.id,

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..analysis.service import AnalysisPipelineService
 from ..bot.sqlite_storage import SQLiteFSMStorage
+from ..config import get_settings
 from ..database import SQLiteTransactionManager
 from ..models import (
     BackgroundJob,
@@ -120,6 +121,22 @@ class MaintenanceJobHandlers:
                 or (employee_section.data_json if employee_section else {}).get("rows")
                 or []
             )
+            narrative_section = await session.scalar(
+                select(ReportSection).where(
+                    ReportSection.report_id == report.id,
+                    ReportSection.section_key == "ai_narrative",
+                )
+            )
+            narrative = narrative_section.data_json if narrative_section else {}
+            period_kind = str(narrative.get("period_kind") or "ежедневный")
+            report_title = {
+                "ежедневный": "Ежедневная сводка",
+                "недельный": "Недельная сводка",
+                "месячный": "Месячная сводка",
+            }.get(period_kind, "Рабочая сводка")
+            executive_summary = escape(str(narrative.get("executive_summary") or report.summary))
+            highlights = [escape(str(item)) for item in list(narrative.get("highlights") or [])[:4]]
+            risks = [escape(str(item)) for item in list(narrative.get("risks") or [])[:4]]
             employee_blocks: list[str] = []
             for row in employee_rows[:8]:
                 open_tasks = int(row.get("open_promises", 0)) + int(row.get("clients_waiting", 0))
@@ -171,8 +188,9 @@ class MaintenanceJobHandlers:
             no_activity = int(metrics.get("messages", 0)) == 0
             partial_analysis = bool(metrics.get("analysis_partial", 0))
             text = (
-                f"📊 <b>Ежедневная сводка · {escape(tenant.name)}</b>\n"
+                f"📊 <b>{report_title} · {escape(tenant.name)}</b>\n"
                 f"{report.period_start:%d.%m.%Y} — {report.period_end:%d.%m.%Y}\n\n"
+                f"{executive_summary}\n\n"
                 "<blockquote>"
                 f"Сообщений изучено: <b>{int(metrics.get('messages', 0))}</b>\n"
                 f"Рабочих ситуаций: <b>{int(metrics.get('problems', 0))}</b>\n"
@@ -187,6 +205,20 @@ class MaintenanceJobHandlers:
                 + (
                     "Часть переписок будет перепроверена автоматически в следующем цикле.\n\n"
                     if partial_analysis
+                    else ""
+                )
+                + (
+                    "<b>Главное за период</b>\n"
+                    + "\n".join(f"• {item}" for item in highlights)
+                    + "\n\n"
+                    if highlights
+                    else ""
+                )
+                + (
+                    "<b>Что требует внимания</b>\n"
+                    + "\n".join(f"• {item}" for item in risks)
+                    + "\n\n"
+                    if risks
                     else ""
                 )
                 + (
@@ -219,6 +251,11 @@ class MaintenanceJobHandlers:
                 ("group", str(group.telegram_chat_id), group.id) for group in groups
             )
             queued: list[tuple[str, str]] = []
+            mini_app_url = get_settings().client_mini_app_url
+            report_url = None
+            if mini_app_url:
+                separator = "&" if "?" in mini_app_url else "?"
+                report_url = f"{mini_app_url}{separator}section=reports&report_id={report.id}"
             for destination_type, destination_id, group_id in destinations:
                 dedup = f"report:{report.id}:{destination_type}:{destination_id}"
                 existing = await session.scalar(
@@ -240,8 +277,12 @@ class MaintenanceJobHandlers:
                                 "inline_keyboard": [
                                     [
                                         {
-                                            "text": "Открыть отчёты",
-                                            "callback_data": "client:reports",
+                                            "text": "Открыть в Ventrix AI",
+                                            **(
+                                                {"url": report_url}
+                                                if report_url
+                                                else {"callback_data": "client:reports"}
+                                            ),
                                         }
                                     ]
                                 ]

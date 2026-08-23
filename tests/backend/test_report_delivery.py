@@ -89,6 +89,20 @@ async def test_report_delivery_uses_notification_pool_and_deduplicates_log(
                 },
             )
         )
+        session.add(
+            ReportSection(
+                tenant_id=tenant.id,
+                report_id=report.id,
+                section_key="ai_narrative",
+                position=3,
+                data_json={
+                    "period_kind": "недельный",
+                    "executive_summary": "Команда отвечала быстрее прошлого периода.",
+                    "highlights": ["Мария подтвердила один созвон."],
+                    "risks": ["Два клиента всё ещё ждут ответа."],
+                },
+            )
+        )
         await session.commit()
 
     queue = RecordingQueue()
@@ -122,7 +136,9 @@ async def test_report_delivery_uses_notification_pool_and_deduplicates_log(
         assert await session.scalar(select(func.count(NotificationLog.id))) == 1
         notification = await session.scalar(select(NotificationLog))
         text = notification.payload_json["text"]
-        assert "Ежедневная сводка" in text
+        assert "Недельная сводка" in text
+        assert "Команда отвечала быстрее" in text
+        assert "Мария подтвердила один созвон" in text
         assert "Мария" in text
         assert notification.payload_json["report_id"] == report.id
 

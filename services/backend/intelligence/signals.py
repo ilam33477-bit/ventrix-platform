@@ -23,6 +23,7 @@ from ..models import (
     TelegramMessage,
     TenantSettings,
 )
+from .connection_settings import effective_connection_settings
 from .conversation_state import ConversationAssessment, assess_conversation
 from .local_signals import LocalSignalCandidate, LocalSignalEngine
 from .message_relevance import classify_message_relevance
@@ -133,6 +134,12 @@ class SignalService:
         settings = await session.scalar(
             select(TenantSettings).where(TenantSettings.tenant_id == message.tenant_id)
         )
+        effective = await effective_connection_settings(
+            session,
+            tenant_id=message.tenant_id,
+            connection_id=message.connection_id,
+            tenant_settings=settings,
+        )
         dialog = await session.get(TelegramDialog, message.dialog_id)
         relevance = classify_message_relevance(
             message.body_text,
@@ -150,7 +157,7 @@ class SignalService:
                     message,
                     [],
                     None,
-                    settings.response_sla_minutes,
+                    effective.response_sla_minutes,
                     assessment,
                 )
             else:
@@ -160,7 +167,7 @@ class SignalService:
         candidates = self.engine.scan(
             message,
             previous,
-            response_sla_minutes=settings.response_sla_minutes,
+            response_sla_minutes=effective.response_sla_minutes,
             timezone=settings.timezone,
         )
         protected = [
@@ -204,7 +211,7 @@ class SignalService:
                 message,
                 [],
                 None,
-                settings.response_sla_minutes,
+                effective.response_sla_minutes,
                 assessment,
             )
             return []
@@ -301,7 +308,7 @@ class SignalService:
             message,
             candidates,
             employee_id,
-            settings.response_sla_minutes,
+            effective.response_sla_minutes,
             assessment,
         )
         return created
@@ -380,7 +387,7 @@ class SignalService:
             }
         job_ids: list[str] = []
         for signal in signals:
-            settings, threshold = await self._triage_policy(signal)
+            settings, threshold, problem_threshold = await self._triage_policy(signal)
             if (signal.metadata_json or {}).get("fast_lane"):
                 await self.notifications.plan_for_signal(signal.id)
             if signal.local_score < threshold:
@@ -389,7 +396,7 @@ class SignalService:
                 JOB_PRIORITY["P0"]
                 if signal.local_score >= settings.signal_immediate_threshold
                 else JOB_PRIORITY["P1"]
-                if signal.local_score >= settings.signal_problem_threshold
+                if signal.local_score >= problem_threshold
                 else JOB_PRIORITY["P2"]
             )
             source = source_messages.get(signal.source_message_id)
@@ -477,10 +484,16 @@ class SignalService:
                 return rule
         return None
 
-    async def _triage_policy(self, signal: Signal) -> tuple[TenantSettings, int]:
+    async def _triage_policy(self, signal: Signal) -> tuple[TenantSettings, int, int]:
         async with self.session_factory() as session:
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == signal.tenant_id)
+            )
+            effective = await effective_connection_settings(
+                session,
+                tenant_id=signal.tenant_id,
+                connection_id=signal.telegram_connection_id,
+                tenant_settings=settings,
             )
             threshold = settings.signal_report_threshold
             if settings.ai_daily_soft_limit:
@@ -498,8 +511,8 @@ class SignalService:
                     )
                 )
                 if used >= settings.ai_daily_soft_limit:
-                    threshold = settings.signal_problem_threshold
-            return settings, threshold
+                    threshold = effective.signal_problem_threshold
+            return settings, threshold, effective.signal_problem_threshold
 
     @staticmethod
     async def _employee_id(session: AsyncSession, message: TelegramMessage) -> str | None:

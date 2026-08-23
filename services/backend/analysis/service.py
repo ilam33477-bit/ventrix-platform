@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from datetime import UTC, datetime, timedelta
@@ -188,6 +189,7 @@ class AnalysisPipelineService:
             system_prompt=SYSTEM_PROMPT,
         )
         self.token_budget = token_budget
+        self.report_model = fast_model
 
     async def pipeline(self, job: JobLease) -> dict[str, Any]:
         if job.tenant_id is None:
@@ -883,7 +885,16 @@ class AnalysisPipelineService:
         async with self.session_factory() as session:
             run = await session.get(AnalysisRun, run_id)
             history_window_days = int((run.metrics_json or {}).get("history_window_days", 30))
-            period_start = self._aware(run.started_at) - timedelta(days=history_window_days)
+            report_window_days = (
+                30
+                if run.trigger == "manual_month"
+                else 7
+                if run.trigger == "manual_week"
+                else 1
+                if run.trigger == "scheduled"
+                else history_window_days
+            )
+            period_start = self._aware(run.started_at) - timedelta(days=report_window_days)
             monitored_dialog_ids = select(TelegramDialog.id).where(
                 TelegramDialog.tenant_id == run.tenant_id,
                 TelegramDialog.selected.is_(True),
@@ -952,8 +963,7 @@ class AnalysisPipelineService:
                     select(func.count(TelegramMessage.id)).where(
                         TelegramMessage.tenant_id == run.tenant_id,
                         TelegramMessage.dialog_id.in_(monitored_dialog_ids),
-                        TelegramMessage.sent_at
-                        >= run.started_at - timedelta(days=history_window_days),
+                        TelegramMessage.sent_at >= period_start,
                     )
                 )
             )
@@ -984,9 +994,13 @@ class AnalysisPipelineService:
             )
         batches = await self._batches(run_id)
         dialog_outcomes: dict[str, list[dict[str, Any]]] = {}
+        dialog_summaries: dict[str, str] = {}
         for batch in batches:
             for result in (batch.result_json or {}).get("dialog_results", []):
                 dialog_id = str(result.get("chat_id") or "")
+                summary = str(result.get("summary") or "").strip()
+                if summary:
+                    dialog_summaries[dialog_id] = summary
                 dialog_outcomes.setdefault(dialog_id, []).extend(
                     list(result.get("business_outcomes") or [])
                 )
@@ -1070,6 +1084,28 @@ class AnalysisPipelineService:
             "analysis_partial": int(run.failed_batches > 0),
             "failed_analysis_batches": int(run.failed_batches),
         }
+        narrative, narrative_usage, narrative_duration_ms = await self._report_narrative(
+            trigger=run.trigger,
+            history_window_days=report_window_days,
+            period_start=period_start,
+            period_end=period_end,
+            metrics=metrics,
+            employee_rows=list(employee_report.get("employees") or []),
+            important_dialogs=list(important_dialogs.get("rows") or []),
+            dialog_summaries=[
+                {
+                    "dialog": (
+                        f"@{dialog_by_id[dialog_id].username}"
+                        if dialog_id in dialog_by_id and dialog_by_id[dialog_id].username
+                        else dialog_by_id[dialog_id].title
+                        if dialog_id in dialog_by_id
+                        else "Диалог"
+                    ),
+                    "summary": summary,
+                }
+                for dialog_id, summary in list(dialog_summaries.items())[:40]
+            ],
+        )
 
         async def write(session: AsyncSession) -> str | None:
             current = await session.get(AnalysisRun, run_id)
@@ -1079,17 +1115,33 @@ class AnalysisPipelineService:
             if due_at is not None and due_at.tzinfo is None:
                 due_at = due_at.replace(tzinfo=UTC)
             delayed = due_at is not None and now > due_at
-            duplicate = await session.scalar(
-                select(Report)
-                .where(
-                    Report.tenant_id == current.tenant_id,
-                    Report.summary
-                    == f"Обработано сообщений: {metrics['messages']}. Проблем: {metrics['problems']}.",
-                    Report.period_end >= now - timedelta(minutes=15),
+            recent_reports = list(
+                await session.scalars(
+                    select(Report)
+                    .join(AnalysisRun, AnalysisRun.id == Report.analysis_run_id)
+                    .where(
+                        Report.tenant_id == current.tenant_id,
+                        Report.period_end >= now - timedelta(minutes=15),
+                        AnalysisRun.trigger == current.trigger,
+                    )
+                    .order_by(Report.period_end.desc())
+                    .limit(10)
                 )
-                .order_by(Report.period_end.desc())
-                .limit(1)
             )
+            duplicate = None
+            for recent_report in recent_reports:
+                recent_metrics = {
+                    item.metric_key: int(item.numeric_value)
+                    for item in await session.scalars(
+                        select(ReportMetric).where(ReportMetric.report_id == recent_report.id)
+                    )
+                }
+                if (
+                    recent_metrics.get("messages") == metrics["messages"]
+                    and recent_metrics.get("problems") == metrics["problems"]
+                ):
+                    duplicate = recent_report
+                    break
             suppress_reason = None
             if report is None and duplicate is not None:
                 suppress_reason = "equivalent_report_already_created"
@@ -1099,12 +1151,12 @@ class AnalysisPipelineService:
                         tenant_id=current.tenant_id,
                         analysis_run_id=current.id,
                         status="ready",
-                        period_start=current.started_at - timedelta(days=history_window_days),
+                        period_start=current.started_at - timedelta(days=report_window_days),
                         period_end=now,
                         due_at=current.report_due_at,
                         ready_at=now,
                         delivery_status="pending",
-                        summary=f"Обработано сообщений: {metrics['messages']}. Проблем: {metrics['problems']}.",
+                        summary=str(narrative["executive_summary"])[:2000],
                     )
                     session.add(report)
                     await session.flush()
@@ -1115,6 +1167,7 @@ class AnalysisPipelineService:
                     "company_report": company_report,
                     "business_performance": business_performance,
                     "important_dialogs": important_dialogs,
+                    "ai_narrative": narrative,
                     "recommendations": {
                         "items": [item.recommended_action for item in problems[:20]]
                     },
@@ -1147,6 +1200,22 @@ class AnalysisPipelineService:
                         )
                     )
                 if report:
+                    if narrative_usage:
+                        input_tokens = int(narrative_usage.get("input_tokens", 0))
+                        output_tokens = int(narrative_usage.get("output_tokens", 0))
+                        session.add(
+                            AIUsageCall(
+                                tenant_id=current.tenant_id,
+                                model=self.report_model,
+                                job_type="report_narrative",
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                duration_ms=narrative_duration_ms,
+                                status="completed",
+                            )
+                        )
+                        current.input_tokens += input_tokens
+                        current.output_tokens += output_tokens
                     session.add(
                         ReportGenerationRun(
                             tenant_id=current.tenant_id,
@@ -1233,6 +1302,82 @@ class AnalysisPipelineService:
             "metrics": metrics,
             "report_suppressed": report_id is None,
         }
+
+    async def _report_narrative(
+        self,
+        *,
+        trigger: str,
+        history_window_days: int,
+        period_start: datetime,
+        period_end: datetime,
+        metrics: dict[str, int],
+        employee_rows: list[dict[str, Any]],
+        important_dialogs: list[dict[str, Any]],
+        dialog_summaries: list[dict[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, int], int]:
+        period_kind = (
+            "месячный"
+            if history_window_days >= 30
+            else "недельный"
+            if history_window_days >= 7
+            else "ежедневный"
+        )
+        fallback = {
+            "period_kind": period_kind,
+            "executive_summary": (
+                f"За период изучено {metrics['messages']} сообщений. "
+                f"Рабочих ситуаций: {metrics['problems']}. "
+                + (
+                    "Критичных изменений не обнаружено, мониторинг продолжается."
+                    if not metrics["high"]
+                    else f"Ситуаций высокого приоритета: {metrics['high']}."
+                )
+            ),
+            "highlights": [],
+            "risks": [],
+            "employee_notes": [],
+            "dialog_notes": [],
+            "recommendations": [],
+        }
+        if self.provider is None or metrics["messages"] == 0:
+            return fallback, {}, 0
+        payload = {
+            "report_type": period_kind,
+            "trigger": trigger,
+            "period": {"start": period_start.isoformat(), "end": period_end.isoformat()},
+            "metrics": metrics,
+            "employees": employee_rows[:30],
+            "important_dialogs": important_dialogs[:20],
+            "dialog_summaries": dialog_summaries[:40],
+        }
+        prompt = """Составь профессиональную управленческую сводку Ventrix на русском языке. Верни только JSON: {"executive_summary":"...","highlights":["..."],"risks":["..."],"employee_notes":[{"employee_id":"...","name":"...","summary":"..."}],"dialog_notes":[{"dialog":"@username или название","summary":"..."}],"recommendations":["..."]}. Используй только факты из payload. Не выдумывай продажи, суммы, созвоны, рабочее время или причины. Указывай usernames, даты, динамику среднего времени ответа, подтверждённые созвоны и продажи только когда они явно есть во входных данных. Пиши простым деловым языком. Для недельного отчёта дай сравнительную управленческую картину, для месячного — более широкие тенденции, для ежедневного — короткие итоги дня. Не упоминай токены, модели и внутренние технические метрики."""
+        started = time.perf_counter()
+        try:
+            raw, usage = await self.provider.generate_json(
+                model=self.report_model,
+                system_prompt=prompt,
+                payload=payload,
+                max_tokens=1800,
+            )
+            normalized = raw.strip()
+            if normalized.startswith("```"):
+                normalized = re.sub(
+                    r"^```(?:json)?\s*|\s*```$", "", normalized, flags=re.IGNORECASE
+                )
+            parsed = json.loads(normalized)
+            if (
+                not isinstance(parsed, dict)
+                or not str(parsed.get("executive_summary") or "").strip()
+            ):
+                raise ValueError("invalid report narrative")
+            narrative = {
+                **fallback,
+                **{key: parsed.get(key, fallback[key]) for key in fallback if key != "period_kind"},
+            }
+            narrative["period_kind"] = period_kind
+            return narrative, usage, int((time.perf_counter() - started) * 1000)
+        except Exception:  # noqa: BLE001 - report creation must survive an optional narrative failure
+            return fallback, {}, int((time.perf_counter() - started) * 1000)
 
     @staticmethod
     def _employee_report(

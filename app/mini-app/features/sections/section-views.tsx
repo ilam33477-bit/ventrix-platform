@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type * as React from "react";
 
 import type { VentrixClientApi } from "../../api/client";
@@ -52,6 +52,8 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
       detail.sections.find((item) => item.key === "client_report")?.data ?? {};
     const recommendations =
       detail.sections.find((item) => item.key === "recommendations")?.data ?? {};
+    const narrative =
+      detail.sections.find((item) => item.key === "ai_narrative")?.data ?? {};
     const headlineMetrics = reportMetrics(detail, company);
     return (
       <section className="report-detail-view">
@@ -73,6 +75,7 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
             ))}
           </div>
         )}
+        <ReportNarrative value={narrative} />
         <div className="report-detail-grid">
           <Card className="report-summary-panel">
             <h3>Компания</h3>
@@ -147,6 +150,21 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
       )}
       {(error || detailError) && <div className="inline-error"><p>{detailError || error}</p><Button onClick={() => void reload()}>Повторить</Button></div>}
     </section>
+  );
+}
+
+function ReportNarrative({ value }: { value: Record<string, unknown> }) {
+  const highlights = Array.isArray(value.highlights) ? value.highlights : [];
+  const risks = Array.isArray(value.risks) ? value.risks : [];
+  const employeeNotes = Array.isArray(value.employee_notes) ? value.employee_notes as Array<Record<string, unknown>> : [];
+  if (!highlights.length && !risks.length && !employeeNotes.length) return null;
+  return (
+    <Card className="report-list-panel report-narrative-panel">
+      <header><div><h3>Управленческий вывод</h3><p>Факты и наблюдения по рабочим перепискам за период.</p></div></header>
+      {highlights.length > 0 && <div><strong>Главное</strong><ul>{highlights.map((item, index) => <li key={`h-${index}`}>{String(item)}</li>)}</ul></div>}
+      {risks.length > 0 && <div><strong>Требует внимания</strong><ul>{risks.map((item, index) => <li key={`r-${index}`}>{String(item)}</li>)}</ul></div>}
+      {employeeNotes.length > 0 && <div><strong>По сотрудникам</strong><ul>{employeeNotes.map((item, index) => <li key={String(item.employee_id ?? index)}><b>{String(item.name ?? "Сотрудник")}:</b> {String(item.summary ?? "")}</li>)}</ul></div>}
+    </Card>
   );
 }
 
@@ -379,6 +397,14 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
                 <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
                 {connection?.last_sync_at && <span><small>Синхронизация</small><strong>{formatRelativeDate(connection.last_sync_at)}</strong></span>}
               </div>
+              {connection && (
+                <ConnectionAnalysisControls
+                  key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
+                  responseMinutes={connection.response_sla_minutes}
+                  problemThreshold={connection.signal_problem_threshold}
+                  onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
+                />
+              )}
               <div
                 className={`employee-actions ${deleting === item.id ? "" : "single-action"}`}
               >
@@ -417,6 +443,98 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
       )}
       {error && <div className="inline-error"><p>{error}</p><Button onClick={() => void reload()}>Повторить</Button></div>}
     </>
+  );
+}
+
+function ConnectionAnalysisControls({
+  responseMinutes: initialResponseMinutes,
+  problemThreshold: initialProblemThreshold,
+  onCommit,
+}: {
+  responseMinutes: number;
+  problemThreshold: number;
+  onCommit: (value: {
+    response_sla_minutes: number;
+    signal_problem_threshold: number;
+  }) => Promise<unknown>;
+}) {
+  const [responseMinutes, setResponseMinutes] = useState(initialResponseMinutes);
+  const [problemThreshold, setProblemThreshold] = useState(initialProblemThreshold);
+  const [saved, setSaved] = useState({
+    responseMinutes: initialResponseMinutes,
+    problemThreshold: initialProblemThreshold,
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setResponseMinutes(initialResponseMinutes);
+    setProblemThreshold(initialProblemThreshold);
+    setSaved({ responseMinutes: initialResponseMinutes, problemThreshold: initialProblemThreshold });
+  }, [initialProblemThreshold, initialResponseMinutes]);
+
+  async function commit() {
+    if (
+      saving ||
+      (responseMinutes === saved.responseMinutes && problemThreshold === saved.problemThreshold)
+    ) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onCommit({
+        response_sla_minutes: responseMinutes,
+        signal_problem_threshold: problemThreshold,
+      });
+      setSaved({ responseMinutes, problemThreshold });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Не удалось сохранить настройки");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const sliderEvents = {
+    onPointerUp: () => void commit(),
+    onBlur: () => void commit(),
+    onKeyUp: (event: React.KeyboardEvent<HTMLInputElement>) => {
+      if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commit();
+    },
+  };
+  return (
+    <div className="connection-analysis-controls" aria-label="Настройки анализа сессии">
+      <label>
+        <span><strong>Время на ответ</strong><b>{responseMinutes} мин.</b></span>
+        <small>Когда отсутствие ответа становится рабочей ситуацией для этой сессии.</small>
+        <input
+          type="range"
+          min="15"
+          max="180"
+          step="15"
+          value={responseMinutes}
+          disabled={saving}
+          style={{ "--range-progress": `${((responseMinutes - 15) / 165) * 100}%` } as React.CSSProperties}
+          onChange={(event) => setResponseMinutes(Number(event.target.value))}
+          {...sliderEvents}
+        />
+      </label>
+      <label>
+        <span><strong>Порог создания ситуации</strong><b>{problemThreshold}/100</b></span>
+        <small>Чем выше значение, тем строже Ventrix отсеивает сомнительные случаи.</small>
+        <input
+          type="range"
+          min="30"
+          max="95"
+          value={problemThreshold}
+          disabled={saving}
+          style={{ "--range-progress": `${((problemThreshold - 30) / 65) * 100}%` } as React.CSSProperties}
+          onChange={(event) => setProblemThreshold(Number(event.target.value))}
+          {...sliderEvents}
+        />
+      </label>
+      <div className="connection-analysis-status" aria-live="polite">
+        {error ? <span className="error-text">{error}</span> : saving ? "Сохраняем…" : "Настройки применяются только к этой сессии"}
+      </div>
+    </div>
   );
 }
 

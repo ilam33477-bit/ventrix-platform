@@ -21,6 +21,7 @@ from ..models import (
     TelegramMessage,
     TenantSettings,
 )
+from .connection_settings import effective_connection_settings
 from .conversation_state import assess_conversation
 from .message_relevance import classify_message_relevance
 from .notifications import NotificationOrchestrator
@@ -356,6 +357,12 @@ class ReconciliationService:
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == job.tenant_id)
             )
+            effective = await effective_connection_settings(
+                session,
+                tenant_id=job.tenant_id,
+                connection_id=source.connection_id,
+                tenant_settings=settings,
+            )
             actual_deadline = self._aware(state.next_sla_check_at)
             configured_minutes = max(
                 1,
@@ -377,8 +384,8 @@ class ReconciliationService:
                     source_message_id=source.id,
                     fingerprint=fingerprint,
                     signal_type="client_without_answer",
-                    local_score=settings.signal_problem_threshold,
-                    criticality=settings.signal_problem_threshold,
+                    local_score=effective.signal_problem_threshold,
+                    criticality=effective.signal_problem_threshold,
                     status="problem_created",
                     reason=(
                         f"Клиент ждёт ответа {waited_minutes} мин. "
@@ -552,10 +559,16 @@ class ReconciliationService:
             settings = await session.scalar(
                 select(TenantSettings).where(TenantSettings.tenant_id == commitment.tenant_id)
             )
+            effective = await effective_connection_settings(
+                session,
+                tenant_id=commitment.tenant_id,
+                connection_id=commitment.connection_id,
+                tenant_settings=settings,
+            )
             delay_minutes = max(
                 1, int((now - self._aware(commitment.deadline_at)).total_seconds() // 60)
             )
-            criticality = min(100, settings.signal_problem_threshold + delay_minutes // 15)
+            criticality = min(100, effective.signal_problem_threshold + delay_minutes // 15)
             fingerprint = hashlib.sha256(f"overdue:{commitment.fingerprint}".encode()).hexdigest()
             signal = await session.scalar(select(Signal).where(Signal.fingerprint == fingerprint))
             if signal is None:

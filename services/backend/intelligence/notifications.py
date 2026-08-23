@@ -216,13 +216,9 @@ class NotificationOrchestrator:
                 group=None,
                 now=datetime.now(UTC),
             )
-            destinations: list[
-                tuple[str, str, str | None, GroupIntegration | None]
-            ] = []
+            destinations: list[tuple[str, str, str | None, GroupIntegration | None]] = []
             if decision.notify_employee and employee and employee.telegram_user_id:
-                destinations.append(
-                    ("employee", str(employee.telegram_user_id), employee.id, None)
-                )
+                destinations.append(("employee", str(employee.telegram_user_id), employee.id, None))
             if decision.notify_manager:
                 destinations.append(("manager", str(tenant.owner_telegram_user_id), None, None))
             groups = list(
@@ -245,7 +241,12 @@ class NotificationOrchestrator:
                 )
                 if group_decision.notify_group:
                     destinations.append(
-                        ("group", str(group.telegram_chat_id), employee.id if employee else None, group)
+                        (
+                            "group",
+                            str(group.telegram_chat_id),
+                            employee.id if employee else None,
+                            group,
+                        )
                     )
 
         notification_ids: list[str] = []
@@ -466,15 +467,25 @@ class NotificationOrchestrator:
                         ]
                     )
             mini_app_url = get_settings().client_mini_app_url
-            if current_problem and mini_app_url and not is_group:
+            if current_problem and mini_app_url:
                 separator = "&" if "?" in mini_app_url else "?"
                 rows.append(
                     [
                         {
-                            "text": "Посмотреть в системе",
-                            "web_app": {
-                                "url": f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
-                            },
+                            "text": (
+                                "Открыть в Ventrix AI" if is_group else "Посмотреть в системе"
+                            ),
+                            **(
+                                {
+                                    "url": f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
+                                }
+                                if is_group
+                                else {
+                                    "web_app": {
+                                        "url": f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
+                                    }
+                                }
+                            ),
                         }
                     ]
                 )
