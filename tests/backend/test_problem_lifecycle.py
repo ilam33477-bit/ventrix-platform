@@ -311,6 +311,21 @@ async def test_remediation_verifier_does_not_treat_acknowledgement_as_fix(
     assert strong.outcome == "fixed"
     assert strong.confidence >= verifier.auto_close_confidence
 
+    problem.problem_type = "commercial_opportunity"
+    commercial_reply = TelegramMessage(
+        tenant_id=problem.tenant_id,
+        connection_id=connection.id,
+        dialog_id=dialog.id,
+        telegram_message_id=source.telegram_message_id + 3,
+        sent_at=datetime.now(UTC),
+        outgoing=True,
+        body_text="Рассказываю, как работает сервис, и отправляю ссылку на тестовый доступ.",
+        attachments_json=[],
+    )
+    handled = await verifier.verify(problem, [commercial_reply])
+    assert handled.outcome == "fixed"
+    assert handled.confidence >= verifier.auto_close_confidence
+
 
 @pytest.mark.asyncio
 async def test_assigned_problem_can_be_marked_false_positive(

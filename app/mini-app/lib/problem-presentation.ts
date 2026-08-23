@@ -28,6 +28,7 @@ const PROBLEM_TYPE_LABELS: Record<string, string> = {
   churn_risk: "Риск потери клиента",
   conflict: "Конфликт в переписке",
   task_risk: "Рабочая задача под риском",
+  commercial_opportunity: "Коммерческая возможность",
   operational_risk: "Рабочая ситуация требует внимания",
 };
 

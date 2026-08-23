@@ -73,11 +73,15 @@ export function MiniAppShell({ auth, access, active, onNavigate, canGoBack, onBa
     profileOpener.current = document.activeElement as HTMLElement | null;
     setProfileOpen(true);
   };
+  const canManageProject = auth.permissions.includes("*") || auth.permissions.includes("settings.manage");
+  const visibleSections = allSections.filter((item) =>
+    canManageProject || !["connections", "groups", "settings"].includes(item.id),
+  );
   return <main className="mini-app-shell">
     <aside className="mini-sidebar">
       <div className="mini-brand"><span>V</span><strong>Ventrix</strong></div>
       <small>ПРОЕКТ</small><h2>{auth.tenant_name}</h2>
-      <nav>{allSections.map((item) => <button key={item.id} className={active === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><Icon name={item.icon} />{item.label}</button>)}</nav>
+      <nav>{visibleSections.map((item) => <button key={item.id} className={active === item.id ? "active" : ""} onClick={() => onNavigate(item.id)}><Icon name={item.icon} />{item.label}</button>)}</nav>
       <button className="mini-user" onClick={openProfile}><span>{initials}</span><div><strong>{userName}</strong><small>{auth.user.username ? `@${auth.user.username}` : auth.user.role}</small></div></button>
     </aside>
     <section className="mini-content">
@@ -87,7 +91,7 @@ export function MiniAppShell({ auth, access, active, onNavigate, canGoBack, onBa
     <nav className="mini-bottom-nav" aria-label="Основная навигация">
       {primaryTabs.map((item) => <button key={item.id} className={active === item.id || (item.id === "more" && !primaryTabs.some((tab) => tab.id === active)) ? "active" : ""} onClick={() => onNavigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}
     </nav>
-    {profileOpen && <div className="profile-overlay" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setProfileOpen(false)}><section className="profile-sheet" role="dialog" aria-modal="true" aria-labelledby="profile-title" ref={profileRef}><header><div className="profile-identity"><span>{initials}</span><div><h2 id="profile-title">{userName}</h2><p>{auth.user.username ? `@${auth.user.username}` : "Username не указан"}</p></div></div><IconButton label="Закрыть профиль" onClick={() => setProfileOpen(false)}><Icon name="close" /></IconButton></header><div className={`access-card ${accessState.tone}`}><StatusBadge tone={accessState.tone}>{accessState.label}</StatusBadge><strong>{accessState.title}</strong><p>{accessState.description}</p></div><div className="profile-facts"><span><small>Роль в проекте</small><strong>{roleLabel(auth.user.role)}</strong></span><span><small>Мониторинг</small><strong>{access.analysis_enabled ? "Работает" : "Приостановлен"}</strong></span></div><div className="profile-theme"><h3>Тема</h3><SegmentedControl label="Тема интерфейса" value={theme} onChange={chooseTheme} options={[{ value: "light", label: "Светлая" }, { value: "dark", label: "Тёмная" }, { value: "telegram", label: "Telegram" }]} /></div><button className="profile-settings" onClick={openSettings}><Icon name="settings" /><span><strong>Настройки</strong><small>Расписание, уведомления и чувствительность</small></span></button></section></div>}
+    {profileOpen && <div className="profile-overlay" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setProfileOpen(false)}><section className="profile-sheet" role="dialog" aria-modal="true" aria-labelledby="profile-title" ref={profileRef}><header><div className="profile-identity"><span>{initials}</span><div><h2 id="profile-title">{userName}</h2><p>{auth.user.username ? `@${auth.user.username}` : "Username не указан"}</p></div></div><IconButton label="Закрыть профиль" onClick={() => setProfileOpen(false)}><Icon name="close" /></IconButton></header><div className={`access-card ${accessState.tone}`}><StatusBadge tone={accessState.tone}>{accessState.label}</StatusBadge><strong>{accessState.title}</strong><p>{accessState.description}</p></div><div className="profile-facts"><span><small>Роль в проекте</small><strong>{roleLabel(auth.user.role)}</strong></span><span><small>Мониторинг</small><strong>{access.analysis_enabled ? "Работает" : "Приостановлен"}</strong></span></div><div className="profile-theme"><h3>Тема</h3><SegmentedControl label="Тема интерфейса" value={theme} onChange={chooseTheme} options={[{ value: "light", label: "Светлая" }, { value: "dark", label: "Тёмная" }, { value: "telegram", label: "Telegram" }]} /></div>{canManageProject && <button className="profile-settings" onClick={openSettings}><Icon name="settings" /><span><strong>Настройки</strong><small>Расписание регулярных отчётов</small></span></button>}</section></div>}
   </main>;
 }
 

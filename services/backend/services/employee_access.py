@@ -78,9 +78,12 @@ async def sync_employee_membership(
         membership.role = employee.role
         membership.status = employee.status
     await session.execute(delete(Permission).where(Permission.membership_id == membership.id))
+    permissions = set(ROLE_PERMISSIONS[employee.role])
+    if employee.reports_access_all:
+        permissions.add("reports.read")
     session.add_all(
         Permission(tenant_id=employee.tenant_id, membership_id=membership.id, permission=permission)
-        for permission in ROLE_PERMISSIONS[employee.role]
+        for permission in permissions
     )
     return membership
 

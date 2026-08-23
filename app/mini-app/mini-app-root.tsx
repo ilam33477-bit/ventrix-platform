@@ -59,11 +59,11 @@ export function MiniAppRoot() {
       case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
       case "statistics": return <StatisticsView api={api} summary={session.auth.dashboard_summary} />;
       case "reports": return <ReportsView api={api} />;
-      case "employees": return <EmployeesView api={api} />;
+      case "employees": return <EmployeesView api={api} canManage={session.auth.permissions.includes("*") || session.auth.permissions.includes("employees.manage")} onOpenGroups={() => navigate("groups")} />;
       case "connections": return <ConnectionManager api={api} connections={session.bootstrap.connections} />;
       case "groups": return <GroupsView api={api} />;
       case "settings": return <SettingsView api={api} />;
-      case "more": return <MoreView onNavigate={navigate} />;
+      case "more": return <MoreView onNavigate={navigate} canManageProject={session.auth.permissions.includes("*") || session.auth.permissions.includes("settings.manage")} canReadAllReports={session.auth.permissions.includes("*") || session.auth.permissions.includes("reports.read")} />;
       default: return <DashboardView api={api} auth={session.auth} summary={session.auth.dashboard_summary} bootstrap={session.bootstrap} onOpenProblems={() => { setDashboardProblemId(undefined); navigate("problems"); }} onOpenProblem={(problemId) => { setDashboardProblemId(problemId); navigate("problems"); }} />;
     }
   })();

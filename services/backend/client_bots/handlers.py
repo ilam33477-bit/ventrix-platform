@@ -492,6 +492,15 @@ def build_client_router(
     async def start(message: Message, client_context: ClientContext) -> None:
         tenant = client_context.tenant
         async with events.session_factory() as session:
+            membership = await session.scalar(
+                select(TenantMembership).where(
+                    TenantMembership.tenant_id == tenant.id,
+                    TenantMembership.telegram_user_id == client_context.telegram_user_id,
+                )
+            )
+            if membership is not None and membership.bot_started_at is None:
+                membership.bot_started_at = datetime.now(UTC)
+                await session.commit()
             connections = list(
                 await session.scalars(
                     select(TelegramConnection)

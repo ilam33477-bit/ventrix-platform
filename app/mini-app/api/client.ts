@@ -192,6 +192,7 @@ export class VentrixClientApi {
     status: "active" | "inactive";
     notifications_enabled: boolean;
     criticality_threshold: number;
+    reports_access_all: boolean;
   }>) {
     return this.request<Employee>(`/employees/${employeeId}`, {
       method: "PATCH",

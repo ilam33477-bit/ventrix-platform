@@ -77,6 +77,9 @@ The goal is to find missed opportunities, unanswered actionable messages and ope
 discussion threads — not every dialog whose last message is from a customer.
 Before emitting client_without_answer, identify the exact latest unanswered question,
 request, agreed follow-up, payment/document action or other open line of discussion.
+If an employee message after the cited source_message_id already answers the question or
+continues the requested next step, that source is handled and cannot be emitted as a new
+commercial opportunity, unanswered request or customer question.
 If a customer declined, said they were not interested, or rejected the offer and the
 employee accepted that outcome (for example "понял, без проблем", "не буду настаивать",
 "если передумаете, я на связи"), the conversation is completed. Courtesy replies such
@@ -739,6 +742,14 @@ class AnalysisPipelineService:
                     )
                     if source is None:
                         continue
+                    if issue_family in {"UNANSWERED_REQUEST", "COMMERCIAL_OPPORTUNITY"}:
+                        current_evidence_ids = {
+                            str(item) for item in assessment.evidence_message_ids
+                        }
+                        if str(source.telegram_message_id) not in current_evidence_ids:
+                            # Historical AI candidates must not reopen an earlier
+                            # question after the conversation has moved on.
+                            continue
                     user_summary = russian_user_text(
                         candidate.summary,
                         "Ventrix обнаружил рабочую ситуацию, требующую проверки.",

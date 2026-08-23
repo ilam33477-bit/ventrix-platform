@@ -215,6 +215,7 @@ class EmployeePatch(BaseModel):
     status: Literal["active", "inactive"] | None = None
     notifications_enabled: bool | None = None
     criticality_threshold: int | None = Field(default=None, ge=0, le=100)
+    reports_access_all: bool | None = None
 
 
 class GroupIntegrationCreate(BaseModel):
@@ -716,6 +717,9 @@ async def mini_app_auth(
     )
     connection = await TenantClientRepository(session, context.tenant.id).current_connection()
     await reconcile_connected_onboarding(session, settings, connection)
+    if context.membership.bot_started_at is None:
+        context.membership.bot_started_at = datetime.now(UTC)
+        await session.commit()
     permissions = ["*"] if context.membership.role == "owner" else sorted(context.permissions)
     return {
         "tenant_id": context.tenant.id,
@@ -2291,40 +2295,43 @@ async def employees(
             select(Employee).where(*employee_filters).order_by(Employee.display_name)
         )
     )
-    return [
-        {
-            "id": item.id,
-            "name": item.display_name,
-            "telegram_user_id": item.telegram_user_id,
-            "telegram_username": item.telegram_username,
-            "role": item.role,
-            "status": item.status,
-            "notifications_enabled": item.notifications_enabled,
-            "criticality_threshold": item.criticality_threshold,
-            "access_status": (
-                await session.scalar(
-                    select(TenantMembership.status).where(
-                        TenantMembership.tenant_id == context.tenant.id,
-                        TenantMembership.employee_id == item.id,
+    result = []
+    for item in rows:
+        membership = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == context.tenant.id,
+                TenantMembership.employee_id == item.id,
+            )
+        )
+        result.append(
+            {
+                "id": item.id,
+                "name": item.display_name,
+                "telegram_user_id": item.telegram_user_id,
+                "telegram_username": item.telegram_username,
+                "role": item.role,
+                "status": item.status,
+                "notifications_enabled": item.notifications_enabled,
+                "criticality_threshold": item.criticality_threshold,
+                "reports_access_all": item.reports_access_all,
+                "access_status": membership.status if membership else None,
+                "bot_started": bool(membership and membership.bot_started_at),
+                "connection_id": await session.scalar(
+                    select(TelegramConnection.id)
+                    .where(
+                        TelegramConnection.tenant_id == context.tenant.id,
+                        TelegramConnection.assigned_employee_id == item.id,
+                        TelegramConnection.deleted_at.is_(None),
+                        TelegramConnection.status.in_(
+                            ("connected", "syncing", "ready", "reauthorization_required")
+                        ),
                     )
-                )
-            ),
-            "connection_id": await session.scalar(
-                select(TelegramConnection.id)
-                .where(
-                    TelegramConnection.tenant_id == context.tenant.id,
-                    TelegramConnection.assigned_employee_id == item.id,
-                    TelegramConnection.deleted_at.is_(None),
-                    TelegramConnection.status.in_(
-                        ("connected", "syncing", "ready", "reauthorization_required")
-                    ),
-                )
-                .order_by(TelegramConnection.created_at.desc())
-                .limit(1)
-            ),
-        }
-        for item in rows
-    ]
+                    .order_by(TelegramConnection.created_at.desc())
+                    .limit(1)
+                ),
+            }
+        )
+    return result
 
 
 @router.delete("/employees/{employee_id}")
@@ -2443,6 +2450,7 @@ async def update_employee(
         "status": employee.status,
         "notifications_enabled": employee.notifications_enabled,
         "criticality_threshold": employee.criticality_threshold,
+        "reports_access_all": employee.reports_access_all,
         "access_status": membership.status if membership else "unlinked",
     }
 

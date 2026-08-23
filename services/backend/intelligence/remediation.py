@@ -156,6 +156,7 @@ class RemediationVerifier:
             "waiting_customer",
             "client_without_answer",
             "customer_question",
+            "commercial_opportunity",
         }:
             source_tokens = self._meaningful_tokens(problem.evidence)
             response_tokens = self._meaningful_tokens(" ".join(texts))
@@ -165,6 +166,14 @@ class RemediationVerifier:
                     "fixed",
                     0.84,
                     "Сотрудник дал содержательный ответ по контексту проблемы.",
+                    "rule",
+                    evidence_ids,
+                )
+            if problem.problem_type == "commercial_opportunity" and max(map(len, texts)) >= 20:
+                return RemediationDecision(
+                    "fixed",
+                    0.9,
+                    "Сотрудник продолжил коммерческий диалог содержательным ответом.",
                     "rule",
                     evidence_ids,
                 )

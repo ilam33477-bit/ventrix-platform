@@ -142,3 +142,18 @@ def test_acknowledgement_with_a_question_is_not_terminal() -> None:
     result = assess_conversation(dialog(("Хорошо, а сколько это стоит?", False)))
     assert result.response_required
     assert result.issue_family == "PAYMENT_QUESTION"
+
+
+def test_interest_question_is_not_open_after_employee_answer() -> None:
+    result = assess_conversation(
+        dialog(
+            ("Звучит интересно, а что за сервис?", False),
+            ("Это Telegram-бот, который подбирает подходящие вакансии.", True),
+            ("Можно попробовать один день бесплатно.", True),
+            ("Хорошо, давайте попробую", False),
+            ("Вот ссылка и краткая инструкция по запуску.", True),
+        )
+    )
+    assert result.conversation_state == "WAITING_FOR_CLIENT"
+    assert not result.response_required
+    assert not result.action_required

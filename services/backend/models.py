@@ -1351,6 +1351,9 @@ class Employee(StringPrimaryKeyMixin, TimestampMixin, Base):
     criticality_threshold: Mapped[int] = mapped_column(
         Integer, default=85, server_default="85", nullable=False
     )
+    reports_access_all: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
     quiet_hours_start: Mapped[time | None] = mapped_column(Time)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time)
     __table_args__ = (
@@ -1474,6 +1477,7 @@ class TenantMembership(StringPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(32), default="active", server_default="active", nullable=False, index=True
     )
+    bot_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("tenant_id", "telegram_user_id", name="uq_tenant_membership"),
     )

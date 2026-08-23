@@ -198,6 +198,8 @@ export type Employee = {
   criticality_threshold: number;
   access_status?: string | null;
   connection_id?: string | null;
+  reports_access_all: boolean;
+  bot_started: boolean;
 };
 
 export type GroupIntegration = {

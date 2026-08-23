@@ -268,7 +268,7 @@ function utcLabel(offset: number) {
   return `UTC${offset >= 0 ? "+" : ""}${offset}`;
 }
 
-export function EmployeesView({ api }: { api: VentrixClientApi }) {
+export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: VentrixClientApi; canManage?: boolean; onOpenGroups?: () => void }) {
   const loader = useCallback(async () => {
     const [employees, problems, commitments, connections] = await Promise.all([
       api.employees(), api.problems(), api.commitments(), api.connections(),
@@ -354,12 +354,7 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
         title="Команда и ответственность"
         description="Кто подключён к мониторингу, какие ситуации закреплены за сотрудниками и кому приходят уведомления."
       />
-      <button
-        className="primary-action section-action"
-        onClick={() => setAdding(true)}
-      >
-        Добавить сотрудника по номеру
-      </button>
+      {canManage && <div className="team-management-actions"><button className="primary-action section-action" onClick={() => setAdding(true)}>Добавить сотрудника по номеру</button><button className="secondary-action section-action" onClick={onOpenGroups}>Добавить или настроить рабочую группу</button></div>}
       {loading ? (
         <Skeleton lines={4} />
       ) : data?.employees.length ? (
@@ -413,9 +408,9 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
               <div className="employee-meta">
                 <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
                 <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
-                {connection?.last_sync_at && <span><small>Синхронизация</small><strong>{formatRelativeDate(connection.last_sync_at)}</strong></span>}
+                <span><small>Бот проекта</small><strong>{item.bot_started ? "Запущен" : "Ещё не открыт"}</strong></span>
               </div>
-              {connection && (
+              {connection && canManage && (
                 <ConnectionAnalysisControls
                   key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
                   responseMinutes={connection.response_sla_minutes}
@@ -429,7 +424,8 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
                   onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
                 />
               )}
-              <div
+              {canManage && <label className="toggle-row employee-report-access"><span><strong>Все отчёты проекта</strong><small>По умолчанию сотрудник видит только собственные данные.</small></span><input type="checkbox" checked={item.reports_access_all} onChange={async (event) => { await api.updateEmployee(item.id, { reports_access_all: event.target.checked }); await reload(); }} /></label>}
+              {canManage && <div
                 className={`employee-actions ${deleting === item.id ? "" : "single-action"}`}
               >
                 {connection ? (
@@ -454,7 +450,7 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
                 {deleting === item.id && (
                   <button onClick={() => setDeleting(null)}>Отмена</button>
                 )}
-              </div>
+              </div>}
             </Card>
           );})}
           </div>
@@ -601,7 +597,7 @@ function ConnectionAnalysisControls({
         />
       </label>
       <div className="connection-analysis-status" aria-live="polite">
-        {error ? <span className="error-text">{error}</span> : saving ? "Сохраняем…" : "Сохранится автоматически после паузы · только для этой сессии"}
+        {error ? <span className="error-text">{error}</span> : saving ? "Сохраняем…" : "Настройки этой сессии"}
       </div>
     </div>
   );
@@ -834,40 +830,6 @@ function SettingsForm({
       setSaving(false);
     }
   }
-  const detectionControls = [
-    {
-      key: "signal_problem_threshold" as const,
-      title: "Показывать как рабочую ситуацию",
-      note: "Чем выше значение, тем меньше сомнительных случаев попадёт в раздел «Проблемы».",
-    },
-    {
-      key: "signal_immediate_threshold" as const,
-      title: "Считать ситуацию срочной",
-      note: "Уровень, с которого ситуация получает срочный приоритет.",
-    },
-  ];
-  const notificationControls = [
-    {
-      key: "manager_notification_threshold" as const,
-      title: "Уведомлять руководителя",
-      note: "Минимальная важность для личного уведомления владельцу или менеджеру.",
-    },
-    {
-      key: "employee_notification_threshold" as const,
-      title: "Уведомлять сотрудника",
-      note: "Минимальная важность для персонального уведомления ответственному.",
-    },
-    {
-      key: "group_notification_threshold" as const,
-      title: "Уведомлять рабочую группу",
-      note: "Минимальная важность для разрешённого уведомления в подключённой группе.",
-    },
-    {
-      key: "notification_immediate_threshold" as const,
-      title: "Отправлять сразу",
-      note: "Ситуации этого уровня не ждут следующей регулярной сводки.",
-    },
-  ];
   const weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
   return (
     <div className="settings-workspace">
@@ -877,33 +839,16 @@ function SettingsForm({
           <label>Время отправки<input type="time" value={value.daily_report_time.slice(0, 5)} onChange={(event) => patch("daily_report_time", event.target.value)} /></label>
           <label>Часовой пояс<select value={timezoneOffset(value.timezone)} onChange={(event) => patch("timezone", offsetTimezone(Number(event.target.value)))}>{UTC_OPTIONS.map((offset) => <option key={offset} value={offset}>{utcLabel(offset)}</option>)}</select><small>Для Москвы — UTC+3.</small></label>
           <label>Период анализа<select value={value.history_window_days} onChange={(event) => patch("history_window_days", Number(event.target.value))}><option value="7">Последние 7 дней</option><option value="14">Последние 14 дней</option><option value="30">Последние 30 дней</option></select></label>
-          <label>Время на ответ клиенту<select value={value.response_sla_minutes} onChange={(event) => patch("response_sla_minutes", Number(event.target.value))}><option value="15">15 минут</option><option value="30">30 минут</option><option value="60">60 минут</option><option value="120">120 минут</option><option value="180">180 минут</option></select><small>Через какое время без ответа Ventrix создаст ситуацию.</small></label>
         </div>
         <fieldset className="weekday-field"><legend>Дни отправки</legend><div>{weekdays.map((day, valueDay) => { const active = value.enabled_days.includes(valueDay); return <button type="button" aria-pressed={active} className={active ? "active" : ""} key={day} onClick={() => patch("enabled_days", active ? value.enabled_days.filter((item) => item !== valueDay) : [...value.enabled_days, valueDay].sort())}>{day}</button>; })}</div></fieldset>
         <label className="toggle-row"><span><strong>Регулярный анализ</strong><small>Останавливает новые плановые проверки, не удаляя уже собранные данные.</small></span><input type="checkbox" checked={value.analysis_enabled} onChange={(event) => patch("analysis_enabled", event.target.checked)} /></label>
         {value.next_analysis_at && <div className="next-analysis"><span>Следующая проверка</span><strong>{formatRelativeDate(value.next_analysis_at)}</strong></div>}
-      </Card>
-      <Card className="settings-section threshold-settings">
-        <header><div><h3>Отбор ситуаций</h3><p>Определяет, насколько строго Ventrix отделяет рабочие риски от обычного диалога.</p></div></header>
-        {detectionControls.map((control) => <ThresholdControl key={control.key} control={control} value={value[control.key]} onChange={(next) => patch(control.key, next)} />)}
-      </Card>
-      <Card className="settings-section threshold-settings">
-        <header><div><h3>Кому и когда сообщать</h3><p>Разные получатели могут иметь собственный минимальный уровень важности.</p></div></header>
-        {notificationControls.map((control) => <ThresholdControl key={control.key} control={control} value={value[control.key]} onChange={(next) => patch(control.key, next)} />)}
-        <div className="settings-toggles">
-          <label className="toggle-row"><span><strong>Ответственные сотрудники</strong><small>Отправлять личные уведомления назначенному сотруднику.</small></span><input type="checkbox" checked={value.employee_notifications_enabled} onChange={(event) => patch("employee_notifications_enabled", event.target.checked)} /></label>
-          <label className="toggle-row"><span><strong>Рабочие группы</strong><small>Разрешить напоминания в уже подключённых группах.</small></span><input type="checkbox" checked={value.group_reminders_enabled} onChange={(event) => patch("group_reminders_enabled", event.target.checked)} /></label>
-        </div>
       </Card>
       {error && <p className="form-error">{error}</p>}
       {success && <p className="settings-success"><span>✓</span>Настройки сохранены</p>}
       <Button variant="primary" className="settings-save" disabled={saving || value.enabled_days.length === 0} onClick={() => void save()}>{saving ? "Сохраняем…" : "Сохранить изменения"}</Button>
     </div>
   );
-}
-
-function ThresholdControl<K extends keyof ClientSettings>({ control, value, onChange }: { control: { key: K; title: string; note: string }; value: number; onChange: (value: number) => void }) {
-  return <label className="threshold-control"><span><strong>{control.title}</strong><b>{value}/100</b></span><small>{control.note}</small><input type="range" min="30" max="95" value={value} style={{ "--range-progress": `${((value - 30) / 65) * 100}%` } as React.CSSProperties} onChange={(event) => onChange(Number(event.target.value))} /></label>;
 }
 
 export function SettingsView({ api }: { api: VentrixClientApi }) {
@@ -913,8 +858,8 @@ export function SettingsView({ api }: { api: VentrixClientApi }) {
     <section className="settings-view">
       <SectionHeading
         eyebrow="НАСТРОЙКИ"
-        title="Правила мониторинга"
-        description="Расписание, чувствительность и маршруты уведомлений — без внутренних AI-параметров и технических лимитов."
+        title="Регулярные отчёты"
+        description="Расписание отчётов проекта. Время ответа и строгость отбора настраиваются отдельно для каждой рабочей сессии."
       />
       {loading ? (
         <Skeleton />
@@ -931,7 +876,7 @@ export function SettingsView({ api }: { api: VentrixClientApi }) {
   );
 }
 
-export function MoreView({ onNavigate }: { onNavigate: (tab: TabId) => void }) {
+export function MoreView({ onNavigate, canManageProject = true, canReadAllReports = true }: { onNavigate: (tab: TabId) => void; canManageProject?: boolean; canReadAllReports?: boolean }) {
   const items: Array<{ id: TabId; title: string; note: string; icon: IconName; group: "Работа" | "Подключения" | "Проект" }> = [
     { id: "commitments", title: "Обязательства", note: "Обещания сотрудников и сроки", icon: "alert", group: "Работа" },
     { id: "reports", title: "Отчёты", note: "Периодические итоги команды", icon: "report", group: "Работа" },
@@ -939,10 +884,14 @@ export function MoreView({ onNavigate }: { onNavigate: (tab: TabId) => void }) {
     { id: "groups", title: "Рабочие группы", note: "Групповые уведомления", icon: "groups", group: "Подключения" },
     { id: "settings", title: "Настройки проекта", note: "Расписание и правила уведомлений", icon: "settings", group: "Проект" },
   ];
+  const visibleItems = items.filter((item) =>
+    (canManageProject || !["connections", "groups", "settings"].includes(item.id))
+    && (canReadAllReports || item.id !== "reports"),
+  );
   return (
     <section className="more-view">
       <SectionHeading eyebrow="ЕЩЁ" title="Управление проектом" description="Рабочие разделы, которые нужны реже основной панели." />
-      {(["Работа", "Подключения", "Проект"] as const).map((group) => <section className="more-group" key={group}><h3>{group}</h3><div>{items.filter((item) => item.group === group).map((item) => <button key={item.id} onClick={() => onNavigate(item.id)}><span className="more-icon"><Icon name={item.icon} /></span><span><strong>{item.title}</strong><small>{item.note}</small></span><b>→</b></button>)}</div></section>)}
+      {(["Работа", "Подключения", "Проект"] as const).map((group) => visibleItems.some((item) => item.group === group) && <section className="more-group" key={group}><h3>{group}</h3><div>{visibleItems.filter((item) => item.group === group).map((item) => <button key={item.id} onClick={() => onNavigate(item.id)}><span className="more-icon"><Icon name={item.icon} /></span><span><strong>{item.title}</strong><small>{item.note}</small></span><b>→</b></button>)}</div></section>)}
       <p className="more-profile-note">Профиль, срок активности и тема интерфейса открываются по аватару в правом верхнем углу.</p>
     </section>
   );
