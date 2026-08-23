@@ -312,9 +312,9 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
           api={api}
           connections={[]}
           createEmployee
-          onComplete={() => {
+          onComplete={async () => {
+            await reload();
             setAdding(false);
-            void reload();
           }}
         />
       </>
@@ -340,9 +340,9 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
           api={api}
           connections={[]}
           assignedEmployee={connecting}
-          onComplete={() => {
+          onComplete={async () => {
+            await reload();
             setConnecting(null);
-            void reload();
           }}
         />
       </>

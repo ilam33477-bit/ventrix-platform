@@ -30,7 +30,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
   onSkip?: () => void;
   assignedEmployee?: Pick<Employee, "id" | "name">;
   createEmployee?: boolean;
-  onComplete?: () => void;
+  onComplete?: () => void | Promise<void>;
 }) {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [connections, setConnections] = useState(initialConnections);
@@ -143,7 +143,7 @@ export function ConnectionManager({ api, connections: initialConnections, onboar
       await new Promise((resolve) => window.setTimeout(resolve, 520));
       await onOnboardingStep("monitoring_started");
     }
-    onComplete?.();
+    await onComplete?.();
   }, withPassword ? "password" : "code");
 
   const cancel = () => run(async () => {
