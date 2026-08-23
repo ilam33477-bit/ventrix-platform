@@ -641,6 +641,71 @@ async def reconcile_connected_onboarding(
     return True
 
 
+async def ensure_connection_employee(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    connection: TelegramConnection,
+) -> tuple[TelegramConnection, Employee]:
+    """Persist the accountable employee for a successfully authorized session.
+
+    TelegramConnectionService owns a separate transaction and returns a detached
+    model. Always load the connection into the request session before assigning
+    its employee; otherwise the employee/link disappears when onboarding has
+    already been completed and no unrelated commit happens later in the request.
+    """
+    stored_connection = await session.scalar(
+        select(TelegramConnection).where(
+            TelegramConnection.id == connection.id,
+            TelegramConnection.tenant_id == tenant_id,
+            TelegramConnection.deleted_at.is_(None),
+        )
+    )
+    target = stored_connection or connection
+    employee = (
+        await session.scalar(
+            select(Employee).where(
+                Employee.id == target.assigned_employee_id,
+                Employee.tenant_id == tenant_id,
+            )
+        )
+        if getattr(target, "assigned_employee_id", None)
+        else None
+    )
+    connection_user_id = getattr(target, "telegram_user_id", None)
+    if employee is None and connection_user_id:
+        employee = await session.scalar(
+            select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.telegram_user_id == connection_user_id,
+            )
+        )
+    if employee is None:
+        employee = Employee(
+            tenant_id=tenant_id,
+            display_name=target.display_name or target.username or "Сотрудник",
+            telegram_user_id=connection_user_id,
+            telegram_username=target.username,
+            role="employee",
+            status="active",
+            notifications_enabled=True,
+            criticality_threshold=85,
+        )
+        session.add(employee)
+        await session.flush()
+    else:
+        employee.status = "active"
+        employee.display_name = target.display_name or employee.display_name
+        employee.telegram_username = target.username or employee.telegram_username
+        if employee.telegram_user_id is None:
+            employee.telegram_user_id = connection_user_id
+    target.assigned_employee_id = employee.id
+    if stored_connection is not None:
+        session.add(stored_connection)
+    await sync_employee_membership(session, employee)
+    return target, employee
+
+
 @router.post("/mini-app/auth")
 async def mini_app_auth(
     context: ClientContext,
@@ -1867,59 +1932,45 @@ async def complete_connection_login(
         tenant_settings = await session.scalar(
             select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
         )
+        connection, employee = await ensure_connection_employee(
+            session,
+            tenant_id=context.tenant.id,
+            connection=connection,
+        )
+        # This commit is intentional and unconditional. The Telegram service has
+        # already committed the session in its own transaction; the employee and
+        # connection mapping must be durable even for tenants whose onboarding
+        # was completed long ago.
+        await session.commit()
+        await reconcile_connected_onboarding(session, tenant_settings, connection)
         # Authorization is complete at this point. Catalog loading and initial
         # analysis are retryable background work and must never be reported as
         # an invalid Telegram code or 2FA password.
-        preparation_job_id = await connection_service.queue.enqueue(
-            "telegram.prepare_connection",
-            {"history_days": tenant_settings.message_history_days if tenant_settings else 14},
-            tenant_id=context.tenant.id,
-            telegram_account_id=connection.id,
-            idempotency_key=f"telegram-prepare:{connection.id}",
-            priority=5,
-            category="telegram_rpc",
-            cost_class="light",
-            max_attempts=8,
-        )
-        if not getattr(connection, "assigned_employee_id", None):
-            # Every monitored session needs an accountable person. Even a
-            # shared/owner connection is represented as an employee record so
-            # problems, reports and group mentions never lose their owner.
-            connection_user_id = getattr(connection, "telegram_user_id", None)
-            employee = (
-                await session.scalar(
-                    select(Employee).where(
-                        Employee.tenant_id == context.tenant.id,
-                        Employee.telegram_user_id == connection_user_id,
-                    )
-                )
-                if connection_user_id
-                else None
+        try:
+            preparation_job_id = await connection_service.queue.enqueue(
+                "telegram.prepare_connection",
+                {"history_days": tenant_settings.message_history_days if tenant_settings else 14},
+                tenant_id=context.tenant.id,
+                telegram_account_id=connection.id,
+                idempotency_key=f"telegram-prepare:{connection.id}",
+                priority=5,
+                category="telegram_rpc",
+                cost_class="light",
+                max_attempts=8,
             )
-            if employee is None:
-                employee = Employee(
-                    tenant_id=context.tenant.id,
-                    display_name=connection.display_name or connection.username or "Сотрудник",
-                    telegram_user_id=connection_user_id,
-                    telegram_username=connection.username,
-                    role="employee",
-                    status="active",
-                    notifications_enabled=True,
-                    criticality_threshold=85,
-                )
-                session.add(employee)
-                await session.flush()
-            else:
-                employee.status = "active"
-                employee.display_name = connection.display_name or employee.display_name
-                employee.telegram_username = connection.username or employee.telegram_username
-            connection.assigned_employee_id = employee.id
-            await sync_employee_membership(session, employee)
-        await reconcile_connected_onboarding(session, tenant_settings, connection)
+        except Exception:
+            logger.exception(
+                "Telegram preparation enqueue failed after successful authorization "
+                "tenant_id=%s connection_id=%s",
+                context.tenant.id,
+                connection.id,
+            )
         logger.info(
-            "Telegram authorization completed tenant_id=%s connection_id=%s preparation_job_id=%s",
+            "Telegram authorization completed tenant_id=%s connection_id=%s employee_id=%s "
+            "preparation_job_id=%s",
             context.tenant.id,
             connection.id,
+            employee.id,
             preparation_job_id,
         )
     return {
