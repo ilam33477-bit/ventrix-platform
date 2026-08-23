@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type * as React from "react";
 
 import type { VentrixClientApi } from "../../api/client";
@@ -277,6 +277,9 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
   }, [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [adding, setAdding] = useState(false);
+  const [connectionPreviews, setConnectionPreviews] = useState<
+    Record<string, ConnectionAnalysisValue>
+  >({});
   const [connecting, setConnecting] = useState<{
     id: string;
     name: string;
@@ -369,6 +372,12 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
           <div className="team-list">
           {data.employees.map((item) => {
             const connection = data.connections.find((row) => row.id === item.connection_id || row.employee_id === item.id);
+            const connectionPreview = connection
+              ? connectionPreviews[connection.id] ?? {
+                  response_sla_minutes: connection.response_sla_minutes,
+                  signal_problem_threshold: connection.signal_problem_threshold,
+                }
+              : null;
             const assignedProblems = data.problems.filter((row) => row.responsible_employee_id === item.id && !["resolved", "auto_resolved", "false_positive", "ignored"].includes(row.status));
             const openCommitments = data.commitments.filter((row) => row.employee_id === item.id && row.status === "open");
             return (
@@ -390,7 +399,16 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
               <div className="employee-workload">
                 <div><strong>{assignedProblems.length}</strong><span>ситуаций в работе</span></div>
                 <div><strong>{openCommitments.length}</strong><span>открытых обещаний</span></div>
-                <div><strong>{item.criticality_threshold}/100</strong><span>порог уведомлений</span></div>
+                <div className="employee-analysis-summary">
+                  <span>
+                    <strong>{connectionPreview ? `${connectionPreview.signal_problem_threshold}/100` : "—"}</strong>
+                    <small>порог сообщений</small>
+                  </span>
+                  <span>
+                    <strong>{connectionPreview ? `${connectionPreview.response_sla_minutes} мин.` : "—"}</strong>
+                    <small>время на ответ</small>
+                  </span>
+                </div>
               </div>
               <div className="employee-meta">
                 <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
@@ -402,6 +420,12 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
                   key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
                   responseMinutes={connection.response_sla_minutes}
                   problemThreshold={connection.signal_problem_threshold}
+                  onPreview={(value) =>
+                    setConnectionPreviews((current) => ({
+                      ...current,
+                      [connection.id]: value,
+                    }))
+                  }
                   onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
                 />
               )}
@@ -446,60 +470,97 @@ export function EmployeesView({ api }: { api: VentrixClientApi }) {
   );
 }
 
+type ConnectionAnalysisValue = {
+  response_sla_minutes: number;
+  signal_problem_threshold: number;
+};
+
+function sameConnectionAnalysisValue(
+  left: ConnectionAnalysisValue,
+  right: ConnectionAnalysisValue,
+) {
+  return (
+    left.response_sla_minutes === right.response_sla_minutes &&
+    left.signal_problem_threshold === right.signal_problem_threshold
+  );
+}
+
 function ConnectionAnalysisControls({
   responseMinutes: initialResponseMinutes,
   problemThreshold: initialProblemThreshold,
+  onPreview,
   onCommit,
 }: {
   responseMinutes: number;
   problemThreshold: number;
-  onCommit: (value: {
-    response_sla_minutes: number;
-    signal_problem_threshold: number;
-  }) => Promise<unknown>;
+  onPreview: (value: ConnectionAnalysisValue) => void;
+  onCommit: (value: ConnectionAnalysisValue) => Promise<unknown>;
 }) {
   const [responseMinutes, setResponseMinutes] = useState(initialResponseMinutes);
   const [problemThreshold, setProblemThreshold] = useState(initialProblemThreshold);
-  const [saved, setSaved] = useState({
-    responseMinutes: initialResponseMinutes,
-    problemThreshold: initialProblemThreshold,
-  });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const latestValue = useRef<ConnectionAnalysisValue>({
+    response_sla_minutes: initialResponseMinutes,
+    signal_problem_threshold: initialProblemThreshold,
+  });
+  const savedValue = useRef<ConnectionAnalysisValue>({
+    response_sla_minutes: initialResponseMinutes,
+    signal_problem_threshold: initialProblemThreshold,
+  });
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveInFlight = useRef(false);
+  const mounted = useRef(true);
 
   useEffect(() => {
-    setResponseMinutes(initialResponseMinutes);
-    setProblemThreshold(initialProblemThreshold);
-    setSaved({ responseMinutes: initialResponseMinutes, problemThreshold: initialProblemThreshold });
-  }, [initialProblemThreshold, initialResponseMinutes]);
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, []);
 
-  async function commit() {
-    if (
-      saving ||
-      (responseMinutes === saved.responseMinutes && problemThreshold === saved.problemThreshold)
-    ) return;
-    setSaving(true);
-    setError("");
+  function scheduleSave(delay = 850) {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => void flushSave(), delay);
+  }
+
+  async function flushSave() {
+    saveTimer.current = null;
+    if (saveInFlight.current) {
+      scheduleSave(300);
+      return;
+    }
+    const value = { ...latestValue.current };
+    if (sameConnectionAnalysisValue(value, savedValue.current)) return;
+    saveInFlight.current = true;
+    if (mounted.current) {
+      setSaving(true);
+      setError("");
+    }
     try {
-      await onCommit({
-        response_sla_minutes: responseMinutes,
-        signal_problem_threshold: problemThreshold,
-      });
-      setSaved({ responseMinutes, problemThreshold });
+      await onCommit(value);
+      savedValue.current = value;
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Не удалось сохранить настройки");
+      if (mounted.current) {
+        setError(cause instanceof Error ? cause.message : "Не удалось сохранить настройки");
+      }
     } finally {
-      setSaving(false);
+      saveInFlight.current = false;
+      if (mounted.current) setSaving(false);
+      if (!sameConnectionAnalysisValue(latestValue.current, value)) scheduleSave(500);
     }
   }
 
-  const sliderEvents = {
-    onPointerUp: () => void commit(),
-    onBlur: () => void commit(),
-    onKeyUp: (event: React.KeyboardEvent<HTMLInputElement>) => {
-      if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) void commit();
-    },
-  };
+  function updateValue(value: ConnectionAnalysisValue) {
+    latestValue.current = value;
+    setResponseMinutes(value.response_sla_minutes);
+    setProblemThreshold(value.signal_problem_threshold);
+    setError("");
+    onPreview(value);
+    scheduleSave();
+  }
+
   return (
     <div className="connection-analysis-controls" aria-label="Настройки анализа сессии">
       <label>
@@ -509,12 +570,16 @@ function ConnectionAnalysisControls({
           type="range"
           min="15"
           max="180"
-          step="15"
+          step="1"
           value={responseMinutes}
-          disabled={saving}
+          aria-valuetext={`${responseMinutes} минут`}
           style={{ "--range-progress": `${((responseMinutes - 15) / 165) * 100}%` } as React.CSSProperties}
-          onChange={(event) => setResponseMinutes(Number(event.target.value))}
-          {...sliderEvents}
+          onChange={(event) =>
+            updateValue({
+              response_sla_minutes: Number(event.target.value),
+              signal_problem_threshold: problemThreshold,
+            })
+          }
         />
       </label>
       <label>
@@ -525,14 +590,18 @@ function ConnectionAnalysisControls({
           min="30"
           max="95"
           value={problemThreshold}
-          disabled={saving}
+          aria-valuetext={`${problemThreshold} из 100`}
           style={{ "--range-progress": `${((problemThreshold - 30) / 65) * 100}%` } as React.CSSProperties}
-          onChange={(event) => setProblemThreshold(Number(event.target.value))}
-          {...sliderEvents}
+          onChange={(event) =>
+            updateValue({
+              response_sla_minutes: responseMinutes,
+              signal_problem_threshold: Number(event.target.value),
+            })
+          }
         />
       </label>
       <div className="connection-analysis-status" aria-live="polite">
-        {error ? <span className="error-text">{error}</span> : saving ? "Сохраняем…" : "Настройки применяются только к этой сессии"}
+        {error ? <span className="error-text">{error}</span> : saving ? "Сохраняем…" : "Сохранится автоматически после паузы · только для этой сессии"}
       </div>
     </div>
   );
