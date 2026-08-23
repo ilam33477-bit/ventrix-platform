@@ -60,6 +60,7 @@ from ..services.employee_access import claim_employee_by_username
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
 from ..timezones import timezone_info
+from .links import direct_mini_app_link
 from .states import TelegramConnectionStates
 
 
@@ -2055,7 +2056,20 @@ def build_client_router(
             return
         await message.answer(
             "✅ <b>Группа подключена к Ventrix.</b>\n\n"
-            "Теперь в Mini App можно включить карточки ситуаций и регулярные отчёты для этой группы."
+            "Теперь в Mini App можно включить карточки ситуаций и регулярные отчёты для этой группы.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Открыть Ventrix AI",
+                            url=direct_mini_app_link(
+                                (await message.bot.get_me()).username or "",
+                                "group_connected",
+                            ),
+                        )
+                    ]
+                ]
+            ),
         )
 
     @router.my_chat_member()

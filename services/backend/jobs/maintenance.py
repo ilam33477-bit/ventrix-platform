@@ -8,10 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..analysis.service import AnalysisPipelineService
 from ..bot.sqlite_storage import SQLiteFSMStorage
+from ..client_bots.links import direct_mini_app_link
 from ..config import get_settings
 from ..database import SQLiteTransactionManager
 from ..models import (
     BackgroundJob,
+    BotInstance,
     GroupIntegration,
     NotificationLog,
     OperationalProblem,
@@ -257,6 +259,18 @@ class MaintenanceJobHandlers:
                 separator = "&" if "?" in mini_app_url else "?"
                 report_url = f"{mini_app_url}{separator}section=reports&report_id={report.id}"
             for destination_type, destination_id, group_id in destinations:
+                destination_report_url = report_url
+                if destination_type == "group" and group_id:
+                    destination_group = await session.get(GroupIntegration, group_id)
+                    if destination_group and destination_group.bot_instance_id:
+                        destination_bot = await session.get(
+                            BotInstance, destination_group.bot_instance_id
+                        )
+                        if destination_bot is not None:
+                            destination_report_url = direct_mini_app_link(
+                                destination_bot.username,
+                                f"report_{report.id}",
+                            )
                 dedup = f"report:{report.id}:{destination_type}:{destination_id}"
                 existing = await session.scalar(
                     select(NotificationLog).where(NotificationLog.deduplication_key == dedup)
@@ -279,8 +293,8 @@ class MaintenanceJobHandlers:
                                         {
                                             "text": "Открыть в Ventrix AI",
                                             **(
-                                                {"url": report_url}
-                                                if report_url
+                                                {"url": destination_report_url}
+                                                if destination_report_url
                                                 else {"callback_data": "client:reports"}
                                             ),
                                         }

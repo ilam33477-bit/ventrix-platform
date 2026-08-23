@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ..client_bots.links import direct_mini_app_link
 from ..config import get_settings
 from ..database import SQLiteTransactionManager
 from ..jobs.queue import JOB_PRIORITY, JobDeferred, JobLease, SQLiteJobQueue
@@ -469,6 +470,14 @@ class NotificationOrchestrator:
             mini_app_url = get_settings().client_mini_app_url
             if current_problem and mini_app_url:
                 separator = "&" if "?" in mini_app_url else "?"
+                group_problem_url = None
+                if is_group and group and group.bot_instance_id:
+                    group_bot = await session.get(BotInstance, group.bot_instance_id)
+                    if group_bot is not None:
+                        group_problem_url = direct_mini_app_link(
+                            group_bot.username,
+                            f"problem_{current_problem.id}",
+                        )
                 rows.append(
                     [
                         {
@@ -477,7 +486,8 @@ class NotificationOrchestrator:
                             ),
                             **(
                                 {
-                                    "url": f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
+                                    "url": group_problem_url
+                                    or f"{mini_app_url}{separator}section=problems&problem_id={current_problem.id}"
                                 }
                                 if is_group
                                 else {

@@ -15,14 +15,15 @@ import type { TabId } from "./types";
 
 export function MiniAppRoot() {
   const { launchState, session, api, error, refresh, advanceOnboarding } = useMiniAppSession();
-  const requestedSection = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("section")
-    : null;
-  const requestedProblemId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("problem_id") ?? undefined
-    : undefined;
+  const launchTarget = typeof window !== "undefined" ? miniAppLaunchTarget() : {};
+  const requestedSection = launchTarget.section;
+  const requestedProblemId = launchTarget.problemId;
   const [activeTab, setActiveTab] = useState<TabId>(
-    requestedSection === "problems" ? "problems" : "dashboard",
+    requestedSection === "problems"
+      ? "problems"
+      : requestedSection === "reports"
+        ? "reports"
+        : "dashboard",
   );
   const [dashboardProblemId, setDashboardProblemId] = useState<string | undefined>();
   const [history, setHistory] = useState<TabId[]>([]);
@@ -69,4 +70,24 @@ export function MiniAppRoot() {
   })();
 
   return <MiniAppShell auth={session.auth} access={session.access} active={activeTab} onNavigate={navigate} canGoBack={!primary.has(activeTab) && history.length > 0} onBack={goBack}>{content}</MiniAppShell>;
+}
+
+function miniAppLaunchTarget(): { section?: string; problemId?: string } {
+  const query = new URLSearchParams(window.location.search);
+  const telegramStartParameter = new URLSearchParams(
+    window.Telegram?.WebApp?.initData ?? "",
+  ).get("start_param") ?? query.get("tgWebAppStartParam");
+  const explicitSection = query.get("section") ?? undefined;
+  const explicitProblemId = query.get("problem_id") ?? undefined;
+  if (explicitSection || explicitProblemId) {
+    return { section: explicitSection, problemId: explicitProblemId };
+  }
+  if (telegramStartParameter?.startsWith("problem_")) {
+    return {
+      section: "problems",
+      problemId: telegramStartParameter.slice("problem_".length),
+    };
+  }
+  if (telegramStartParameter?.startsWith("report_")) return { section: "reports" };
+  return {};
 }
