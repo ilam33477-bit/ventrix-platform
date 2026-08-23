@@ -281,6 +281,136 @@ class ProblemLifecycleService:
             ),
         )
 
+    async def start_by_human(
+        self,
+        tenant_id: str,
+        problem_id: str,
+        *,
+        actor_id: str,
+    ) -> OperationalProblem:
+        """Apply the user's "take into work" intent against the latest persisted state."""
+        problem, responsible_id = await self._workflow_context(tenant_id, problem_id)
+        current = ProblemStatus(problem.status)
+        common = {
+            "actor_type": "membership",
+            "actor_id": actor_id,
+            "reason": "Пользователь взял ситуацию в работу.",
+        }
+        if current in {
+            ProblemStatus.RESOLVED,
+            ProblemStatus.AUTO_RESOLVED,
+            ProblemStatus.FALSE_POSITIVE,
+        }:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.REOPENED, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current in {ProblemStatus.NEW, ProblemStatus.NEEDS_CONFIRMATION}:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.ACKNOWLEDGED, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current == ProblemStatus.ACKNOWLEDGED:
+            if responsible_id is None:
+                raise ValueError("для ситуации не определён ответственный рабочий аккаунт")
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(
+                    ProblemStatus.ASSIGNED,
+                    responsible_employee_id=responsible_id,
+                    **common,
+                ),
+            )
+            current = ProblemStatus(problem.status)
+        if current in {ProblemStatus.ASSIGNED, ProblemStatus.WAITING, ProblemStatus.REOPENED}:
+            return await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.IN_PROGRESS, **common),
+            )
+        if current == ProblemStatus.IN_PROGRESS:
+            return problem
+        raise ValueError(f"ситуацию в статусе {current.value} нельзя взять в работу")
+
+    async def mark_false_positive_by_human(
+        self,
+        tenant_id: str,
+        problem_id: str,
+        *,
+        actor_id: str,
+    ) -> OperationalProblem:
+        """Record a false-positive verdict even if verification closed a stale UI card."""
+        problem, _responsible_id = await self._workflow_context(tenant_id, problem_id)
+        current = ProblemStatus(problem.status)
+        common = {
+            "actor_type": "membership",
+            "actor_id": actor_id,
+            "reason": "Пользователь отметил ситуацию как не проблему.",
+        }
+        if current == ProblemStatus.FALSE_POSITIVE:
+            return problem
+        if current in {ProblemStatus.RESOLVED, ProblemStatus.AUTO_RESOLVED}:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.REOPENED, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current == ProblemStatus.NEW:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.NEEDS_CONFIRMATION, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current == ProblemStatus.REOPENED:
+            problem = await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.IN_PROGRESS, **common),
+            )
+            current = ProblemStatus(problem.status)
+        if current in {
+            ProblemStatus.NEEDS_CONFIRMATION,
+            ProblemStatus.ACKNOWLEDGED,
+            ProblemStatus.ASSIGNED,
+            ProblemStatus.IN_PROGRESS,
+            ProblemStatus.WAITING,
+        }:
+            return await self.transition(
+                tenant_id,
+                problem_id,
+                TransitionRequest(ProblemStatus.FALSE_POSITIVE, **common),
+            )
+        raise ValueError(f"ситуацию в статусе {current.value} нельзя отметить как не проблему")
+
+    async def _workflow_context(
+        self, tenant_id: str, problem_id: str
+    ) -> tuple[OperationalProblem, str | None]:
+        async with self.session_factory() as session:
+            problem = await session.scalar(
+                select(OperationalProblem).where(
+                    OperationalProblem.id == problem_id,
+                    OperationalProblem.tenant_id == tenant_id,
+                )
+            )
+            if problem is None:
+                raise LookupError("problem not found in tenant")
+            responsible_id = problem.responsible_employee_id
+            if responsible_id is None:
+                responsible_id = await session.scalar(
+                    select(TelegramConnection.assigned_employee_id).where(
+                        TelegramConnection.id == problem.connection_id,
+                        TelegramConnection.tenant_id == tenant_id,
+                    )
+                )
+            return problem, responsible_id
+
 
 def initialize_problem_lifecycle(
     problem: OperationalProblem,

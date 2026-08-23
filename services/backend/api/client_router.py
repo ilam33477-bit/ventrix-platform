@@ -1443,6 +1443,52 @@ async def resolve_problem(
     return {"id": updated.id, "status": updated.status}
 
 
+@router.post("/problems/{problem_id}/start")
+async def start_problem(
+    problem_id: str,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    item = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    if not can_manage_problem(context, item):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    try:
+        updated = await ProblemLifecycleService(factory).start_by_human(
+            context.tenant.id,
+            problem_id,
+            actor_id=context.membership.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"id": updated.id, "status": updated.status}
+
+
+@router.post("/problems/{problem_id}/false-positive")
+async def mark_problem_false_positive(
+    problem_id: str,
+    context: ClientContext,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    item = await TenantClientRepository(session, context.tenant.id).problem(problem_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Problem not found")
+    if not can_manage_problem(context, item):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    try:
+        updated = await ProblemLifecycleService(factory).mark_false_positive_by_human(
+            context.tenant.id,
+            problem_id,
+            actor_id=context.membership.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {"id": updated.id, "status": updated.status}
+
+
 @router.get("/reports")
 async def reports(
     context: ClientContext,

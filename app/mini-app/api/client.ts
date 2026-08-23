@@ -132,6 +132,19 @@ export class VentrixClientApi {
     });
   }
 
+  startProblem(problemId: string) {
+    return this.request<{ id: string; status: ProblemStatus }>(`/problems/${problemId}/start`, {
+      method: "POST",
+    });
+  }
+
+  markProblemFalsePositive(problemId: string) {
+    return this.request<{ id: string; status: ProblemStatus }>(
+      `/problems/${problemId}/false-positive`,
+      { method: "POST" },
+    );
+  }
+
   commitments() {
     return this.request<Commitment[]>("/commitments");
   }

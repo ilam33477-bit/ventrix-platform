@@ -195,6 +195,69 @@ async def test_worker_pool_claims_only_its_categories(session_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_heavy_jobs_from_two_tenants_run_independently_and_fairly(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        first_tenant = await make_service(session).create_tenant(tenant_payload)
+        second_payload = tenant_payload.model_copy(
+            update={
+                "name": "Second Pilot",
+                "owner_telegram_username": "second_owner",
+                "owner_telegram_user_id": 555000222,
+            }
+        )
+        second_tenant = await make_service(session).create_tenant(second_payload)
+
+    queue = SQLiteJobQueue(
+        session_factory,
+        max_active_tenant_jobs=2,
+        tenant_max_active_heavy_jobs=1,
+        category_limits={"analysis": 2},
+    )
+    first_a = await queue.enqueue(
+        "analysis.pipeline",
+        {},
+        tenant_id=first_tenant.id,
+        category="analysis",
+    )
+    second_a = await queue.enqueue(
+        "analysis.pipeline",
+        {},
+        tenant_id=first_tenant.id,
+        category="analysis",
+    )
+    first_b = await queue.enqueue(
+        "analysis.pipeline",
+        {},
+        tenant_id=second_tenant.id,
+        category="analysis",
+    )
+
+    claimed_a = await queue.claim_next(
+        "analysis-a", allowed_categories=frozenset({"analysis"})
+    )
+    claimed_b = await queue.claim_next(
+        "analysis-b", allowed_categories=frozenset({"analysis"})
+    )
+
+    assert claimed_a is not None and claimed_a.id == first_a
+    assert claimed_b is not None and claimed_b.id == first_b
+    assert claimed_a.tenant_id != claimed_b.tenant_id
+    assert (
+        await queue.claim_next("analysis-c", allowed_categories=frozenset({"analysis"}))
+        is None
+    )
+
+    assert await queue.complete(claimed_a)
+    next_for_first_tenant = await queue.claim_next(
+        "analysis-c", allowed_categories=frozenset({"analysis"})
+    )
+    assert next_for_first_tenant is not None
+    assert next_for_first_tenant.id == second_a
+
+
+@pytest.mark.asyncio
 async def test_telegram_rpc_bypasses_tenant_general_concurrency(
     session_factory, make_service, tenant_payload
 ) -> None:

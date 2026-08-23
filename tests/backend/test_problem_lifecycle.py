@@ -179,6 +179,103 @@ async def test_quick_resolve_uses_session_owner_and_audits_full_path(
 
 
 @pytest.mark.asyncio
+async def test_stale_auto_resolved_card_can_be_taken_back_into_work(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, employee, _connection, _dialog, _message, problem = await _problem_fixture(
+        session_factory, make_service, tenant_payload
+    )
+    lifecycle = ProblemLifecycleService(session_factory)
+    for request in (
+        TransitionRequest(ProblemStatus.ACKNOWLEDGED, "system", None, "Проверено"),
+        TransitionRequest(
+            ProblemStatus.ASSIGNED,
+            "system",
+            None,
+            "Назначено владельцу сессии",
+            responsible_employee_id=employee.id,
+        ),
+        TransitionRequest(ProblemStatus.IN_PROGRESS, "system", None, "Начата работа"),
+        TransitionRequest(
+            ProblemStatus.AUTO_RESOLVED,
+            "system",
+            None,
+            "Автоматическая проверка посчитала ситуацию завершённой",
+            evidence="Найден последующий ответ сотрудника",
+        ),
+    ):
+        await lifecycle.transition(tenant.id, problem.id, request)
+
+    result = await lifecycle.start_by_human(
+        tenant.id,
+        problem.id,
+        actor_id="owner-membership",
+    )
+
+    async with session_factory() as session:
+        transitions = list(
+            await session.scalars(
+                select(ProblemTransition)
+                .where(ProblemTransition.problem_id == problem.id)
+                .order_by(ProblemTransition.occurred_at)
+            )
+        )
+    assert result.status == "in_progress"
+    assert result.responsible_employee_id == employee.id
+    assert [item.to_status for item in transitions][-2:] == ["reopened", "in_progress"]
+
+
+@pytest.mark.asyncio
+async def test_stale_auto_resolved_card_can_be_marked_false_positive(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, employee, _connection, _dialog, _message, problem = await _problem_fixture(
+        session_factory, make_service, tenant_payload
+    )
+    lifecycle = ProblemLifecycleService(session_factory)
+    for request in (
+        TransitionRequest(ProblemStatus.ACKNOWLEDGED, "system", None, "Проверено"),
+        TransitionRequest(
+            ProblemStatus.ASSIGNED,
+            "system",
+            None,
+            "Назначено владельцу сессии",
+            responsible_employee_id=employee.id,
+        ),
+        TransitionRequest(ProblemStatus.IN_PROGRESS, "system", None, "Начата работа"),
+        TransitionRequest(
+            ProblemStatus.AUTO_RESOLVED,
+            "system",
+            None,
+            "Автоматическая проверка посчитала ситуацию завершённой",
+            evidence="Найден последующий ответ сотрудника",
+        ),
+    ):
+        await lifecycle.transition(tenant.id, problem.id, request)
+
+    result = await lifecycle.mark_false_positive_by_human(
+        tenant.id,
+        problem.id,
+        actor_id="owner-membership",
+    )
+
+    async with session_factory() as session:
+        transitions = list(
+            await session.scalars(
+                select(ProblemTransition)
+                .where(ProblemTransition.problem_id == problem.id)
+                .order_by(ProblemTransition.occurred_at)
+            )
+        )
+    assert result.status == "false_positive"
+    assert [item.to_status for item in transitions][-3:] == [
+        "reopened",
+        "in_progress",
+        "false_positive",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_remediation_verifier_does_not_treat_acknowledgement_as_fix(
     session_factory, make_service, tenant_payload
 ) -> None:

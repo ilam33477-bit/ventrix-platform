@@ -23,6 +23,8 @@ const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string, 
   reopened: [["in_progress", "Взять в работу", "primary"]],
 };
 
+const CLOSED_STATUSES = new Set<ProblemStatus>(["resolved", "auto_resolved", "false_positive"]);
+
 function ProblemReplyPanel({ api, problem, onChanged }: {
   api: VentrixClientApi;
   problem: ProblemDetail;
@@ -85,6 +87,7 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [confirmingClose, setConfirmingClose] = useState(false);
 
   async function transition(status: ProblemStatus, label: string) {
     const reason = status === "false_positive"
@@ -96,15 +99,37 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
     setError("");
     setSuccess("");
     try {
-      await api.transitionProblem(problem.id, {
-        status,
-        reason,
-        deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
-      });
+      if (status === "in_progress") {
+        await api.startProblem(problem.id);
+      } else if (status === "false_positive") {
+        await api.markProblemFalsePositive(problem.id);
+      } else {
+        await api.transitionProblem(problem.id, {
+          status,
+          reason,
+          deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
+        });
+      }
       setSuccess(label);
       await onChanged();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Не удалось изменить ситуацию");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function closeProblem() {
+    setBusy(true);
+    setError("");
+    setSuccess("");
+    try {
+      await api.resolveProblem(problem.id);
+      setConfirmingClose(false);
+      setSuccess("Ситуация завершена");
+      await onChanged();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Не удалось завершить ситуацию");
     } finally {
       setBusy(false);
     }
@@ -132,7 +157,7 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
 
       <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
 
-      <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
+      <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}{!CLOSED_STATUSES.has(problem.status) && <div className="detail-quick-close">{confirmingClose ? <><p>Подтвердите, что ситуация действительно завершена.</p><div><Button variant="primary" disabled={busy} onClick={() => void closeProblem()}>{busy ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={busy} onClick={() => setConfirmingClose(false)}>Отмена</Button></div></> : <Button variant="secondary" disabled={busy} onClick={() => setConfirmingClose(true)}>Завершить ситуацию</Button>}</div>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
 
       {(problem.transitions.length > 0 || problem.verifications.length > 0) && <details className="problem-history"><summary>История ситуации <span>{problem.transitions.length + problem.verifications.length}</span></summary><div className="timeline">{problem.transitions.map((item, index) => <div key={`${item.occurred_at}-${index}`}><i /><p><strong>{PROBLEM_STATUS_LABELS[item.from_status] ?? item.from_status} → {PROBLEM_STATUS_LABELS[item.to_status] ?? item.to_status}</strong><span>{item.reason}</span><small>{new Date(item.occurred_at).toLocaleString("ru-RU")}</small></p></div>)}{problem.verifications.map((item) => <div key={item.checked_at}><i /><p><strong>Проверка исправления: {item.outcome}</strong><span>{item.reason}</span><small>{new Date(item.checked_at).toLocaleString("ru-RU")}</small></p></div>)}</div></details>}
     </section>
