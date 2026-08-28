@@ -14,6 +14,7 @@ from services.backend.bot import handlers
 from services.backend.bot.flow_guard import ActiveFlowGuardMiddleware
 from services.backend.bot.keyboards import (
     client_main_menu,
+    client_more_menu,
     client_welcome_menu,
     owner_main_menu,
 )
@@ -35,7 +36,8 @@ def test_owner_and_client_navigation_is_inline_only() -> None:
     assert isinstance(client, InlineKeyboardMarkup)
     assert isinstance(welcome, InlineKeyboardMarkup)
     assert "👥 Клиенты" in button_texts(owner)
-    assert "⚠️ Важное" in button_texts(client)
+    assert button_texts(client) == ["Открыть Ventrix AI", "Сводка", "Ситуации", "Отчёты", "Ещё"]
+    assert "Подключения" in button_texts(client_more_menu())
     assert button_texts(welcome) == ["Настроить Ventrix"]
 
 

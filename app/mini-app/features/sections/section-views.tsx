@@ -878,8 +878,9 @@ export function SettingsView({ api }: { api: VentrixClientApi }) {
 
 export function MoreView({ onNavigate, canManageProject = true, canReadAllReports = true }: { onNavigate: (tab: TabId) => void; canManageProject?: boolean; canReadAllReports?: boolean }) {
   const items: Array<{ id: TabId; title: string; note: string; icon: IconName; group: "Работа" | "Подключения" | "Проект" }> = [
+    { id: "statistics", title: "Статистика", note: "Динамика ситуаций и команды", icon: "chart", group: "Работа" },
+    { id: "employees", title: "Команда", note: "Сотрудники и ответственность", icon: "team", group: "Работа" },
     { id: "commitments", title: "Обязательства", note: "Обещания сотрудников и сроки", icon: "alert", group: "Работа" },
-    { id: "reports", title: "Отчёты", note: "Периодические итоги команды", icon: "report", group: "Работа" },
     { id: "connections", title: "Telegram-аккаунты", note: "Сессии и источники анализа", icon: "telegram", group: "Подключения" },
     { id: "groups", title: "Рабочие группы", note: "Групповые уведомления", icon: "groups", group: "Подключения" },
     { id: "settings", title: "Настройки проекта", note: "Расписание и правила уведомлений", icon: "settings", group: "Проект" },
@@ -890,7 +891,7 @@ export function MoreView({ onNavigate, canManageProject = true, canReadAllReport
   );
   return (
     <section className="more-view">
-      <SectionHeading eyebrow="ЕЩЁ" title="Управление проектом" description="Рабочие разделы, которые нужны реже основной панели." />
+      <SectionHeading eyebrow="РАЗДЕЛЫ" title="Ещё" description="Команда, подключения и настройки проекта." />
       {(["Работа", "Подключения", "Проект"] as const).map((group) => visibleItems.some((item) => item.group === group) && <section className="more-group" key={group}><h3>{group}</h3><div>{visibleItems.filter((item) => item.group === group).map((item) => <button key={item.id} onClick={() => onNavigate(item.id)}><span className="more-icon"><Icon name={item.icon} /></span><span><strong>{item.title}</strong><small>{item.note}</small></span><b>→</b></button>)}</div></section>)}
       <p className="more-profile-note">Профиль, срок активности и тема интерфейса открываются по аватару в правом верхнем углу.</p>
     </section>

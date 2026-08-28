@@ -27,7 +27,7 @@ export function MiniAppRoot() {
   );
   const [dashboardProblemId, setDashboardProblemId] = useState<string | undefined>();
   const [history, setHistory] = useState<TabId[]>([]);
-  const primary = new Set<TabId>(["dashboard", "problems", "statistics", "employees", "more"]);
+  const primary = new Set<TabId>(["dashboard", "problems", "reports", "more"]);
   function navigate(tab: TabId) {
     if (tab !== activeTab) setHistory((current) => [...current, activeTab].slice(-8));
     setActiveTab(tab);

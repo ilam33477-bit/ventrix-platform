@@ -410,25 +410,37 @@ def bot_actions(bot_id: str, username: str) -> InlineKeyboardMarkup:
 
 def client_main_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
     panel = (
-        InlineKeyboardButton(text="↗ Открыть панель", web_app=WebAppInfo(url=mini_app_url))
+        InlineKeyboardButton(text="Открыть Ventrix AI", web_app=WebAppInfo(url=mini_app_url))
         if mini_app_url
-        else InlineKeyboardButton(text="↗ Открыть панель", callback_data="client:panel")
+        else InlineKeyboardButton(text="Открыть Ventrix AI", callback_data="client:panel")
     )
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [panel],
             [
-                InlineKeyboardButton(text="📊 Показатели", callback_data="client:summary"),
-                InlineKeyboardButton(text="⚠️ Важное", callback_data="client:important"),
+                InlineKeyboardButton(text="Сводка", callback_data="client:summary"),
+                InlineKeyboardButton(text="Ситуации", callback_data="client:important"),
             ],
             [
-                InlineKeyboardButton(text="📄 Отчёты", callback_data="client:reports"),
-                InlineKeyboardButton(text="🔗 Подключения", callback_data="client:connections"),
+                InlineKeyboardButton(text="Отчёты", callback_data="client:reports"),
+                InlineKeyboardButton(text="Ещё", callback_data="client:more"),
             ],
-            [panel, InlineKeyboardButton(text="⚙️ Настройки", callback_data="client:settings")],
+        ]
+    )
+
+
+def client_more_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="👥 Сотрудники", callback_data="client:employees"),
-                InlineKeyboardButton(text="🏢 Рабочие группы", callback_data="client:groups"),
+                InlineKeyboardButton(text="Подключения", callback_data="client:connections"),
+                InlineKeyboardButton(text="Команда", callback_data="client:employees"),
             ],
+            [
+                InlineKeyboardButton(text="Рабочие группы", callback_data="client:groups"),
+                InlineKeyboardButton(text="Настройки", callback_data="client:settings"),
+            ],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")],
         ]
     )
 

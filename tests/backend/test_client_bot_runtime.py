@@ -77,7 +77,7 @@ async def test_runtime_registers_tenant_context_for_group_membership_updates(
         session_factory, make_service, tenant_payload, encryption_key, 1
     )
     runtime = AiogramPollingRuntime(
-        "123456789:abcdefghijklmnopqrstuvwxyzABCDE",
+        "1234567:abcdefghijklmnopqrstuvwxyzABCDE",
         tenant_id,
         bot_ids[0],
         session_factory,

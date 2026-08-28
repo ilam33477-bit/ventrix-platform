@@ -8,7 +8,7 @@ import { useResource } from "../../hooks/use-resource";
 import { cleanExplanation, formatRelativeAge, priorityLabel, priorityTone, problemPerson, problemTitle, PROBLEM_STATUS_LABELS, sortProblemsByPriority } from "../../lib/problem-presentation";
 import type { Problem, ProblemDetail, ProblemStatus } from "../../types";
 
-type ProblemFilter = "all" | Problem["priority"] | "resolved";
+type ProblemFilter = "active" | "urgent" | "resolved";
 type ProblemFeed = { active: Problem[]; resolved: Problem[] };
 
 const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string, "primary" | "secondary" | "ghost"]>>> = {
@@ -149,15 +149,15 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
 
       <Card className="evidence-panel"><div className="evidence-mark" aria-hidden="true">“</div><div><p className="detail-label">ДОКАЗАТЕЛЬСТВО</p><blockquote>{problem.evidence}</blockquote></div></Card>
 
+      <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
+
+      <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}{!CLOSED_STATUSES.has(problem.status) && <div className="detail-quick-close">{confirmingClose ? <><p>Подтвердите, что ситуация действительно завершена.</p><div><Button variant="primary" disabled={busy} onClick={() => void closeProblem()}>{busy ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={busy} onClick={() => setConfirmingClose(false)}>Отмена</Button></div></> : <Button variant="secondary" disabled={busy} onClick={() => setConfirmingClose(true)}>Завершить ситуацию</Button>}</div>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
+
       <div className="detail-section context-section"><p className="detail-label">КОНТЕКСТ</p><h3>Переписка вокруг ситуации</h3>{problem.context_messages.length ? <div className="dialog-context">{problem.context_messages.map((message) => <div className={`${message.outgoing ? "outgoing" : "incoming"} ${message.is_source ? "source" : ""}`} key={message.id}><small>{message.outgoing ? "Сотрудник" : problemPerson(problem)} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p>{message.is_source && <em>Исходное сообщение</em>}</div>)}</div> : <div className="context-empty">Контекст сообщений для этой ситуации не найден.</div>}</div>
 
       <ProblemReplyPanel api={api} problem={problem} onChanged={onChanged} />
 
       <div className="detail-section assignment-section"><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? "Определяется по рабочему аккаунту"}</h3><p className="assignment-note">Ответственный назначается автоматически: это сотрудник, через Telegram-сессию которого пришла ситуация.</p><div className="problem-routing"><div><span>Рабочий аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Диалог</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><div className="assignment-controls single"><label>Срок решения<input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div></div>
-
-      <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
-
-      <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}{!CLOSED_STATUSES.has(problem.status) && <div className="detail-quick-close">{confirmingClose ? <><p>Подтвердите, что ситуация действительно завершена.</p><div><Button variant="primary" disabled={busy} onClick={() => void closeProblem()}>{busy ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={busy} onClick={() => setConfirmingClose(false)}>Отмена</Button></div></> : <Button variant="secondary" disabled={busy} onClick={() => setConfirmingClose(true)}>Завершить ситуацию</Button>}</div>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
 
       {(problem.transitions.length > 0 || problem.verifications.length > 0) && <details className="problem-history"><summary>История ситуации <span>{problem.transitions.length + problem.verifications.length}</span></summary><div className="timeline">{problem.transitions.map((item, index) => <div key={`${item.occurred_at}-${index}`}><i /><p><strong>{PROBLEM_STATUS_LABELS[item.from_status] ?? item.from_status} → {PROBLEM_STATUS_LABELS[item.to_status] ?? item.to_status}</strong><span>{item.reason}</span><small>{new Date(item.occurred_at).toLocaleString("ru-RU")}</small></p></div>)}{problem.verifications.map((item) => <div key={item.checked_at}><i /><p><strong>Проверка исправления: {item.outcome}</strong><span>{item.reason}</span><small>{new Date(item.checked_at).toLocaleString("ru-RU")}</small></p></div>)}</div></details>}
     </section>
@@ -165,7 +165,7 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
 }
 
 export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi; initialProblemId?: string }) {
-  const [filter, setFilter] = useState<ProblemFilter>("all");
+  const [filter, setFilter] = useState<ProblemFilter>("active");
   const loader = useCallback(async (): Promise<ProblemFeed> => {
     const [active, resolved, autoResolved] = await Promise.all([api.problems(), api.problems("resolved"), api.problems("auto_resolved")]);
     return { active, resolved: [...resolved, ...autoResolved] };
@@ -180,7 +180,13 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
 
   const active = useMemo(() => data?.active ?? [], [data]);
   const resolved = useMemo(() => data?.resolved ?? [], [data]);
-  const visible = useMemo(() => sortProblemsByPriority(filter === "resolved" ? resolved : active.filter((item) => filter === "all" || item.priority === filter)), [active, filter, resolved]);
+  const visible = useMemo(() => sortProblemsByPriority(
+    filter === "resolved"
+      ? resolved
+      : filter === "urgent"
+        ? active.filter((item) => ["critical", "high"].includes(item.priority))
+        : active,
+  ), [active, filter, resolved]);
   const criticalCount = active.filter((item) => item.priority === "critical").length;
   const highCount = active.filter((item) => item.priority === "high").length;
   const initialLoading = loading && !data;
@@ -227,19 +233,17 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
   if (detail) return <ProblemDetailPanel api={api} problem={detail} onChanged={refreshDetail} onClose={() => setDetail(null)} />;
 
   const filters: Array<{ value: ProblemFilter; label: string; count?: number }> = [
-    { value: "all", label: "Все", count: active.length },
-    { value: "critical", label: "Критичные", count: criticalCount },
-    { value: "high", label: "Высокие", count: highCount },
-    { value: "medium", label: "Средние", count: active.filter((item) => item.priority === "medium").length },
-    { value: "resolved", label: "Решённые", count: resolved.length },
+    { value: "active", label: "В работе", count: active.length },
+    { value: "urgent", label: "Срочные", count: criticalCount + highCount },
+    { value: "resolved", label: "Завершённые", count: resolved.length },
   ];
 
   return <div className="problems-workspace">
-    <header className="problems-summary"><div><p className="eyebrow">РАБОЧИЕ СИТУАЦИИ</p><h2>{initialLoading ? "Проверяем рабочие ситуации" : active.length ? `${active.length} ${situationWord(active.length)} требуют решения` : "Сейчас всё под контролем"}</h2><p>{initialLoading ? "Собираем актуальные статусы и ответственных." : active.length ? "Сначала показаны самые важные и давно ожидающие реакции ситуации." : "Новых подтверждённых рисков в рабочих диалогах нет."}</p></div>{!initialLoading && <div className="problems-summary-facts"><span><i className="critical" />Критичные<strong>{criticalCount}</strong></span><span><i className="high" />Высокие<strong>{highCount}</strong></span></div>}</header>
+    <header className="problems-summary"><div><h2>{initialLoading ? "Обновляем ситуации" : active.length ? `${active.length} ${situationWord(active.length)} в работе` : "Сейчас всё под контролем"}</h2><p>{initialLoading ? "Получаем актуальные статусы." : active.length ? "Сначала показаны самые важные и давно ожидающие реакции." : "Новых подтверждённых рисков в рабочих диалогах нет."}</p></div>{!initialLoading && (criticalCount + highCount > 0) && <div className="problems-summary-facts"><span><i className="critical" />Срочные<strong>{criticalCount + highCount}</strong></span></div>}</header>
 
     {!initialLoading && <div className="problem-filters" role="tablist" aria-label="Фильтр ситуаций">{filters.map((item) => <button role="tab" aria-selected={filter === item.value} className={filter === item.value ? "active" : ""} key={item.value} onClick={() => setFilter(item.value)}><span>{item.label}</span>{item.count !== undefined && <small>{item.count}</small>}</button>)}</div>}
 
-    {loading ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <Card className={`problem-card priority-${problem.priority}`} key={problem.id}><button className="problem-card-open" onClick={() => void open(problem.id)} disabled={openingId === problem.id}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.connection_username ? `Рабочий аккаунт @${problem.connection_username}` : problem.connection_name ?? "Рабочий аккаунт не указан"}</small></div></div><div className="problem-card-copy"><p className="problem-type">{problemTitle(problem)}</p><h3>{cleanExplanation(problem.explanation)}</h3><blockquote>{problem.evidence}</blockquote></div><div className="problem-card-meta"><span><small>Ответственный</small><strong>{problem.responsible_employee_name ?? "По рабочему аккаунту"}</strong></span><span><small>Статус</small><strong>{PROBLEM_STATUS_LABELS[problem.status] ?? problem.status}</strong></span></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть ситуацию"}</span><b aria-hidden="true">→</b></footer></button><div className="problem-quick-close">{confirmingCloseId === problem.id ? <><span>Завершить эту ситуацию?</span><Button variant="primary" disabled={closingId === problem.id} onClick={() => void quickClose(problem.id)}>{closingId === problem.id ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={closingId === problem.id} onClick={() => setConfirmingCloseId("")}>Отмена</Button></> : <Button variant="secondary" onClick={() => setConfirmingCloseId(problem.id)}>Завершить</Button>}</div></Card>)}</div>}
+    {loading ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <Card className={`problem-card priority-${problem.priority}`} key={problem.id}><button className="problem-card-open" onClick={() => void open(problem.id)} disabled={openingId === problem.id}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.responsible_employee_name ? `Ответственный: ${problem.responsible_employee_name}` : problem.connection_username ? `Ответственный: @${problem.connection_username}` : "Ответственный определяется"}</small></div></div><div className="problem-card-copy"><h3>{problemTitle(problem)}</h3><p>{cleanExplanation(problem.explanation)}</p></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть"}</span><b aria-hidden="true">→</b></footer></button><div className="problem-quick-close">{confirmingCloseId === problem.id ? <><span>Завершить эту ситуацию?</span><Button variant="primary" disabled={closingId === problem.id} onClick={() => void quickClose(problem.id)}>{closingId === problem.id ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={closingId === problem.id} onClick={() => setConfirmingCloseId("")}>Отмена</Button></> : <Button variant="secondary" onClick={() => setConfirmingCloseId(problem.id)}>Завершить</Button>}</div></Card>)}</div>}
 
     {(error || openError) && <div className="inline-error" role="alert"><span>{openError || "Не удалось загрузить ситуации."}</span><button onClick={() => void reload()}>Повторить</button></div>}
     {!loading && !visible.length && <EmptyState title={filter === "resolved" ? "Решённых ситуаций пока нет" : "В этом разделе всё спокойно"} description={filter === "resolved" ? "Здесь появятся ситуации после подтверждённого решения." : "Ventrix продолжает мониторинг и покажет новый риск после проверки контекста."} />}

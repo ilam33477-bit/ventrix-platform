@@ -28,6 +28,7 @@ from packages.ops_core.problems import ProblemStatus
 from ..bot.keyboards import (
     back_to_client_menu,
     client_main_menu,
+    client_more_menu,
     client_welcome_menu,
 )
 from ..intelligence.problem_lifecycle import (
@@ -95,6 +96,12 @@ PROBLEM_STATUS_LABELS = {
     "auto_resolved": "Решена автоматически",
     "reopened": "Открыта повторно",
     "false_positive": "Не проблема",
+}
+PRIORITY_LABELS = {
+    "critical": "Критично",
+    "high": "Важно",
+    "medium": "Средний приоритет",
+    "low": "Низкий приоритет",
 }
 CONNECTION_STATUS_LABELS = {
     "awaiting_code": "ожидает код",
@@ -169,14 +176,23 @@ class TenantOwnerMiddleware(BaseMiddleware):
             and (event.text or "").split("@", 1)[0].strip() == "/ventrix_connect"
         )
         verified_group_admin = False
-        if tenant is not None and user_id is not None and membership is None and group_connect_command:
+        if (
+            tenant is not None
+            and user_id is not None
+            and membership is None
+            and group_connect_command
+        ):
             try:
                 actor_member = await event.bot.get_chat_member(event.chat.id, user_id)
                 verified_group_admin = actor_member.status in {"administrator", "creator"}
             except TelegramBadRequest:
                 verified_group_admin = False
         tenant_scoped_group_event = group_membership_update or verified_group_admin
-        if tenant is None or user_id is None or (membership is None and not tenant_scoped_group_event):
+        if (
+            tenant is None
+            or user_id is None
+            or (membership is None and not tenant_scoped_group_event)
+        ):
             await self.events.record(
                 tenant_id=self.tenant_id,
                 bot_instance_id=self.bot_instance_id,
@@ -302,7 +318,7 @@ def build_client_router(
         else:
             rows = [
                 [
-                    InlineKeyboardButton(text="Решено", callback_data=f"np:close:{problem_id}"),
+                    InlineKeyboardButton(text="Завершить", callback_data=f"np:close:{problem_id}"),
                     InlineKeyboardButton(
                         text="Не проблема", callback_data=f"np:false:{problem_id}"
                     ),
@@ -596,6 +612,15 @@ def build_client_router(
             main=True,
         )
 
+    @router.callback_query(F.data == "client:more")
+    async def more_menu(query: CallbackQuery, client_context: ClientContext) -> None:
+        await record(client_context, "client_more_opened")
+        await edit_screen(
+            query,
+            "<b>Ещё</b>\n\nПодключения, команда и настройки проекта.",
+            client_more_menu(),
+        )
+
     @router.callback_query(F.data.startswith("np:open:"))
     async def notification_problem_open(
         query: CallbackQuery, client_context: ClientContext
@@ -617,19 +642,20 @@ def build_client_router(
         ):
             await query.answer("Эта ситуация назначена другому сотруднику", show_alert=True)
             return
+        if problem.status == ProblemStatus.FALSE_POSITIVE.value:
+            markup = problem_status_markup(problem.id, false_positive=True)
+        elif problem.status in ACTIVE_PROBLEM_STATUSES:
+            markup = problem_status_markup(problem.id)
+        else:
+            markup = problem_system_markup(problem.id)
         await edit_screen(
             query,
             f"<b>{escape(PROBLEM_TYPE_LABELS.get(problem.problem_type, 'Рабочая ситуация'))}</b>\n\n"
             f"Статус: <b>{escape(PROBLEM_STATUS_LABELS.get(problem.status, 'Требует проверки'))}</b>\n"
-            f"Причина: {escape(problem.explanation)}\n\n"
-            f"<blockquote>{escape(problem.evidence or 'Evidence появится после проверки')}</blockquote>\n\n"
-            f"Следующий шаг: {escape(problem.recommended_action)}",
-            InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Закрыть", callback_data=f"np:close:{problem.id}")],
-                    *problem_system_markup(problem.id).inline_keyboard,
-                ]
-            ),
+            f"\n<b>Что произошло</b>\n{escape(problem.explanation)}\n\n"
+            f"<blockquote>{escape(problem.evidence or 'Детали появятся после проверки.')}</blockquote>\n\n"
+            f"<b>Что сделать</b>\n{escape(problem.recommended_action)}",
+            markup,
         )
 
     @router.callback_query(F.data.startswith("np:false:"))
@@ -978,19 +1004,51 @@ def build_client_router(
                     select(OperationalProblem)
                     .where(
                         OperationalProblem.tenant_id == client_context.tenant_id,
-                        OperationalProblem.status.in_(("open", "needs_confirmation")),
+                        OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
                     )
                     .order_by(OperationalProblem.occurred_at.desc())
-                    .limit(10)
+                    .limit(5)
                 )
             )
-        lines = [
-            f"{index}. {escape(item.explanation)} · {escape(item.priority)}"
-            for index, item in enumerate(rows, start=1)
-        ]
-        await render(
+        cards: list[str] = []
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, item in enumerate(rows, start=1):
+            explanation = " ".join((item.explanation or "").split())
+            if len(explanation) > 180:
+                explanation = f"{explanation[:177].rstrip()}…"
+            cards.append(
+                f"<blockquote><b>{index}. {escape(PROBLEM_TYPE_LABELS.get(item.problem_type, 'Рабочая ситуация'))}</b>\n"
+                f"{escape(PRIORITY_LABELS.get(item.priority, 'Требует внимания'))}\n"
+                f"{escape(explanation or 'Откройте ситуацию, чтобы посмотреть детали.')}</blockquote>"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{index}. Открыть ситуацию",
+                        callback_data=f"np:open:{item.id}",
+                    )
+                ]
+            )
+        if mini_app_url:
+            separator = "&" if "?" in mini_app_url else "?"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Все ситуации в Ventrix AI",
+                        web_app=WebAppInfo(url=f"{mini_app_url}{separator}section=problems"),
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
+        await edit_screen(
             query,
-            "<b>Важное</b>\n\n" + ("\n".join(lines) if lines else "Открытых проблем нет."),
+            "<b>Ситуации</b>\n\n"
+            + (
+                "\n\n".join(cards)
+                if cards
+                else "Сейчас нет ситуаций, требующих реакции. Мониторинг продолжается."
+            ),
+            InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
     @router.callback_query(F.data == "client:reports")
