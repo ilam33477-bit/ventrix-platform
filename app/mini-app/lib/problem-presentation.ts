@@ -14,6 +14,17 @@ export const PROBLEM_STATUS_LABELS: Record<string, string> = {
   reopened: "Открыта снова",
 };
 
+export function problemStatusLabel(status: string) {
+  return PROBLEM_STATUS_LABELS[status] ?? "Статус обновлён";
+}
+
+export function verificationOutcomeLabel(outcome: string) {
+  if (outcome === "fixed") return "исправление подтверждено";
+  if (outcome === "not_fixed") return "проблема остаётся";
+  if (outcome === "uncertain") return "нужна ручная проверка";
+  return "проверка завершена";
+}
+
 const PROBLEM_TYPE_LABELS: Record<string, string> = {
   client_without_answer: "Клиент ждёт ответа",
   customer_complaint: "Жалоба клиента",
@@ -22,6 +33,14 @@ const PROBLEM_TYPE_LABELS: Record<string, string> = {
   broken_commitment: "Обещание не выполнено",
   lost_lead: "Риск потерять клиента",
   customer_question: "Вопрос без ответа",
+  technical_problem: "Техническая проблема",
+  payment_question: "Вопрос об оплате",
+  product_dissatisfaction: "Клиент недоволен продуктом",
+  followup_candidate: "Нужно вернуться к клиенту",
+  handoff: "Передача клиента требует внимания",
+  contract_question: "Вопрос по договору или предложению",
+  commercial_question: "Вопрос о стоимости",
+  new_lead: "Новый потенциальный клиент",
   waiting_customer: "Ожидается ответ клиента",
   payment_risk: "Риск по оплате",
   deal_risk: "Сделка под риском",
@@ -32,8 +51,9 @@ const PROBLEM_TYPE_LABELS: Record<string, string> = {
   operational_risk: "Рабочая ситуация требует внимания",
 };
 
-export function problemTitle(problem: Pick<Problem, "type" | "explanation">) {
-  return PROBLEM_TYPE_LABELS[problem.type] ?? humanize(problem.type) ?? cleanExplanation(problem.explanation);
+export function problemTitle(problem: Pick<Problem, "type">) {
+  const normalizedType = problem.type.trim().toLowerCase().replaceAll(" ", "_");
+  return PROBLEM_TYPE_LABELS[normalizedType] ?? "Рабочая ситуация";
 }
 
 export function cleanExplanation(value: string) {
@@ -77,9 +97,4 @@ export function sortProblemsByPriority(items: Problem[]) {
     if (severity !== 0) return severity;
     return new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime();
   });
-}
-
-function humanize(value: string) {
-  const text = value.replaceAll("_", " ").trim();
-  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "";
 }

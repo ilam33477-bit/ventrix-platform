@@ -35,17 +35,25 @@ export class VentrixClientApi {
   ) {}
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.baseUrl}/api/v1/client${path}`, {
-      ...options,
-      headers: {
-        Authorization: `tma ${this.initData}`,
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        ...(options.headers ?? {}),
-      },
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/api/v1/client${path}`, {
+        ...options,
+        headers: {
+          Authorization: `tma ${this.initData}`,
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers ?? {}),
+        },
+      });
+    } catch {
+      throw new ClientApiError(
+        "Не удалось связаться с Ventrix. Проверьте соединение и повторите.",
+        0,
+      );
+    }
     if (!response.ok) {
       const payload = await response.json().catch(() => null) as { detail?: string } | null;
-      throw new ClientApiError(payload?.detail ?? "Не удалось выполнить запрос", response.status);
+      throw new ClientApiError(apiErrorMessage(payload?.detail, response.status), response.status);
     }
     return response.json() as Promise<T>;
   }
@@ -311,4 +319,12 @@ export class VentrixClientApi {
   job<T = Record<string, unknown>>(jobId: string) {
     return this.request<AsyncJob<T>>(`/sync/${jobId}`);
   }
+}
+
+function apiErrorMessage(detail: string | undefined, status: number) {
+  if (status >= 500) return "Ventrix временно не отвечает. Повторите через несколько секунд.";
+  if (!detail || /^(load failed|failed to fetch|network error)$/i.test(detail.trim())) {
+    return "Не удалось загрузить данные. Проверьте соединение и повторите.";
+  }
+  return detail;
 }

@@ -277,9 +277,7 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
   }, [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [adding, setAdding] = useState(false);
-  const [connectionPreviews, setConnectionPreviews] = useState<
-    Record<string, ConnectionAnalysisValue>
-  >({});
+  const [expandedEmployeeId, setExpandedEmployeeId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState<{
     id: string;
     name: string;
@@ -361,22 +359,16 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
         <div className="team-roster">
           <div className="team-overview">
             <div><strong><AnimatedNumber value={data.employees.length} /></strong><span>сотрудников</span></div>
-            <div><strong><AnimatedNumber value={data.connections.filter((item) => ["connected", "syncing", "ready"].includes(item.status)).length} /></strong><span>сессий активно</span></div>
             <div><strong><AnimatedNumber value={data.problems.filter((item) => !["resolved", "auto_resolved", "false_positive", "ignored"].includes(item.status)).length} /></strong><span>ситуаций в работе</span></div>
           </div>
           <div className="team-list">
           {data.employees.map((item) => {
             const connection = data.connections.find((row) => row.id === item.connection_id || row.employee_id === item.id);
-            const connectionPreview = connection
-              ? connectionPreviews[connection.id] ?? {
-                  response_sla_minutes: connection.response_sla_minutes,
-                  signal_problem_threshold: connection.signal_problem_threshold,
-                }
-              : null;
             const assignedProblems = data.problems.filter((row) => row.responsible_employee_id === item.id && !["resolved", "auto_resolved", "false_positive", "ignored"].includes(row.status));
             const openCommitments = data.commitments.filter((row) => row.employee_id === item.id && row.status === "open");
+            const expanded = expandedEmployeeId === item.id;
             return (
-            <Card className="employee-card" key={item.id}>
+            <Card className={`employee-card${expanded ? " expanded" : ""}`} key={item.id}>
               <div className="person-row">
                 <span>{item.name.slice(0, 2).toUpperCase()}</span>
                 <div>
@@ -391,66 +383,66 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                   {connection ? connectionStatusLabel(connection.status) : "Не подключён"}
                 </StatusBadge>
               </div>
-              <div className="employee-workload">
-                <div><strong>{assignedProblems.length}</strong><span>ситуаций в работе</span></div>
-                <div><strong>{openCommitments.length}</strong><span>открытых обещаний</span></div>
-                <div className="employee-analysis-summary">
-                  <span>
-                    <strong>{connectionPreview ? `${connectionPreview.signal_problem_threshold}/100` : "—"}</strong>
-                    <small>порог сообщений</small>
-                  </span>
-                  <span>
-                    <strong>{connectionPreview ? `${connectionPreview.response_sla_minutes} мин.` : "—"}</strong>
-                    <small>время на ответ</small>
-                  </span>
-                </div>
+              <div className="employee-card-glance">
+                <span><strong>{assignedProblems.length}</strong> в работе</span>
+                <span><strong>{openCommitments.length}</strong> обещаний</span>
               </div>
-              <div className="employee-meta">
-                <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
-                <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
-                <span><small>Бот проекта</small><strong>{item.bot_started ? "Запущен" : "Ещё не открыт"}</strong></span>
-              </div>
-              {connection && canManage && (
-                <ConnectionAnalysisControls
-                  key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
-                  responseMinutes={connection.response_sla_minutes}
-                  problemThreshold={connection.signal_problem_threshold}
-                  onPreview={(value) =>
-                    setConnectionPreviews((current) => ({
-                      ...current,
-                      [connection.id]: value,
-                    }))
-                  }
-                  onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
-                />
-              )}
-              {canManage && <label className="toggle-row employee-report-access"><span><strong>Все отчёты проекта</strong><small>По умолчанию сотрудник видит только собственные данные.</small></span><input type="checkbox" checked={item.reports_access_all} onChange={async (event) => { await api.updateEmployee(item.id, { reports_access_all: event.target.checked }); await reload(); }} /></label>}
-              {canManage && <div
-                className={`employee-actions ${deleting === item.id ? "" : "single-action"}`}
+              <div
+                className="employee-card-details"
+                id={`employee-details-${item.id}`}
+                hidden={!expanded}
               >
-                {connection ? (
-                  <button
-                    className="danger-action"
-                    onClick={() => void remove(item.id)}
-                  >
-                    {deleting === item.id
-                      ? "Подтвердить удаление"
-                      : "Удалить сотрудника и сессию"}
-                  </button>
-                ) : (
-                  <button
-                    className="primary-action"
-                    onClick={() =>
-                      setConnecting({ id: item.id, name: item.name })
-                    }
-                  >
-                    Подключить Telegram
-                  </button>
+                <div className="employee-meta">
+                  <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
+                  <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
+                  <span><small>Бот проекта</small><strong>{item.bot_started ? "Запущен" : "Ещё не открыт"}</strong></span>
+                </div>
+                {connection && canManage && (
+                  <ConnectionAnalysisControls
+                    key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
+                    responseMinutes={connection.response_sla_minutes}
+                    problemThreshold={connection.signal_problem_threshold}
+                    onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
+                  />
                 )}
-                {deleting === item.id && (
-                  <button onClick={() => setDeleting(null)}>Отмена</button>
-                )}
-              </div>}
+                {canManage && <label className="toggle-row employee-report-access"><span><strong>Все отчёты проекта</strong><small>По умолчанию сотрудник видит только собственные данные.</small></span><input type="checkbox" checked={item.reports_access_all} onChange={async (event) => { await api.updateEmployee(item.id, { reports_access_all: event.target.checked }); await reload(); }} /></label>}
+                {canManage && <div
+                  className={`employee-actions ${deleting === item.id ? "" : "single-action"}`}
+                >
+                  {connection ? (
+                    <button
+                      className="danger-action"
+                      onClick={() => void remove(item.id)}
+                    >
+                      {deleting === item.id
+                        ? "Подтвердить удаление"
+                        : "Удалить сотрудника и сессию"}
+                    </button>
+                  ) : (
+                    <button
+                      className="primary-action"
+                      onClick={() =>
+                        setConnecting({ id: item.id, name: item.name })
+                      }
+                    >
+                      Подключить Telegram
+                    </button>
+                  )}
+                  {deleting === item.id && (
+                    <button onClick={() => setDeleting(null)}>Отмена</button>
+                  )}
+                </div>}
+              </div>
+              <button
+                type="button"
+                className="employee-settings-toggle"
+                aria-expanded={expanded}
+                aria-controls={`employee-details-${item.id}`}
+                onClick={() => setExpandedEmployeeId(expanded ? null : item.id)}
+              >
+                <span>{expanded ? "Свернуть настройки" : "Настройки сотрудника"}</span>
+                <i aria-hidden="true" />
+              </button>
             </Card>
           );})}
           </div>
@@ -484,12 +476,10 @@ function sameConnectionAnalysisValue(
 function ConnectionAnalysisControls({
   responseMinutes: initialResponseMinutes,
   problemThreshold: initialProblemThreshold,
-  onPreview,
   onCommit,
 }: {
   responseMinutes: number;
   problemThreshold: number;
-  onPreview: (value: ConnectionAnalysisValue) => void;
   onCommit: (value: ConnectionAnalysisValue) => Promise<unknown>;
 }) {
   const [responseMinutes, setResponseMinutes] = useState(initialResponseMinutes);
@@ -553,7 +543,6 @@ function ConnectionAnalysisControls({
     setResponseMinutes(value.response_sla_minutes);
     setProblemThreshold(value.signal_problem_threshold);
     setError("");
-    onPreview(value);
     scheduleSave();
   }
 
