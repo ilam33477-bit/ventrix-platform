@@ -61,7 +61,7 @@ from ..services.employee_access import claim_employee_by_username
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
 from ..timezones import timezone_info
-from .links import direct_mini_app_link
+from .links import private_bot_link
 from .states import TelegramConnectionStates
 
 
@@ -284,24 +284,30 @@ def build_client_router(
                     raise
         await query.answer()
 
-    def problem_system_markup(problem_id: str) -> InlineKeyboardMarkup:
+    def mini_app_section_markup(
+        text: str,
+        section: str,
+        *,
+        problem_id: str | None = None,
+    ) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
         if mini_app_url:
             separator = "&" if "?" in mini_app_url else "?"
+            target = f"{mini_app_url}{separator}section={section}"
+            if problem_id:
+                target = f"{target}&problem_id={problem_id}"
             rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="Посмотреть в системе",
-                        web_app=WebAppInfo(
-                            url=(
-                                f"{mini_app_url}{separator}section=problems&problem_id={problem_id}"
-                            )
-                        ),
-                    )
-                ]
+                [InlineKeyboardButton(text=text, web_app=WebAppInfo(url=target))]
             )
         rows.append([InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def problem_system_markup(problem_id: str) -> InlineKeyboardMarkup:
+        return mini_app_section_markup(
+            "Посмотреть в системе",
+            "problems",
+            problem_id=problem_id,
+        )
 
     def problem_status_markup(
         problem_id: str, *, false_positive: bool = False
@@ -522,6 +528,12 @@ def build_client_router(
     @router.message(CommandStart())
     async def start(message: Message, client_context: ClientContext) -> None:
         tenant = client_context.tenant
+        start_parameter = ""
+        if message.text:
+            command_parts = message.text.split(maxsplit=1)
+            if len(command_parts) == 2:
+                start_parameter = command_parts[1].strip()
+        linked_problem: OperationalProblem | None = None
         async with events.session_factory() as session:
             membership = await session.scalar(
                 select(TenantMembership).where(
@@ -532,6 +544,20 @@ def build_client_router(
             if membership is not None and membership.bot_started_at is None:
                 membership.bot_started_at = datetime.now(UTC)
                 await session.commit()
+            if start_parameter.startswith("problem_"):
+                problem_id = start_parameter.removeprefix("problem_")
+                linked_problem = await session.scalar(
+                    select(OperationalProblem).where(
+                        OperationalProblem.id == problem_id,
+                        OperationalProblem.tenant_id == tenant.id,
+                    )
+                )
+                if (
+                    linked_problem is not None
+                    and client_context.role == "employee"
+                    and linked_problem.responsible_employee_id != client_context.employee_id
+                ):
+                    linked_problem = None
             connections = list(
                 await session.scalars(
                     select(TelegramConnection)
@@ -567,6 +593,34 @@ def build_client_router(
                 )
         await record(client_context, "client_user_started_bot")
         await record(client_context, "client_menu_opened")
+        if start_parameter.startswith("problem_"):
+            if linked_problem is None:
+                await message.answer(
+                    "Эта ситуация недоступна вашему аккаунту или уже удалена.",
+                    reply_markup=client_main_menu(mini_app_url),
+                )
+                return
+            await message.answer(
+                f"<b>{escape(PROBLEM_TYPE_LABELS.get(linked_problem.problem_type, 'Рабочая ситуация'))}</b>\n\n"
+                f"{escape(linked_problem.title)}\n\n"
+                f"Статус: <b>{escape(PROBLEM_STATUS_LABELS.get(linked_problem.status, linked_problem.status))}</b>\n"
+                f"Приоритет: <b>{escape(PRIORITY_LABELS.get(linked_problem.priority, linked_problem.priority))}</b>\n\n"
+                "Откройте Ventrix AI, чтобы увидеть переписку и доступные действия.",
+                reply_markup=problem_system_markup(linked_problem.id),
+            )
+            return
+        if start_parameter.startswith("report_"):
+            await message.answer(
+                "<b>Регулярная сводка готова</b>\n\nОткройте Ventrix AI, чтобы посмотреть полный отчёт по проекту.",
+                reply_markup=mini_app_section_markup("Открыть отчёты", "reports"),
+            )
+            return
+        if start_parameter == "group_connected":
+            await message.answer(
+                "<b>Рабочая группа подключена</b>\n\nНастройте доставку карточек и регулярных отчётов в разделе «Команда».",
+                reply_markup=mini_app_section_markup("Открыть команду", "employees"),
+            )
+            return
         first_name = (
             (message.from_user.first_name if message.from_user else None)
             or (tenant.owner_name or "").strip().split()[0]
@@ -2120,7 +2174,7 @@ def build_client_router(
                     [
                         InlineKeyboardButton(
                             text="Открыть Ventrix AI",
-                            url=direct_mini_app_link(
+                            url=private_bot_link(
                                 (await message.bot.get_me()).username or "",
                                 "group_connected",
                             ),

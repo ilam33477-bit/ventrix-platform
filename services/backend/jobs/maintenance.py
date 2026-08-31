@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..analysis.service import AnalysisPipelineService
 from ..bot.sqlite_storage import SQLiteFSMStorage
-from ..client_bots.links import direct_mini_app_link
+from ..client_bots.links import private_bot_link
 from ..config import get_settings
 from ..database import SQLiteTransactionManager
 from ..models import (
@@ -259,7 +259,7 @@ class MaintenanceJobHandlers:
                             BotInstance, destination_group.bot_instance_id
                         )
                         if destination_bot is not None:
-                            destination_report_url = direct_mini_app_link(
+                            destination_report_url = private_bot_link(
                                 destination_bot.username,
                                 f"report_{report.id}",
                             )

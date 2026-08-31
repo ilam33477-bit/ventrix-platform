@@ -56,13 +56,17 @@ export function useMiniAppSession() {
   ) => {
     if (!api || !session) return;
     const onboarding = await api.updateOnboarding(step, status);
+    // Login completion changes the connection list and sync progress together
+    // with the onboarding step. Reload that snapshot before rendering the next
+    // screen so it cannot show the stale pre-login empty state.
+    const bootstrap = await api.bootstrap();
     setSession((current) => current ? {
       ...current,
       auth: {
         ...current.auth,
         project_context: { ...current.auth.project_context, onboarding },
       },
-      bootstrap: { ...current.bootstrap, onboarding },
+      bootstrap: { ...bootstrap, onboarding },
     } : current);
   }, [api, session]);
 

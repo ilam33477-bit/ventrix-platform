@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.api.deepseek import DeepSeekProvider
 
+from ..client_bots.menu import ensure_mini_app_menu_button
 from ..config import Settings
 from ..jobs.queue import SQLiteJobQueue
 from ..models import (
@@ -378,6 +379,7 @@ def bot_card(bot: Any, tenant_name: str, unique_users: int = 0, miniapp_opens: i
         f"Название: {escape(bot.display_name)}\n"
         f"Username: @{escape(bot.username)}\n"
         f"Клиент: {escape(tenant_name)}\n"
+        "Mini App: кнопка Ventrix AI включается автоматически\n"
         f"Runtime: {escape(bot.runtime_status)}\n"
         f"Последний запуск: {bot.last_started_at.isoformat() if bot.last_started_at else '—'}\n"
         f"Последнее событие: {bot.last_update_at.isoformat() if bot.last_update_at else '—'}\n"
@@ -1665,6 +1667,8 @@ async def bot_create_finish(
 ) -> None:
     token = message.text or ""
     data = await state.get_data()
+    menu_configured = False
+    menu_error = ""
     try:
         await message.delete()
     except Exception:  # noqa: BLE001 - secret message deletion is best-effort
@@ -1675,6 +1679,17 @@ async def bot_create_finish(
             service = service_for(session, settings, telegram_verifier)
             bot = await service.create_bot(data["tenant_id"], payload)
             tenant = await service.get_tenant(data["tenant_id"])
+        if settings.client_mini_app_url:
+            client_bot = Bot(token=token)
+            try:
+                await ensure_mini_app_menu_button(client_bot, settings.client_mini_app_url)
+                menu_configured = True
+            except TelegramAPIError as exc:
+                menu_error = type(exc).__name__
+            finally:
+                await client_bot.session.close()
+        else:
+            menu_error = "CLIENT_MINI_APP_URL не настроен"
     except (ValidationError, BotTokenVerificationError, BotAlreadyExistsError) as exc:
         await update_flow_screen(
             message,
@@ -1686,16 +1701,26 @@ async def bot_create_finish(
         token = ""
     await state.clear()
     stats = await ProductEventService(session_factory).stats(bot.id, bot.tenant_id)
+    setup_status = (
+        "<b>✅ Mini App подключена</b>\n"
+        "Кнопка <b>Ventrix AI</b> установлена в меню клиентского бота. "
+        "Клиент увидит её после открытия бота.\n\n"
+        if menu_configured
+        else "<b>⚠️ Настройка Mini App не завершена</b>\n"
+        f"Кнопка Ventrix AI не установлена: {escape(menu_error)}. "
+        "Проверьте URL Mini App и перезапустите клиентского бота.\n\n"
+    )
     try:
         await message.bot.edit_message_text(
             chat_id=data["screen_chat_id"],
             message_id=data["screen_message_id"],
-            text=bot_card(bot, tenant.name, stats.unique_users),
+            text=setup_status + bot_card(bot, tenant.name, stats.unique_users),
             reply_markup=bot_actions(bot.id, bot.username),
         )
     except TelegramBadRequest:
         await message.answer(
-            bot_card(bot, tenant.name), reply_markup=bot_actions(bot.id, bot.username)
+            setup_status + bot_card(bot, tenant.name),
+            reply_markup=bot_actions(bot.id, bot.username),
         )
 
 

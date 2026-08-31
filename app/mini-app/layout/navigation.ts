@@ -5,7 +5,7 @@ export const primaryTabs: Array<{ id: TabId; label: string; icon: IconName }> = 
   { id: "dashboard", label: "Главная", icon: "home" },
   { id: "problems", label: "Ситуации", icon: "alert" },
   { id: "reports", label: "Отчёты", icon: "report" },
-  { id: "more", label: "Ещё", icon: "more" },
+  { id: "employees", label: "Команда", icon: "team" },
 ];
 
 export const allSections: Array<{ id: TabId; label: string; icon: IconName }> = [

@@ -13,8 +13,6 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    MenuButtonWebApp,
-    WebAppInfo,
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -26,6 +24,7 @@ from ..services.encryption import EncryptionService
 from ..services.product_events import ProductEventService
 from ..telegram_sessions.service import TelegramConnectionService
 from .handlers import TenantOwnerMiddleware, build_client_router
+from .menu import ensure_mini_app_menu_button
 
 logger = logging.getLogger(__name__)
 
@@ -109,21 +108,7 @@ class AiogramPollingRuntime:
         if not self.mini_app_url:
             return
         try:
-            current = await self.bot.get_chat_menu_button()
-            current_url = getattr(getattr(current, "web_app", None), "url", None)
-            current_text = getattr(current, "text", None)
-            if (
-                current_url
-                and current_url.rstrip("/") == self.mini_app_url.rstrip("/")
-                and current_text == "Ventrix AI"
-            ):
-                return
-            await self.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="Ventrix AI",
-                    web_app=WebAppInfo(url=self.mini_app_url),
-                )
-            )
+            await ensure_mini_app_menu_button(self.bot, self.mini_app_url)
         except TelegramBadRequest as exc:
             logger.warning(
                 "Could not synchronize Mini App menu button for tenant %s (%s)",

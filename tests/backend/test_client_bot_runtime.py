@@ -10,7 +10,7 @@ from aiogram.types import MenuButtonCommands
 from sqlalchemy import select
 
 from services.backend.client_bots.handlers import TenantOwnerMiddleware
-from services.backend.client_bots.links import direct_mini_app_link
+from services.backend.client_bots.links import private_bot_link
 from services.backend.client_bots.runtime import AiogramPollingRuntime, ClientBotRuntimeManager
 from services.backend.models import BotInstance, EncryptedSecret, ProductEvent
 from services.backend.schemas import BotCreate
@@ -32,10 +32,17 @@ class FakeRuntime:
         self.stopped.set()
 
 
-def test_group_mini_app_link_uses_telegram_startapp() -> None:
-    assert direct_mini_app_link("@ventrix_bot", "problem_abc-123") == (
-        "https://t.me/ventrix_bot?startapp=problem_abc-123"
+def test_group_button_uses_private_bot_deep_link() -> None:
+    assert private_bot_link("@ventrix_bot", "problem_abc-123") == (
+        "https://t.me/ventrix_bot?start=problem_abc-123"
     )
+
+
+def test_private_bot_link_sanitizes_and_limits_start_payload() -> None:
+    link = private_bot_link("ventrix_bot", "report:" + "а" * 100 + " final")
+
+    assert link == "https://t.me/ventrix_bot?start=report_final"
+    assert len(link.removeprefix("https://t.me/ventrix_bot?start=")) <= 64
 
 
 class FakeFactory:

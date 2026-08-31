@@ -78,7 +78,7 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
       </Card>
       {bootstrap.connections.length > 0
         ? <ConnectionManager api={api} connections={bootstrap.connections} mode="onboarding_groups" />
-        : <Card className="warning-card"><h3>Telegram пока не подключён</h3><p>Группы можно добавить позже в разделе «Источники».</p></Card>}
+        : <Card className="warning-card"><h3>Рабочий Telegram ещё не подключён</h3><p>Группы можно добавить позже в разделе «Команда».</p></Card>}
       <div className="onboarding-actions"><button className="primary-action" onClick={() => void onAdvance("notifications")}>Продолжить</button><button className="text-action" onClick={() => void onAdvance("notifications", "skipped")}>Пропустить этот шаг</button></div>
     </OnboardingFrame>;
   }
@@ -115,10 +115,8 @@ export function OnboardingFlow({ api, bootstrap, onAdvance }: {
     const items: Array<[IconName, string, string]> = [
       ["home", "Главная", "Состояние проекта и то, что требует внимания."],
       ["alert", "Ситуации", "Контекст, ответственный, срок и действия."],
-      ["report", "Отчёты", "Регулярные итоги по компании и команде."],
-      ["team", "Команда", "Сотрудники, их доступ и рабочие аккаунты."],
-      ["telegram", "Источники", "Telegram-аккаунты и подключённые группы."],
-      ["settings", "Настройки", "Расписание, чувствительность и уведомления."],
+      ["report", "Отчёты", "Регулярные итоги и динамика работы команды."],
+      ["team", "Команда", "Сотрудники, Telegram-аккаунты и рабочие группы."],
     ];
     return <OnboardingFrame step={step} title="Где что находится">
       <div className="quick-guide">{items.map(([icon, title, text]) => <div key={title}><Icon name={icon} /><span><strong>{title}</strong><small>{text}</small></span></div>)}</div>
@@ -236,7 +234,7 @@ function FinalReview({ api, initial, onAdvance }: { api: VentrixClientApi; initi
 
 function Summary({ label, value }: { label: string; value: number | undefined }) { return <div><small>{label}</small><strong>{typeof value === "number" ? <AnimatedNumber value={value} /> : "—"}</strong></div>; }
 function StatusRow({ label, value, ok = false }: { label: string; value: string; ok?: boolean }) { return <div><span>{label}</span><StatusBadge tone={ok ? "success" : "neutral"}>{value}</StatusBadge></div>; }
-function numericMetric(metrics: Bootstrap["progress"] extends infer _ ? Record<string, number | string | null> | undefined : never, key: string) { const value = metrics?.[key]; return typeof value === "number" ? value : undefined; }
+function numericMetric(metrics: Record<string, number | string | null> | undefined, key: string) { const value = metrics?.[key]; return typeof value === "number" ? value : undefined; }
 function syncStageLabel(stage?: string, status?: string) { if (status === "completed") return "Готово"; if (!stage) return "Подготавливаем синхронизацию"; if (stage.includes("message")) return "Собираем сообщения"; if (stage.includes("analysis")) return "Анализируем диалоги"; if (stage.includes("dialog")) return "Находим рабочие диалоги"; return "Синхронизация продолжается"; }
 function reportSchedule(settings: ClientSettings) { const frequency = settings.enabled_days.length === 7 ? "ежедневно" : settings.enabled_days.length === 1 ? "раз в неделю" : "по будням"; return `${frequency}, ${settings.daily_report_time.slice(0, 5)}`; }
 
