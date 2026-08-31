@@ -24,6 +24,14 @@ NEGATIVE_RE = re.compile(
 )
 TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+PRICE_QUESTION_RE = re.compile(
+    r"(?:цен[ауы]|стоимост|сколько(?:\s+это)?\s+сто|тариф|оплат)", re.IGNORECASE
+)
+PRICE_ANSWER_RE = re.compile(
+    r"(?:\b\d[\d\s]*(?:₽|руб(?:л(?:ей|я|ь))?|р\.?|usd|доллар|€|eur)?\b|"
+    r"стоимост|цен[ауы]|тариф|за\s+(?:недел|месяц|год)|в\s+(?:недел|месяц|год))",
+    re.IGNORECASE,
+)
 
 
 class RemediationAIProvider(Protocol):
@@ -152,11 +160,24 @@ class RemediationVerifier:
                 "rule",
                 evidence_ids,
             )
+        if (
+            problem.problem_type == "payment_question"
+            and PRICE_QUESTION_RE.search(problem.evidence or "")
+            and any(PRICE_ANSWER_RE.search(text) for text in texts)
+        ):
+            return RemediationDecision(
+                "fixed",
+                0.95,
+                "Сотрудник дал конкретный ответ по цене или условиям оплаты.",
+                "rule",
+                evidence_ids,
+            )
         if problem.problem_type in {
             "waiting_customer",
             "client_without_answer",
             "customer_question",
             "commercial_opportunity",
+            "payment_question",
         }:
             source_tokens = self._meaningful_tokens(problem.evidence)
             response_tokens = self._meaningful_tokens(" ".join(texts))

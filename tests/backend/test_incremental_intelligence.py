@@ -118,9 +118,10 @@ class IncrementalGateway:
 
 
 class FakeTriageProvider:
-    def __init__(self, criticality: int = 92) -> None:
+    def __init__(self, criticality: int = 92, *, manager_notification: bool = True) -> None:
         self.calls = 0
         self.criticality = criticality
+        self.manager_notification = manager_notification
 
     async def generate_json(self, **kwargs):
         self.calls += 1
@@ -131,7 +132,7 @@ class FakeTriageProvider:
                     "category": "contract_question",
                     "requires_immediate_attention": True,
                     "requires_employee_notification": True,
-                    "requires_manager_notification": True,
+                    "requires_manager_notification": self.manager_notification,
                     "reason": "Клиент готов начать и запросил договор.",
                     "recommended_action": "Ответить клиенту и отправить договор.",
                     "recommended_deadline_minutes": 15,
@@ -358,6 +359,92 @@ async def test_ai_unanswered_candidate_cannot_create_problem_before_sla(
 
 
 @pytest.mark.asyncio
+async def test_stale_ai_price_candidate_cannot_create_problem_after_employee_reply(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    gateway = IncrementalGateway()
+    tenant, connection, dialog, _ = await _connection_with_dialog(
+        session_factory, make_service, tenant_payload, encryption_key, gateway
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        question = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=601,
+            sender_role="customer",
+            sent_at=now,
+            outgoing=False,
+            body_text="А после цена какая?",
+            attachments_json=[],
+        )
+        session.add(question)
+        await session.flush()
+        signal = Signal(
+            tenant_id=tenant.id,
+            telegram_connection_id=connection.id,
+            dialog_id=dialog.id,
+            source_message_id=question.id,
+            fingerprint="price-question-answered-before-triage",
+            signal_type="payment_question",
+            local_score=90,
+            criticality=90,
+            status="candidate",
+            reason="Клиент спросил цену.",
+            detected_at=now,
+            metadata_json={},
+        )
+        session.add(signal)
+        session.add(
+            TelegramMessage(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                telegram_message_id=602,
+                sender_role="account_owner",
+                sent_at=now + timedelta(seconds=15),
+                outgoing=True,
+                body_text="После триала стоимость 699 рублей в неделю или 999 рублей в месяц.",
+                attachments_json=[],
+            )
+        )
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        await session.commit()
+        signal_id = signal.id
+
+    result = TriageResult(
+        criticality=90,
+        category="payment_question",
+        requires_immediate_attention=True,
+        requires_employee_notification=True,
+        requires_manager_notification=True,
+        reason="Клиент ожидает ответ по цене.",
+        recommended_action="Ответить клиенту по тарифам.",
+        recommended_deadline_minutes=30,
+        needs_deep_analysis=False,
+        message_class="business",
+        business_relevance=True,
+        conversation_state="WAITING_FOR_EMPLOYEE",
+        response_required=True,
+        action_required=True,
+        issue_family="PAYMENT_QUESTION",
+        confidence=0.95,
+    )
+    problem_id = await AITriageService(
+        session_factory, SQLiteJobQueue(session_factory), None, model="test"
+    )._apply_result(signal_id, result, settings, False)
+
+    assert problem_id is None
+    async with session_factory() as session:
+        stored_signal = await session.get(Signal, signal_id)
+        assert stored_signal.status == "history"
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_incremental_ingestion_is_idempotent_and_recovers_cursor_after_restart(
     session_factory, make_service, tenant_payload, encryption_key
 ) -> None:
@@ -541,7 +628,11 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
         settings = await session.scalar(
             select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
         )
-        settings.group_reminders_enabled = True
+        # Per-group delivery is authoritative. The legacy tenant-wide flag may
+        # remain disabled for projects created before group controls moved into
+        # the group card.
+        settings.group_reminders_enabled = False
+        settings.group_notification_threshold = 100
         await session.flush()
         signal = Signal(
             tenant_id=tenant.id,
@@ -571,7 +662,7 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     )
     lease = await queue.claim_next("triage-test")
     assert lease is not None and lease.id == job_id
-    provider = FakeTriageProvider()
+    provider = FakeTriageProvider(manager_notification=False)
     result = await AITriageService(session_factory, queue, provider, model="deepseek-test").triage(
         lease
     )

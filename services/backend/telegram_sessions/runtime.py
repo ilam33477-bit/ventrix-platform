@@ -1285,6 +1285,9 @@ async def run() -> None:
     session_factory = get_session_factory()
     settings = await load_runtime_secret_overrides(session_factory, settings)
     configure_structured_logging(settings.log_level)
+    # Telethon's per-channel difference messages are useful for deep debugging
+    # but can produce hundreds of megabytes of logs in a long-lived runtime.
+    logging.getLogger("telethon").setLevel(logging.WARNING)
     if not settings.telegram_api_id or not settings.telegram_api_hash:
         raise RuntimeError("Telegram API credentials are required")
     runtime = TelegramSessionRuntime(

@@ -326,6 +326,22 @@ async def test_remediation_verifier_does_not_treat_acknowledgement_as_fix(
     assert handled.outcome == "fixed"
     assert handled.confidence >= verifier.auto_close_confidence
 
+    problem.problem_type = "payment_question"
+    problem.evidence = "А после цена какая?"
+    price_reply = TelegramMessage(
+        tenant_id=problem.tenant_id,
+        connection_id=connection.id,
+        dialog_id=dialog.id,
+        telegram_message_id=source.telegram_message_id + 4,
+        sent_at=datetime.now(UTC),
+        outgoing=True,
+        body_text="После триала стоимость 699 рублей в неделю или 999 рублей в месяц.",
+        attachments_json=[],
+    )
+    priced = await verifier.verify(problem, [price_reply])
+    assert priced.outcome == "fixed"
+    assert priced.confidence >= verifier.auto_close_confidence
+
 
 @pytest.mark.asyncio
 async def test_assigned_problem_can_be_marked_false_positive(

@@ -347,6 +347,8 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees", headers={"Authorization": f"tma {init_data}"}
         )
         assert employees.json()[0]["telegram_user_id"] == 700001
+        assert employees.json()[0]["active_problem_count"] == 0
+        assert employees.json()[0]["open_commitment_count"] == 0
         updated_employee = await client.patch(
             f"/api/v1/client/employees/{employee.json()['id']}",
             headers={"Authorization": f"tma {init_data}"},

@@ -52,7 +52,7 @@ const PROBLEM_TYPE_LABELS: Record<string, string> = {
 };
 
 export function problemTitle(problem: Pick<Problem, "type">) {
-  const normalizedType = problem.type.trim().toLowerCase().replaceAll(" ", "_");
+  const normalizedType = problem.type.trim().toLowerCase().replace(/[\s-]+/g, "_");
   return PROBLEM_TYPE_LABELS[normalizedType] ?? "Рабочая ситуация";
 }
 

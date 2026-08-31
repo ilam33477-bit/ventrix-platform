@@ -187,9 +187,7 @@ async def test_problem_reply_is_tenant_scoped_idempotent_and_uses_actor_lifecycl
     assert first["id"] == second["id"]
 
     async with session_factory() as session:
-        assert (
-            int(await session.scalar(select(func.count(OutboundTelegramMessage.id))) or 0) == 1
-        )
+        assert int(await session.scalar(select(func.count(OutboundTelegramMessage.id))) or 0) == 1
         assert (
             int(
                 await session.scalar(
@@ -201,6 +199,18 @@ async def test_problem_reply_is_tenant_scoped_idempotent_and_uses_actor_lifecycl
             )
             == 1
         )
+        pending_conversation = await problem_conversation(
+            problem.id, context, before=None, limit=30, session=session
+        )
+    assert pending_conversation["outbound_commands"] == [
+        {
+            "id": first["id"],
+            "client_request_id": str(request_id),
+            "text": payload.text,
+            "status": "pending",
+            "telegram_message_id": None,
+        }
+    ]
 
     queue = SQLiteJobQueue(session_factory)
     lease = await queue.claim_next(
@@ -229,9 +239,7 @@ async def test_problem_reply_is_tenant_scoped_idempotent_and_uses_actor_lifecycl
         outgoing = await session.scalar(
             select(TelegramMessage).where(TelegramMessage.telegram_message_id == 90210)
         )
-        state = await session.scalar(
-            select(DialogState).where(DialogState.tenant_id == tenant.id)
-        )
+        state = await session.scalar(select(DialogState).where(DialogState.tenant_id == tenant.id))
         refreshed_problem = await session.get(OperationalProblem, problem.id)
     assert command.status == "sent" and command.telegram_message_id == 90210
     assert outgoing is not None and outgoing.outgoing is True
@@ -243,6 +251,7 @@ async def test_problem_reply_is_tenant_scoped_idempotent_and_uses_actor_lifecycl
             problem.id, context, before=None, limit=30, session=session
         )
     assert [item["telegram_message_id"] for item in conversation["messages"]] == [10, 90210]
+    assert conversation["outbound_commands"][0]["status"] == "sent"
 
 
 @pytest.mark.asyncio

@@ -75,6 +75,7 @@ class SignalService:
 
         signal_ids = await self.transactions.run(write)
         await self._schedule_temporal_jobs([message_id])
+        await self._schedule_problem_evaluations([message_id])
         async with self.session_factory() as session:
             signals = list(await session.scalars(select(Signal).where(Signal.id.in_(signal_ids))))
         jobs = await self.enqueue_triage(signals)
@@ -120,6 +121,7 @@ class SignalService:
 
         signal_ids = await self.transactions.run(write)
         await self._schedule_temporal_jobs(message_ids)
+        await self._schedule_problem_evaluations(message_ids)
         async with self.session_factory() as session:
             signals = list(await session.scalars(select(Signal).where(Signal.id.in_(signal_ids))))
         jobs = await self.enqueue_triage(signals)
@@ -147,11 +149,11 @@ class SignalService:
         )
         if not relevance.business_relevant:
             assessment = assess_conversation([*previous, message])
-            if (
-                relevance.message_class == "social"
-                and assessment.conversation_state
-                in {"CLOSED_SUCCESS", "CLOSED_REJECTED", "CLOSED_NEUTRAL"}
-            ):
+            if relevance.message_class == "social" and assessment.conversation_state in {
+                "CLOSED_SUCCESS",
+                "CLOSED_REJECTED",
+                "CLOSED_NEUTRAL",
+            }:
                 await self._update_dialog_state(
                     session,
                     message,
@@ -375,6 +377,61 @@ class SignalService:
                     category="reconciliation",
                     cost_class="light",
                 )
+
+    async def _schedule_problem_evaluations(self, message_ids: list[str]) -> None:
+        """Verify open cards immediately after a new employee reply is ingested."""
+        async with self.session_factory() as session:
+            replies = list(
+                await session.scalars(
+                    select(TelegramMessage).where(
+                        TelegramMessage.id.in_(message_ids),
+                        TelegramMessage.outgoing.is_(True),
+                        TelegramMessage.deleted_at.is_(None),
+                    )
+                )
+            )
+            if not replies:
+                return
+            dialogs = {item.dialog_id for item in replies}
+            problems = list(
+                await session.scalars(
+                    select(OperationalProblem).where(
+                        OperationalProblem.dialog_id.in_(dialogs),
+                        OperationalProblem.status.in_(
+                            (
+                                "new",
+                                "needs_confirmation",
+                                "acknowledged",
+                                "assigned",
+                                "in_progress",
+                                "waiting",
+                                "reopened",
+                            )
+                        ),
+                    )
+                )
+            )
+        latest_reply_by_dialog = {
+            item.dialog_id: max(
+                (reply for reply in replies if reply.dialog_id == item.dialog_id),
+                key=lambda reply: reply.telegram_message_id,
+            )
+            for item in problems
+        }
+        for problem in problems:
+            reply = latest_reply_by_dialog[problem.dialog_id]
+            await self.queue.enqueue(
+                "problem.evaluate",
+                {"problem_id": problem.id},
+                tenant_id=problem.tenant_id,
+                telegram_account_id=problem.connection_id,
+                dialog_id=problem.dialog_id,
+                priority=30,
+                idempotency_key=f"problem-evaluate:{problem.id}:{reply.id}",
+                correlation_id=problem.id,
+                category="reconciliation",
+                cost_class="light",
+            )
 
     async def enqueue_triage(self, signals: list[Signal]) -> list[str]:
         source_ids = {signal.source_message_id for signal in signals}

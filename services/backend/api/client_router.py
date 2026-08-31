@@ -1297,6 +1297,17 @@ async def problem_conversation(
     has_more = len(rows) > limit
     rows = rows[:limit]
     rows.reverse()
+    outbound_commands = list(
+        await session.scalars(
+            select(OutboundTelegramMessage)
+            .where(
+                OutboundTelegramMessage.tenant_id == context.tenant.id,
+                OutboundTelegramMessage.problem_id == problem.id,
+            )
+            .order_by(OutboundTelegramMessage.created_at.desc())
+            .limit(10)
+        )
+    )
     return {
         "problem_id": problem.id,
         "client": {
@@ -1324,6 +1335,16 @@ async def problem_conversation(
                 "sent_at": item.sent_at,
             }
             for item in rows
+        ],
+        "outbound_commands": [
+            {
+                "id": item.id,
+                "client_request_id": item.client_request_id,
+                "text": item.text,
+                "status": item.status,
+                "telegram_message_id": item.telegram_message_id,
+            }
+            for item in outbound_commands
         ],
         "next_cursor": rows[0].telegram_message_id if has_more and rows else None,
     }
@@ -2295,14 +2316,93 @@ async def employees(
             select(Employee).where(*employee_filters).order_by(Employee.display_name)
         )
     )
-    result = []
-    for item in rows:
-        membership = await session.scalar(
-            select(TenantMembership).where(
-                TenantMembership.tenant_id == context.tenant.id,
-                TenantMembership.employee_id == item.id,
+    employee_ids = [item.id for item in rows]
+    memberships = (
+        list(
+            await session.scalars(
+                select(TenantMembership).where(
+                    TenantMembership.tenant_id == context.tenant.id,
+                    TenantMembership.employee_id.in_(employee_ids),
+                )
             )
         )
+        if employee_ids
+        else []
+    )
+    connections = (
+        list(
+            await session.scalars(
+                select(TelegramConnection)
+                .where(
+                    TelegramConnection.tenant_id == context.tenant.id,
+                    TelegramConnection.assigned_employee_id.in_(employee_ids),
+                    TelegramConnection.deleted_at.is_(None),
+                    TelegramConnection.status.in_(
+                        ("connected", "syncing", "ready", "reauthorization_required")
+                    ),
+                )
+                .order_by(TelegramConnection.created_at.desc())
+            )
+        )
+        if employee_ids
+        else []
+    )
+    membership_by_employee = {item.employee_id: item for item in memberships}
+    connection_by_employee: dict[str, TelegramConnection] = {}
+    for connection in connections:
+        if connection.assigned_employee_id is not None:
+            connection_by_employee.setdefault(connection.assigned_employee_id, connection)
+    problem_counts = (
+        dict(
+            (
+                await session.execute(
+                    select(
+                        OperationalProblem.responsible_employee_id,
+                        func.count(OperationalProblem.id),
+                    )
+                    .where(
+                        OperationalProblem.tenant_id == context.tenant.id,
+                        OperationalProblem.responsible_employee_id.in_(employee_ids),
+                        OperationalProblem.status.in_(
+                            (
+                                "new",
+                                "needs_confirmation",
+                                "acknowledged",
+                                "assigned",
+                                "in_progress",
+                                "waiting",
+                                "reopened",
+                            )
+                        ),
+                    )
+                    .group_by(OperationalProblem.responsible_employee_id)
+                )
+            ).all()
+        )
+        if employee_ids
+        else {}
+    )
+    commitment_counts = (
+        dict(
+            (
+                await session.execute(
+                    select(Commitment.responsible_employee_id, func.count(Commitment.id))
+                    .where(
+                        Commitment.tenant_id == context.tenant.id,
+                        Commitment.responsible_employee_id.in_(employee_ids),
+                        Commitment.status == "open",
+                    )
+                    .group_by(Commitment.responsible_employee_id)
+                )
+            ).all()
+        )
+        if employee_ids
+        else {}
+    )
+    result = []
+    for item in rows:
+        membership = membership_by_employee.get(item.id)
+        connection = connection_by_employee.get(item.id)
         result.append(
             {
                 "id": item.id,
@@ -2316,19 +2416,9 @@ async def employees(
                 "reports_access_all": item.reports_access_all,
                 "access_status": membership.status if membership else None,
                 "bot_started": bool(membership and membership.bot_started_at),
-                "connection_id": await session.scalar(
-                    select(TelegramConnection.id)
-                    .where(
-                        TelegramConnection.tenant_id == context.tenant.id,
-                        TelegramConnection.assigned_employee_id == item.id,
-                        TelegramConnection.deleted_at.is_(None),
-                        TelegramConnection.status.in_(
-                            ("connected", "syncing", "ready", "reauthorization_required")
-                        ),
-                    )
-                    .order_by(TelegramConnection.created_at.desc())
-                    .limit(1)
-                ),
+                "connection_id": connection.id if connection else None,
+                "active_problem_count": int(problem_counts.get(item.id, 0)),
+                "open_commitment_count": int(commitment_counts.get(item.id, 0)),
             }
         )
     return result

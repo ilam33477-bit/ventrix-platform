@@ -22,7 +22,6 @@ from ..models import (
     ReportSection,
     TelegramDialog,
     Tenant,
-    TenantSettings,
 )
 from ..telegram_sessions.service import TelegramConnectionService
 from .queue import JobLease
@@ -233,21 +232,14 @@ class MaintenanceJobHandlers:
             destinations: list[tuple[str, str, str | None]] = [
                 ("manager", str(tenant.owner_telegram_user_id), None)
             ]
-            settings = await session.scalar(
-                select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
-            )
-            groups = (
-                list(
-                    await session.scalars(
-                        select(GroupIntegration).where(
-                            GroupIntegration.tenant_id == tenant.id,
-                            GroupIntegration.status == "active",
-                            GroupIntegration.notifications_enabled.is_(True),
-                        )
+            groups = list(
+                await session.scalars(
+                    select(GroupIntegration).where(
+                        GroupIntegration.tenant_id == tenant.id,
+                        GroupIntegration.status == "active",
+                        GroupIntegration.notifications_enabled.is_(True),
                     )
                 )
-                if settings and settings.group_reminders_enabled
-                else []
             )
             destinations.extend(
                 ("group", str(group.telegram_chat_id), group.id) for group in groups

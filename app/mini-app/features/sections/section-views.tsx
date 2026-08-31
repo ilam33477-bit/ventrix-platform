@@ -270,10 +270,10 @@ function utcLabel(offset: number) {
 
 export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: VentrixClientApi; canManage?: boolean; onOpenGroups?: () => void }) {
   const loader = useCallback(async () => {
-    const [employees, problems, commitments, connections] = await Promise.all([
-      api.employees(), api.problems(), api.commitments(), api.connections(),
+    const [employees, connections] = await Promise.all([
+      api.employees(), api.connections(),
     ]);
-    return { employees, problems, commitments, connections };
+    return { employees, connections };
   }, [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [adding, setAdding] = useState(false);
@@ -359,13 +359,13 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
         <div className="team-roster">
           <div className="team-overview">
             <div><strong><AnimatedNumber value={data.employees.length} /></strong><span>сотрудников</span></div>
-            <div><strong><AnimatedNumber value={data.problems.filter((item) => !["resolved", "auto_resolved", "false_positive", "ignored"].includes(item.status)).length} /></strong><span>ситуаций в работе</span></div>
+            <div><strong><AnimatedNumber value={data.employees.reduce((sum, item) => sum + (item.active_problem_count ?? 0), 0)} /></strong><span>ситуаций в работе</span></div>
           </div>
           <div className="team-list">
           {data.employees.map((item) => {
             const connection = data.connections.find((row) => row.id === item.connection_id || row.employee_id === item.id);
-            const assignedProblems = data.problems.filter((row) => row.responsible_employee_id === item.id && !["resolved", "auto_resolved", "false_positive", "ignored"].includes(row.status));
-            const openCommitments = data.commitments.filter((row) => row.employee_id === item.id && row.status === "open");
+            const assignedProblemCount = item.active_problem_count ?? 0;
+            const openCommitmentCount = item.open_commitment_count ?? 0;
             const expanded = expandedEmployeeId === item.id;
             return (
             <Card className={`employee-card${expanded ? " expanded" : ""}`} key={item.id}>
@@ -384,19 +384,29 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                 </StatusBadge>
               </div>
               <div className="employee-card-glance">
-                <span><strong>{assignedProblems.length}</strong> в работе</span>
-                <span><strong>{openCommitments.length}</strong> обещаний</span>
+                <span><strong>{assignedProblemCount}</strong> в работе</span>
+                <span><strong>{openCommitmentCount}</strong> обещаний</span>
               </div>
+              <div className="employee-meta">
+                <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
+                <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
+                <span><small>Бот проекта</small><strong>{item.bot_started ? "Запущен" : "Ещё не открыт"}</strong></span>
+              </div>
+              <button
+                type="button"
+                className="employee-settings-toggle"
+                aria-expanded={expanded}
+                aria-controls={`employee-settings-${item.id}`}
+                onClick={() => setExpandedEmployeeId(expanded ? null : item.id)}
+              >
+                <span>{expanded ? "Свернуть настройки сессии" : "Настройки сессии"}</span>
+                <i aria-hidden="true" />
+              </button>
               <div
                 className="employee-card-details"
-                id={`employee-details-${item.id}`}
+                id={`employee-settings-${item.id}`}
                 hidden={!expanded}
               >
-                <div className="employee-meta">
-                  <span><small>Доступ</small><strong>{accessStatusLabel(item.access_status ?? item.status)}</strong></span>
-                  <span><small>Уведомления</small><strong>{item.notifications_enabled ? "Включены" : "Выключены"}</strong></span>
-                  <span><small>Бот проекта</small><strong>{item.bot_started ? "Запущен" : "Ещё не открыт"}</strong></span>
-                </div>
                 {connection && canManage && (
                   <ConnectionAnalysisControls
                     key={`${connection.id}-${connection.response_sla_minutes}-${connection.signal_problem_threshold}`}
@@ -433,16 +443,6 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                   )}
                 </div>}
               </div>
-              <button
-                type="button"
-                className="employee-settings-toggle"
-                aria-expanded={expanded}
-                aria-controls={`employee-details-${item.id}`}
-                onClick={() => setExpandedEmployeeId(expanded ? null : item.id)}
-              >
-                <span>{expanded ? "Свернуть настройки" : "Настройки сотрудника"}</span>
-                <i aria-hidden="true" />
-              </button>
             </Card>
           );})}
           </div>

@@ -301,8 +301,9 @@ class AITriageService:
                 await session.scalars(
                     select(TelegramMessage)
                     .where(
+                        TelegramMessage.tenant_id == signal.tenant_id,
                         TelegramMessage.dialog_id == signal.dialog_id,
-                        TelegramMessage.telegram_message_id <= message.telegram_message_id,
+                        TelegramMessage.deleted_at.is_(None),
                     )
                     .order_by(TelegramMessage.sent_at.desc())
                     .limit(self.context_limit)
@@ -451,8 +452,33 @@ class AITriageService:
             state = await session.scalar(
                 select(DialogState).where(DialogState.dialog_id == signal.dialog_id)
             )
-            if state:
-                source = await session.get(TelegramMessage, signal.source_message_id)
+            source = await session.get(TelegramMessage, signal.source_message_id)
+            later_employee_reply = None
+            if source is not None:
+                later_employee_reply = await session.scalar(
+                    select(TelegramMessage.id)
+                    .where(
+                        TelegramMessage.tenant_id == signal.tenant_id,
+                        TelegramMessage.dialog_id == signal.dialog_id,
+                        TelegramMessage.telegram_message_id > source.telegram_message_id,
+                        TelegramMessage.deleted_at.is_(None),
+                        TelegramMessage.outgoing.is_(True),
+                    )
+                    .limit(1)
+                )
+            if later_employee_reply is not None and issue_family in {
+                "UNANSWERED_REQUEST",
+                "PAYMENT_QUESTION",
+                "COMMERCIAL_OPPORTUNITY",
+                "FOLLOWUP",
+            }:
+                if state and state.response_expected_message_id == signal.source_message_id:
+                    state.awaiting_employee_since = None
+                    state.response_expected_message_id = None
+                    state.next_sla_check_at = None
+                signal.status = "history"
+                return None
+            if state and source is not None:
                 state.last_ai_processed_message_id = source.telegram_message_id
             if not result.action_required or (
                 not result.response_required

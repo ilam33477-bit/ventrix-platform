@@ -143,6 +143,13 @@ export type ProblemConversation = {
     sender_role: string;
     sent_at: string;
   }>;
+  outbound_commands: Array<{
+    id: string;
+    client_request_id: string;
+    text: string;
+    status: "pending" | "sending" | "sent" | "failed";
+    telegram_message_id: number | null;
+  }>;
   next_cursor: number | null;
 };
 
@@ -200,6 +207,8 @@ export type Employee = {
   connection_id?: string | null;
   reports_access_all: boolean;
   bot_started: boolean;
+  active_problem_count?: number;
+  open_commitment_count?: number;
 };
 
 export type GroupIntegration = {

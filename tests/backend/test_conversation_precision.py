@@ -157,3 +157,15 @@ def test_interest_question_is_not_open_after_employee_answer() -> None:
     assert result.conversation_state == "WAITING_FOR_CLIENT"
     assert not result.response_required
     assert not result.action_required
+
+
+def test_price_question_is_not_open_after_employee_gives_tariffs() -> None:
+    result = assess_conversation(
+        dialog(
+            ("А после цена какая?", False),
+            ("После триала, если захочешь оставить: 699 неделя или 999 месяц.", True),
+        )
+    )
+    assert result.conversation_state == "WAITING_FOR_CLIENT"
+    assert not result.response_required
+    assert not result.action_required

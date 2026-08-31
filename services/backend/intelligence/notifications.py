@@ -58,7 +58,6 @@ class NotificationPolicyService:
         criticality = signal.criticality
         triage = (signal.metadata_json or {}).get("triage") or {}
         employee_requested = bool(triage.get("requires_employee_notification", True))
-        manager_requested = bool(triage.get("requires_manager_notification", True))
         employee_allowed = bool(
             settings.employee_notifications_enabled
             and employee
@@ -69,15 +68,17 @@ class NotificationPolicyService:
             and employee_requested
             and not self._quiet(employee, settings.timezone, now)
         )
-        manager_allowed = bool(
-            criticality >= settings.manager_notification_threshold and manager_requested
-        )
+        # The manager threshold is an explicit tenant policy. AI may recommend
+        # an employee notification, but it must not silently veto alerts that
+        # the owner configured to receive.
+        manager_allowed = criticality >= settings.manager_notification_threshold
         group_allowed = bool(
-            settings.group_reminders_enabled
-            and group
+            group
             and group.status == "active"
             and group.notifications_enabled
-            and criticality >= max(settings.group_notification_threshold, group.minimum_criticality)
+            # Group controls are managed per integration. Do not let the
+            # retired tenant-wide threshold override the value shown in UI.
+            and criticality >= group.minimum_criticality
         )
         immediate = criticality >= settings.notification_immediate_threshold
         return NotificationDecision(

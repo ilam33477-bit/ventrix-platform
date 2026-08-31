@@ -11,8 +11,8 @@ import type { Problem, ProblemDetail, ProblemStatus } from "../../types";
 type ProblemFilter = "active" | "urgent" | "resolved";
 
 const NEXT_ACTIONS: Partial<Record<ProblemStatus, Array<[ProblemStatus, string, "primary" | "secondary" | "ghost"]>>> = {
-  new: [["needs_confirmation", "Проверить ситуацию", "primary"], ["acknowledged", "Подтвердить", "secondary"]],
-  needs_confirmation: [["acknowledged", "Подтвердить", "primary"], ["false_positive", "Не проблема", "ghost"]],
+  new: [["needs_confirmation", "Проверить ситуацию", "primary"]],
+  needs_confirmation: [["false_positive", "Не проблема", "ghost"]],
   assigned: [["in_progress", "Взять в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
   in_progress: [["resolved", "Отметить решённой", "primary"], ["waiting", "Отложить", "secondary"], ["false_positive", "Не проблема", "ghost"]],
   waiting: [["in_progress", "Вернуть в работу", "primary"], ["false_positive", "Не проблема", "ghost"]],
@@ -34,32 +34,50 @@ function ProblemReplyPanel({ api, problem, onChanged }: {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
-  const [success, setSuccess] = useState("");
+  const [optimistic, setOptimistic] = useState<{ requestId: string; text: string } | null>(null);
   const requestId = useRef<string | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void reload();
-    }, 15_000);
+    }, optimistic ? 3_000 : 15_000);
     return () => window.clearInterval(timer);
-  }, [reload]);
+  }, [optimistic, reload]);
+
+  useEffect(() => {
+    if (!optimistic || !data) return;
+    const command = data.outbound_commands.find((item) => item.client_request_id === optimistic.requestId);
+    const delivered = command?.telegram_message_id != null
+      && data.messages.some((item) => item.telegram_message_id === command.telegram_message_id);
+    if (command?.status !== "failed" && !delivered) return;
+    const timer = window.setTimeout(() => {
+      setOptimistic(null);
+      requestId.current = null;
+      if (command?.status === "failed") {
+        setSendError("Не удалось отправить сообщение. Проверьте рабочую Telegram-сессию и попробуйте ещё раз.");
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [data, optimistic]);
 
   async function send() {
     const message = text.trim();
     if (!message || sending) return;
     requestId.current ??= window.crypto.randomUUID();
+    const activeRequestId = requestId.current;
+    setOptimistic({ requestId: activeRequestId, text: message });
     setSending(true);
     setSendError("");
-    setSuccess("");
     try {
-      await api.replyToProblem(problem.id, message, requestId.current);
-      requestId.current = null;
+      const result = await api.replyToProblem(problem.id, message, activeRequestId);
+      if (result.status === "failed") throw new Error("Telegram не принял сообщение");
       setText("");
-      setSuccess("Ответ поставлен в отправку через рабочий Telegram.");
       await reload();
       await onChanged();
-    } catch (cause) {
-      setSendError(cause instanceof Error ? cause.message : "Не удалось отправить ответ");
+    } catch {
+      setOptimistic(null);
+      requestId.current = null;
+      setSendError("Не удалось отправить сообщение. Проверьте рабочую Telegram-сессию и попробуйте ещё раз.");
     } finally {
       setSending(false);
     }
@@ -69,12 +87,11 @@ function ProblemReplyPanel({ api, problem, onChanged }: {
     <header><div><p className="detail-label">ОТВЕТ КЛИЕНТУ</p><h3>Переписка и ответ</h3></div>{data && <StatusBadge tone={data.can_reply ? "success" : "neutral"}>{data.can_reply ? "Сессия доступна" : "Только просмотр"}</StatusBadge>}</header>
     {loading && !data ? <Skeleton lines={3} /> : data ? <>
       <div className="reply-route"><span><small>Клиент</small><strong>{data.client.username ? `@${data.client.username}` : data.client.title}</strong></span><span><small>Отправитель</small><strong>{data.connection.username ? `@${data.connection.username}` : data.connection.name ?? "Рабочий аккаунт"}</strong></span></div>
-      <div className="reply-thread" aria-live="polite">{data.messages.map((message) => <div className={message.outgoing ? "outgoing" : "incoming"} key={message.id}><small>{message.outgoing ? "Сотрудник" : data.client.username ? `@${data.client.username}` : data.client.title} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p></div>)}</div>
-      {data.can_reply ? <div className="reply-composer"><label htmlFor={`problem-reply-${problem.id}`}>Ответить клиенту</label><textarea id={`problem-reply-${problem.id}`} rows={3} maxLength={4096} value={text} disabled={sending} placeholder="Введите сообщение от имени рабочего аккаунта" onChange={(event) => { setText(event.target.value); setSuccess(""); }} /><div><small>{text.length}/4096</small><Button variant="primary" disabled={sending || !text.trim()} onClick={() => void send()}>{sending ? "Отправляем…" : "Отправить"}</Button></div></div> : <p className="reply-unavailable">Ответ недоступен: проверьте права и состояние рабочей Telegram-сессии.</p>}
+      <div className="reply-thread" aria-live="polite">{data.messages.map((message) => <div className={message.outgoing ? "outgoing" : "incoming"} key={message.id}><small>{message.outgoing ? "Сотрудник" : data.client.username ? `@${data.client.username}` : data.client.title} · {new Date(message.sent_at).toLocaleString("ru-RU")}</small><p>{message.text || "Сообщение без текста"}</p></div>)}{optimistic && <div className="outgoing optimistic" key={optimistic.requestId}><small>Сотрудник · сейчас</small><p>{optimistic.text}</p></div>}</div>
+      {data.can_reply ? <div className="reply-composer"><label htmlFor={`problem-reply-${problem.id}`}>Ответить клиенту</label><textarea id={`problem-reply-${problem.id}`} rows={3} maxLength={4096} value={text} disabled={sending} placeholder="Введите сообщение от имени рабочего аккаунта" onChange={(event) => setText(event.target.value)} /><div><small>{text.length}/4096</small><Button variant="primary" disabled={sending || !text.trim()} onClick={() => void send()}>{sending ? "Отправляем…" : "Отправить"}</Button></div></div> : <p className="reply-unavailable">Ответ недоступен: проверьте права и состояние рабочей Telegram-сессии.</p>}
     </> : null}
     {loadError && <div className="inline-error" role="alert"><span>Не удалось обновить переписку.</span><button onClick={() => void reload()}>Повторить</button></div>}
     {sendError && <p className="form-error" role="alert">{sendError}</p>}
-    {success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}
   </Card>;
 }
 
@@ -140,23 +157,18 @@ function ProblemDetailPanel({ api, problem, onChanged, onClose }: {
     <header className="problem-detail-nav"><button className="text-action" onClick={onClose}>← Все ситуации</button><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge></header>
 
     <Card className="problem-detail-hero">
-      <div className="problem-detail-kicker"><span>СИТУАЦИЯ</span><small>{formatRelativeAge(problem.occurred_at)}</small></div>
-      <h2>{problemTitle(problem)}</h2>
+      <div className="problem-detail-kicker"><span>{problemTitle(problem)}</span><small>{formatRelativeAge(problem.occurred_at)}</small></div>
+      <h2>{problem.evidence}</h2>
+      <p className="problem-detail-explanation">{cleanExplanation(problem.explanation)}</p>
       <div className="problem-identity"><div><strong>{problem.dialog_title ?? "Клиент"}</strong><span>{problemPerson(problem)}</span></div><StatusBadge tone={problem.status === "resolved" || problem.status === "auto_resolved" ? "success" : "neutral"}>{problemStatusLabel(problem.status)}</StatusBadge></div>
     </Card>
 
     <section className="problem-detail-flow">
-      <div className="detail-section"><p className="detail-label">ПРИЧИНА</p><h3>Почему Ventrix обратил внимание</h3><p>{cleanExplanation(problem.explanation)}</p></div>
-
-      <Card className="evidence-panel"><div className="evidence-mark" aria-hidden="true">“</div><div><p className="detail-label">ДОКАЗАТЕЛЬСТВО</p><blockquote>{problem.evidence}</blockquote></div></Card>
-
-      <Card className="next-step-panel"><span aria-hidden="true">→</span><div><p className="detail-label">СЛЕДУЮЩИЙ ШАГ</p><strong>{problem.recommended_action}</strong>{problem.deadline_at && <small>Срок: {new Date(problem.deadline_at).toLocaleString("ru-RU")}</small>}</div></Card>
-
       <div className="detail-section action-section"><p className="detail-label">ДЕЙСТВИЯ</p>{error && <p className="form-error" role="alert">{error}</p>}{success && <p className="action-success" role="status"><span aria-hidden="true">✓</span>{success}</p>}{!CLOSED_STATUSES.has(problem.status) && <div className="detail-quick-close">{confirmingClose ? <><p>Подтвердите, что ситуация действительно завершена.</p><div><Button variant="primary" disabled={busy} onClick={() => void closeProblem()}>{busy ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={busy} onClick={() => setConfirmingClose(false)}>Отмена</Button></div></> : <Button variant="secondary" disabled={busy} onClick={() => setConfirmingClose(true)}>Завершить ситуацию</Button>}</div>}<div className="problem-actions">{(NEXT_ACTIONS[problem.status] ?? []).map(([status, label, variant]) => <Button variant={variant} key={status} disabled={busy} onClick={() => void transition(status, label)}>{busy ? "Сохраняем…" : label}</Button>)}</div></div>
 
       <ProblemReplyPanel api={api} problem={problem} onChanged={onChanged} />
 
-      <div className="detail-section assignment-section"><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? "Определяется по рабочему аккаунту"}</h3><p className="assignment-note">Ответственный назначается автоматически: это сотрудник, через Telegram-сессию которого пришла ситуация.</p><div className="problem-routing"><div><span>Рабочий аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Диалог</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><div className="assignment-controls single"><label>Срок решения<input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div></div>
+      <div className="detail-section assignment-section"><div className="assignment-heading"><div><p className="detail-label">ОТВЕТСТВЕННЫЙ</p><h3>{problem.responsible_employee_name ?? (problem.connection_username ? `@${problem.connection_username}` : "Рабочий аккаунт")}</h3></div><small>Назначен автоматически</small></div><div className="problem-routing"><div><span>Аккаунт</span><strong>{problem.connection_username ? `@${problem.connection_username}` : problem.connection_name ?? "Не определён"}</strong></div><div><span>Клиент</span><strong>{problem.dialog_username ? `@${problem.dialog_username}` : problem.dialog_title ?? "Не определён"}</strong></div></div><label className="compact-deadline"><span>Срок решения</span><input disabled={busy} type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label></div>
 
       {(problem.transitions.length > 0 || problem.verifications.length > 0) && <details className="problem-history"><summary>История ситуации <span>{problem.transitions.length + problem.verifications.length}</span></summary><div className="timeline">{problem.transitions.map((item, index) => <div key={`${item.occurred_at}-${index}`}><i /><p><strong>{problemStatusLabel(item.from_status)} → {problemStatusLabel(item.to_status)}</strong><span>{item.reason}</span><small>{new Date(item.occurred_at).toLocaleString("ru-RU")}</small></p></div>)}{problem.verifications.map((item) => <div key={item.checked_at}><i /><p><strong>Проверка исправления: {verificationOutcomeLabel(item.outcome)}</strong><span>{item.reason}</span><small>{new Date(item.checked_at).toLocaleString("ru-RU")}</small></p></div>)}</div></details>}
     </section>
@@ -260,7 +272,7 @@ export function ProblemsView({ api, initialProblemId }: { api: VentrixClientApi;
 
     {!initialLoading && <div className="problem-filters" role="tablist" aria-label="Фильтр ситуаций">{filters.map((item) => <button role="tab" aria-selected={filter === item.value} className={filter === item.value ? "active" : ""} key={item.value} onClick={() => setFilter(item.value)}><span>{item.label}</span>{item.count !== undefined && <small>{item.count}</small>}</button>)}</div>}
 
-    {(loading || (filter === "resolved" && resolvedLoading)) ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <Card className={`problem-card priority-${problem.priority}`} key={problem.id}><button className="problem-card-open" onClick={() => void open(problem.id)} disabled={openingId === problem.id}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.responsible_employee_name ? `Ответственный: ${problem.responsible_employee_name}` : problem.connection_username ? `Ответственный: @${problem.connection_username}` : "Ответственный определяется"}</small></div></div><div className="problem-card-copy"><h3>{problemTitle(problem)}</h3><p>{cleanExplanation(problem.explanation)}</p></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть"}</span><b aria-hidden="true">→</b></footer></button><div className="problem-quick-close">{confirmingCloseId === problem.id ? <><span>Завершить эту ситуацию?</span><Button variant="primary" disabled={closingId === problem.id} onClick={() => void quickClose(problem.id)}>{closingId === problem.id ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={closingId === problem.id} onClick={() => setConfirmingCloseId("")}>Отмена</Button></> : <Button variant="secondary" onClick={() => setConfirmingCloseId(problem.id)}>Завершить</Button>}</div></Card>)}</div>}
+    {(loading || (filter === "resolved" && resolvedLoading)) ? <div className="problem-list-loading"><Skeleton lines={4} /><Skeleton lines={3} /></div> : <div className="problem-cards" key={filter}>{visible.map((problem) => <Card className={`problem-card priority-${problem.priority}`} key={problem.id}><button className="problem-card-open" onClick={() => void open(problem.id)} disabled={openingId === problem.id}><div className="problem-card-top"><StatusBadge tone={priorityTone(problem.priority)}>{priorityLabel(problem.priority)}</StatusBadge><span className="problem-age">{formatRelativeAge(problem.occurred_at)}</span></div><div className="problem-card-person"><span>{problemPerson(problem).replace("@", "").slice(0, 2).toUpperCase()}</span><div><strong>{problemPerson(problem)}</strong><small>{problem.responsible_employee_name ? `Ответственный: ${problem.responsible_employee_name}` : problem.connection_username ? `Ответственный: @${problem.connection_username}` : "Ответственный определяется"}</small></div></div><div className="problem-card-copy"><p className="problem-type">{problemTitle(problem)}</p><h3>{problem.evidence}</h3><p>{cleanExplanation(problem.explanation)}</p></div><footer><span>{openingId === problem.id ? "Открываем…" : "Открыть"}</span><b aria-hidden="true">→</b></footer></button><div className="problem-quick-close">{confirmingCloseId === problem.id ? <><span>Завершить эту ситуацию?</span><Button variant="primary" disabled={closingId === problem.id} onClick={() => void quickClose(problem.id)}>{closingId === problem.id ? "Закрываем…" : "Да, завершить"}</Button><Button variant="ghost" disabled={closingId === problem.id} onClick={() => setConfirmingCloseId("")}>Отмена</Button></> : <Button variant="secondary" onClick={() => setConfirmingCloseId(problem.id)}>Завершить</Button>}</div></Card>)}</div>}
 
     {(error || resolvedError || openError) && <div className="inline-error" role="alert"><span>{openError || resolvedError || "Не удалось загрузить ситуации."}</span><button onClick={() => { if (filter === "resolved") { resolvedRequested.current = false; setResolvedLoaded(false); setResolvedError(""); } else { void reload(); } }}>Повторить</button></div>}
     {!loading && !resolvedLoading && !visible.length && <EmptyState title={filter === "resolved" ? "Решённых ситуаций пока нет" : "В этом разделе всё спокойно"} description={filter === "resolved" ? "Здесь появятся ситуации после подтверждённого решения." : "Ventrix продолжает мониторинг и покажет новый риск после проверки контекста."} />}
