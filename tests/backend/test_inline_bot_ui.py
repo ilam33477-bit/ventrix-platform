@@ -43,7 +43,7 @@ def test_owner_and_client_navigation_is_inline_only() -> None:
 
 def test_employee_navigation_contains_only_personal_sections() -> None:
     employee = button_texts(client_main_menu(role="employee"))
-    assert employee == ["Открыть Ventrix AI", "Сводка", "Ситуации", "Мои отчёты"]
+    assert employee == ["Открыть Ventrix AI", "Сводка", "Ситуации", "Мои отчёты", "Команда"]
     assert button_texts(client_more_menu(role="employee")) == ["← Главное меню"]
 
 

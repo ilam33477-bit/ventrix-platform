@@ -432,6 +432,7 @@ input:disabled,select:disabled,textarea:disabled{opacity:1;color:var(--text-tert
 .employee-card-glance strong{color:var(--text-primary);font:var(--font-label)}
 .employee-card-details{display:grid;gap:14px;padding:16px;border-top:1px solid var(--border);animation:employee-details-in var(--motion-standard) var(--ease-emphasized) both}
 .employee-card-details[hidden]{display:none}
+.employee-session-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.employee-session-summary>span{display:grid;gap:3px;padding:10px;border-radius:var(--radius-sm);background:var(--surface-muted)}.employee-session-summary>span:last-child:nth-child(3){grid-column:1/-1}.employee-session-summary small{color:var(--text-tertiary);font:var(--font-caption)}.employee-session-summary strong{font:var(--font-label);overflow-wrap:anywhere}
 .employee-settings-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-height:46px;padding:11px 16px;border:0;border-top:1px solid var(--border);background:transparent;color:var(--text-secondary);font:800 .68rem/1.2 Inter,sans-serif;cursor:pointer;text-align:left;transition:background-color var(--motion-quick) var(--ease-signature),color var(--motion-quick) var(--ease-signature)}
 .employee-settings-toggle:hover{background:var(--surface-muted);color:var(--text-primary)}
 .employee-settings-toggle:focus-visible{outline:2px solid var(--focus-ring);outline-offset:-3px}

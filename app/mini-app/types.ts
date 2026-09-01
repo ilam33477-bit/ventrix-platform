@@ -205,6 +205,9 @@ export type Employee = {
   criticality_threshold: number;
   access_status?: string | null;
   connection_id?: string | null;
+  connection_status?: string | null;
+  connection_username?: string | null;
+  connection_last_sync_at?: string | null;
   reports_access_all: boolean;
   bot_started: boolean;
   active_problem_count?: number;

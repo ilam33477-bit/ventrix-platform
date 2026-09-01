@@ -2132,7 +2132,8 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:employees")
     async def employees(query: CallbackQuery, client_context: ClientContext) -> None:
-        if await deny_project_management(query, client_context):
+        if client_context.role == "observer":
+            await query.answer("Раздел команды недоступен", show_alert=True)
             return
         async with events.session_factory() as session:
             rows = list(
@@ -2142,16 +2143,30 @@ def build_client_router(
                     .order_by(Employee.display_name)
                 )
             )
-        lines = [
-            f"{'✅' if item.status == 'active' else '⏸'} <b>{escape(item.display_name)}</b>\n   @{escape(item.telegram_username or 'username не указан')} · {'доступ связан' if item.telegram_user_id else 'ожидает первого входа'}"
-            for item in rows
-        ]
+        manager_view = client_context.role in {"owner", "manager"}
+        lines = []
+        for item in rows:
+            profile = (
+                f"@{escape(item.telegram_username)}"
+                if item.telegram_username
+                else "Telegram-профиль ещё не определён"
+            )
+            access = "активен" if item.telegram_user_id else "ожидает первого входа"
+            lines.append(
+                f"{'✅' if item.status == 'active' else '⏸'} <b>{escape(item.display_name)}</b>\n"
+                f"   {profile} · доступ {access}"
+            )
         await edit_screen(
             query,
             "<b>👥 Команда</b>\n\n<blockquote>"
             + ("\n\n".join(lines) if lines else "Сотрудники ещё не добавлены.")
-            + "</blockquote>\n\n<i>Новый сотрудник добавляется по номеру телефона в Ventrix AI; профиль определяется после входа.</i>",
-            settings_markup(),
+            + "</blockquote>\n\n"
+            + (
+                "<i>Управление сотрудниками и сессиями доступно в Ventrix AI.</i>"
+                if manager_view
+                else "<i>Состав команды доступен для просмотра. Изменения выполняет руководитель проекта.</i>"
+            ),
+            settings_markup() if manager_view else back_to_client_menu(),
         )
 
     def groups_markup() -> InlineKeyboardMarkup:

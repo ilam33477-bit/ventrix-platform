@@ -74,11 +74,10 @@ export function MiniAppShell({ auth, access, active, onNavigate, canGoBack, onBa
     setProfileOpen(true);
   };
   const canManageProject = auth.permissions.includes("*") || auth.permissions.includes("settings.manage");
-  const employeeView = auth.user.role === "employee";
   const visibleSections = allSections.filter((item) =>
-    canManageProject || !["connections", "groups", "settings", ...(employeeView ? ["employees"] : [])].includes(item.id),
+    canManageProject || !["connections", "groups", "settings"].includes(item.id),
   );
-  const visiblePrimaryTabs = primaryTabs.filter((item) => !employeeView || item.id !== "employees");
+  const visiblePrimaryTabs = primaryTabs;
   return <main className="mini-app-shell">
     <aside className="mini-sidebar">
       <div className="mini-brand"><span>V</span><strong>Ventrix</strong></div>

@@ -270,6 +270,17 @@ function utcLabel(offset: number) {
   return `UTC${offset >= 0 ? "+" : ""}${offset}`;
 }
 
+function formatSessionDateTime(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "Недоступно";
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(parsed);
+}
+
 export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: VentrixClientApi; canManage?: boolean; onOpenGroups?: () => void }) {
   const loader = useCallback(async () => {
     const [employees, connections] = await Promise.all([
@@ -366,6 +377,7 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
           <div className="team-list">
           {data.employees.map((item) => {
             const connection = data.connections.find((row) => row.id === item.connection_id || row.employee_id === item.id);
+            const connectionStatus = connection?.status ?? item.connection_status ?? null;
             const assignedProblemCount = item.active_problem_count ?? 0;
             const openCommitmentCount = item.open_commitment_count ?? 0;
             const expanded = expandedEmployeeId === item.id;
@@ -381,8 +393,8 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                       : "Telegram-профиль ещё не определён"}
                   </p>
                 </div>
-                <StatusBadge tone={connection ? connectionTone(connection.status) : "warning"}>
-                  {connection ? connectionStatusLabel(connection.status) : "Не подключён"}
+                <StatusBadge tone={connectionStatus ? connectionTone(connectionStatus) : "warning"}>
+                  {connectionStatus ? connectionStatusLabel(connectionStatus) : "Не подключён"}
                 </StatusBadge>
               </div>
               <div className="employee-card-glance">
@@ -401,7 +413,7 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                 aria-controls={`employee-settings-${item.id}`}
                 onClick={() => setExpandedEmployeeId(expanded ? null : item.id)}
               >
-                <span>{expanded ? "Свернуть настройки сессии" : "Настройки сессии"}</span>
+                <span>{canManage ? (expanded ? "Свернуть настройки сессии" : "Настройки сессии") : (expanded ? "Скрыть сведения" : "Подробнее")}</span>
                 <i aria-hidden="true" />
               </button>
               <div
@@ -416,6 +428,13 @@ export function EmployeesView({ api, canManage = true, onOpenGroups }: { api: Ve
                     problemThreshold={connection.signal_problem_threshold}
                     onCommit={(value) => api.updateConnectionAnalysisSettings(connection.id, value)}
                   />
+                )}
+                {!canManage && (
+                  <div className="employee-session-summary">
+                    <span><small>Рабочая сессия</small><strong>{item.connection_username ? `@${item.connection_username}` : connection?.username ? `@${connection.username}` : connectionStatus ? "Подключена" : "Не привязана"}</strong></span>
+                    <span><small>Состояние</small><strong>{connectionStatus ? connectionStatusLabel(connectionStatus) : "Нет активной сессии"}</strong></span>
+                    {(item.connection_last_sync_at || connection?.last_sync_at) && <span><small>Последняя синхронизация</small><strong>{formatSessionDateTime(item.connection_last_sync_at ?? connection?.last_sync_at ?? "")}</strong></span>}
+                  </div>
                 )}
                 {canManage && <label className="toggle-row employee-report-access"><span><strong>Все отчёты проекта</strong><small>По умолчанию сотрудник видит только собственные данные.</small></span><input type="checkbox" checked={item.reports_access_all} onChange={async (event) => { await api.updateEmployee(item.id, { reports_access_all: event.target.checked }); await reload(); }} /></label>}
                 {canManage && <div

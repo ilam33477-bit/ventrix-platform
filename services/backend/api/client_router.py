@@ -1769,14 +1769,21 @@ async def connections(
     settings = await session.scalar(
         select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
     )
+    connection_filters = [
+        TelegramConnection.tenant_id == context.tenant.id,
+        TelegramConnection.deleted_at.is_(None),
+        TelegramConnection.status.in_(VISIBLE_CONNECTION_STATUSES),
+    ]
+    if context.membership.role == "employee":
+        if context.membership.employee_id is None:
+            return []
+        connection_filters.append(
+            TelegramConnection.assigned_employee_id == context.membership.employee_id
+        )
     rows = list(
         await session.scalars(
             select(TelegramConnection)
-            .where(
-                TelegramConnection.tenant_id == context.tenant.id,
-                TelegramConnection.deleted_at.is_(None),
-                TelegramConnection.status.in_(VISIBLE_CONNECTION_STATUSES),
-            )
+            .where(*connection_filters)
             .order_by(TelegramConnection.created_at.desc())
         )
     )
@@ -2401,8 +2408,6 @@ async def employees(
     if context.membership.role == "observer" and not context.allows("employees.read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     employee_filters = [Employee.tenant_id == context.tenant.id, Employee.status == "active"]
-    if context.membership.role == "employee":
-        employee_filters.append(Employee.id == context.membership.employee_id)
     rows = list(
         await session.scalars(
             select(Employee).where(*employee_filters).order_by(Employee.display_name)
@@ -2495,11 +2500,16 @@ async def employees(
     for item in rows:
         membership = membership_by_employee.get(item.id)
         connection = connection_by_employee.get(item.id)
+        is_own_employee = item.id == context.membership.employee_id
         result.append(
             {
                 "id": item.id,
                 "name": item.display_name,
-                "telegram_user_id": item.telegram_user_id,
+                "telegram_user_id": (
+                    item.telegram_user_id
+                    if context.membership.role != "employee" or is_own_employee
+                    else None
+                ),
                 "telegram_username": item.telegram_username,
                 "role": item.role,
                 "status": item.status,
@@ -2509,6 +2519,9 @@ async def employees(
                 "access_status": membership.status if membership else None,
                 "bot_started": bool(membership and membership.bot_started_at),
                 "connection_id": connection.id if connection else None,
+                "connection_status": connection.status if connection else None,
+                "connection_username": connection.username if connection else None,
+                "connection_last_sync_at": connection.last_sync_at if connection else None,
                 "active_problem_count": int(problem_counts.get(item.id, 0)),
                 "open_commitment_count": int(commitment_counts.get(item.id, 0)),
             }

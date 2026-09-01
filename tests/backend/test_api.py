@@ -393,7 +393,12 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees",
             headers={"Authorization": f"tma {username_init_data}"},
         )
-        assert [row["telegram_user_id"] for row in username_employee_rows.json()] == [700003]
+        assert len(username_employee_rows.json()) == 3
+        assert [
+            row["telegram_user_id"]
+            for row in username_employee_rows.json()
+            if row["telegram_user_id"] is not None
+        ] == [700003]
         employee_init_data = signed_init_data(
             "mock-telegram-token-must-remain-secret", 700001, int(time.time())
         )
@@ -407,7 +412,18 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees",
             headers={"Authorization": f"tma {employee_init_data}"},
         )
-        assert [item["telegram_user_id"] for item in employee_visible_staff.json()] == [700001]
+        assert len(employee_visible_staff.json()) == 3
+        assert [
+            item["telegram_user_id"]
+            for item in employee_visible_staff.json()
+            if item["telegram_user_id"] is not None
+        ] == [700001]
+        employee_cannot_edit_team = await client.patch(
+            f"/api/v1/client/employees/{second_employee.json()['id']}",
+            headers={"Authorization": f"tma {employee_init_data}"},
+            json={"notifications_enabled": False},
+        )
+        assert employee_cannot_edit_team.status_code == 403
         now = datetime.now(UTC)
         async with session_factory() as session:
             run = AnalysisRun(
