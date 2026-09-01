@@ -565,11 +565,18 @@ async def mini_app_dashboard_summary(
                 select(func.count(TelegramConnection.id)).where(
                     TelegramConnection.tenant_id == tenant_id,
                     TelegramConnection.deleted_at.is_(None),
+                    *(
+                        (TelegramConnection.assigned_employee_id == employee_id,)
+                        if self_scoped
+                        else ()
+                    ),
                 )
             )
             or 0
         ),
-        "groups": int(
+        "groups": 0
+        if self_scoped
+        else int(
             await session.scalar(
                 select(func.count(GroupIntegration.id)).where(
                     GroupIntegration.tenant_id == tenant_id
@@ -806,6 +813,8 @@ async def client_bootstrap(
     app_settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> dict[str, Any]:
     tenant = context.tenant
+    employee_id = context.membership.employee_id
+    self_scoped = context.membership.role == "employee"
     welcome_copy = fallback_welcome(tenant)
     if (
         tenant.settings.client_onboarding_completed_at is None
@@ -833,6 +842,11 @@ async def client_bootstrap(
                 TelegramConnection.tenant_id == tenant.id,
                 TelegramConnection.deleted_at.is_(None),
                 TelegramConnection.status.in_(VISIBLE_CONNECTION_STATUSES),
+                *(
+                    (TelegramConnection.assigned_employee_id == employee_id,)
+                    if self_scoped
+                    else ()
+                ),
             )
             .order_by(TelegramConnection.created_at.desc())
         )
@@ -841,12 +855,18 @@ async def client_bootstrap(
         (item for item in connections if item.status == "ready"),
         connections[0] if connections else None,
     )
-    run = await session.scalar(
-        select(InitialAnalysisRun)
-        .where(InitialAnalysisRun.tenant_id == tenant.id)
-        .order_by(InitialAnalysisRun.created_at.desc())
-        .limit(1)
-    )
+    connection_ids = [item.id for item in connections]
+    run = None
+    if not self_scoped or connection_ids:
+        run = await session.scalar(
+            select(InitialAnalysisRun)
+            .where(
+                InitialAnalysisRun.tenant_id == tenant.id,
+                *((InitialAnalysisRun.connection_id.in_(connection_ids),) if self_scoped else ()),
+            )
+            .order_by(InitialAnalysisRun.created_at.desc())
+            .limit(1)
+        )
     dialog_counts = dict(
         (
             await session.execute(
@@ -854,6 +874,7 @@ async def client_bootstrap(
                 .where(
                     TelegramDialog.tenant_id == tenant.id,
                     TelegramDialog.excluded.is_(False),
+                    *((TelegramDialog.connection_id.in_(connection_ids),) if self_scoped else ()),
                 )
                 .group_by(TelegramDialog.dialog_type)
             )
@@ -864,18 +885,23 @@ async def client_bootstrap(
             select(func.count(Employee.id)).where(
                 Employee.tenant_id == tenant.id,
                 Employee.status == "active",
+                *((Employee.id == employee_id,) if self_scoped else ()),
             )
         )
         or 0
     )
-    group_count = int(
-        await session.scalar(
-            select(func.count(GroupIntegration.id)).where(
-                GroupIntegration.tenant_id == tenant.id,
-                GroupIntegration.status == "active",
+    group_count = (
+        0
+        if self_scoped
+        else int(
+            await session.scalar(
+                select(func.count(GroupIntegration.id)).where(
+                    GroupIntegration.tenant_id == tenant.id,
+                    GroupIntegration.status == "active",
+                )
             )
+            or 0
         )
-        or 0
     )
     problems = list(
         await session.scalars(
@@ -1589,7 +1615,15 @@ async def reports(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
-    if context.membership.role not in {"owner", "manager"} and not context.allows("reports.read"):
+    personal_only = (
+        context.membership.role == "employee"
+        and not context.allows("reports.read")
+    )
+    if (
+        context.membership.role not in {"owner", "manager"}
+        and not context.allows("reports.read")
+        and not personal_only
+    ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     rows = await TenantClientRepository(session, context.tenant.id).reports()
     canonical_rows: list[Report] = []
@@ -1609,7 +1643,11 @@ async def reports(
             "due_at": item.due_at,
             "ready_at": item.ready_at,
             "delivery_status": item.delivery_status,
-            "summary": item.summary,
+            "summary": (
+                "Персональная сводка за период готова."
+                if personal_only
+                else item.summary
+            ),
         }
         for item in canonical_rows
     ]
@@ -1621,8 +1659,18 @@ async def report_detail(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, Any]:
-    if context.membership.role not in {"owner", "manager"} and not context.allows("reports.read"):
+    personal_only = (
+        context.membership.role == "employee"
+        and not context.allows("reports.read")
+    )
+    if (
+        context.membership.role not in {"owner", "manager"}
+        and not context.allows("reports.read")
+        and not personal_only
+    ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    if personal_only and not context.membership.employee_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employee is not linked")
     repository = TenantClientRepository(session, context.tenant.id)
     report = await repository.report(report_id)
     if report is None:
@@ -1647,24 +1695,68 @@ async def report_detail(
     )
     problem_ids = list(
         await session.scalars(
-            select(ReportProblem.problem_id).where(
+            select(ReportProblem.problem_id)
+            .join(OperationalProblem, OperationalProblem.id == ReportProblem.problem_id)
+            .where(
                 ReportProblem.tenant_id == context.tenant.id,
                 ReportProblem.report_id == report.id,
+                *(
+                    (
+                        OperationalProblem.responsible_employee_id
+                        == context.membership.employee_id,
+                    )
+                    if personal_only
+                    else ()
+                ),
             )
         )
     )
+    section_payloads = [
+        {"key": item.section_key, "position": item.position, "data": item.data_json}
+        for item in sections
+    ]
+    personal_summary = "За этот период у вас нет отдельных рабочих итогов."
+    if personal_only:
+        personal_sections: list[dict[str, Any]] = []
+        for item in section_payloads:
+            if item["key"] != "employee_report":
+                continue
+            rows = item["data"].get("employees", [])
+            own_rows = [
+                row
+                for row in rows
+                if isinstance(row, dict)
+                and row.get("employee_id") == context.membership.employee_id
+            ]
+            if own_rows:
+                personal_sections.append(
+                    {
+                        "key": "employee_report",
+                        "position": 0,
+                        "data": {"employees": own_rows},
+                    }
+                )
+                own = own_rows[0]
+                personal_summary = (
+                    f"Ситуаций решено: {int(own.get('resolved') or 0)}. "
+                    f"Клиентов ждут ответа: {int(own.get('clients_waiting') or 0)}. "
+                    f"Открытых обещаний: {int(own.get('open_promises') or 0)}."
+                )
+            break
+        section_payloads = personal_sections
     await record_event(session, context, "report_opened", {"report_id": report.id})
     await session.commit()
     return {
         "id": report.id,
         "status": report.status,
-        "summary": report.summary,
+        "summary": personal_summary if personal_only else report.summary,
         "period": {"start": report.period_start, "end": report.period_end},
-        "sections": [
-            {"key": item.section_key, "position": item.position, "data": item.data_json}
-            for item in sections
-        ],
-        "metrics": {item.metric_key: item.numeric_value for item in metrics},
+        "sections": section_payloads,
+        "metrics": (
+            {}
+            if personal_only
+            else {item.metric_key: item.numeric_value for item in metrics}
+        ),
         "problem_ids": problem_ids,
     }
 

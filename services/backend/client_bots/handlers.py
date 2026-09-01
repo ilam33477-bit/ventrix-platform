@@ -261,8 +261,13 @@ def build_client_router(
         text_value: str,
         *,
         main: bool = False,
+        context: ClientContext | None = None,
     ) -> None:
-        markup = client_main_menu(mini_app_url) if main else back_to_client_menu()
+        markup = (
+            client_main_menu(mini_app_url, role=context.role if context else None)
+            if main
+            else back_to_client_menu()
+        )
         if query.message:
             try:
                 await query.message.edit_text(text_value, reply_markup=markup)
@@ -283,6 +288,17 @@ def build_client_router(
                 if "message is not modified" not in str(exc).lower():
                     raise
         await query.answer()
+
+    async def deny_project_management(
+        query: CallbackQuery, context: ClientContext
+    ) -> bool:
+        if context.role in {"owner", "manager"}:
+            return False
+        await query.answer(
+            "Управление проектом доступно владельцу или руководителю",
+            show_alert=True,
+        )
+        return True
 
     def mini_app_section_markup(
         text: str,
@@ -391,13 +407,16 @@ def build_client_router(
                 .limit(1)
             )
 
-    async def key_metrics(tenant_id: str) -> dict[str, int]:
+    async def key_metrics(
+        tenant_id: str, *, employee_id: str | None = None
+    ) -> dict[str, int]:
         async with events.session_factory() as session:
             problems = int(
                 await session.scalar(
                     select(func.count(OperationalProblem.id)).where(
                         OperationalProblem.tenant_id == tenant_id,
                         OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                        *((OperationalProblem.responsible_employee_id == employee_id,) if employee_id else ()),
                     )
                 )
                 or 0
@@ -408,6 +427,7 @@ def build_client_router(
                         OperationalProblem.tenant_id == tenant_id,
                         OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
                         OperationalProblem.problem_type == "client_without_answer",
+                        *((OperationalProblem.responsible_employee_id == employee_id,) if employee_id else ()),
                     )
                 )
                 or 0
@@ -424,7 +444,9 @@ def build_client_router(
             employees = int(
                 await session.scalar(
                     select(func.count(Employee.id)).where(
-                        Employee.tenant_id == tenant_id, Employee.status == "active"
+                        Employee.tenant_id == tenant_id,
+                        Employee.status == "active",
+                        *((Employee.id == employee_id,) if employee_id else ()),
                     )
                 )
                 or 0
@@ -528,6 +550,7 @@ def build_client_router(
     @router.message(CommandStart())
     async def start(message: Message, client_context: ClientContext) -> None:
         tenant = client_context.tenant
+        employee_view = client_context.role == "employee"
         start_parameter = ""
         if message.text:
             command_parts = message.text.split(maxsplit=1)
@@ -565,6 +588,11 @@ def build_client_router(
                         TelegramConnection.tenant_id == tenant.id,
                         TelegramConnection.deleted_at.is_(None),
                         TelegramConnection.status.in_(("connected", "syncing", "ready")),
+                        *(
+                            (TelegramConnection.assigned_employee_id == client_context.employee_id,)
+                            if employee_view
+                            else ()
+                        ),
                     )
                     .order_by(TelegramConnection.created_at.desc())
                 )
@@ -587,6 +615,11 @@ def build_client_router(
                             OperationalProblem.tenant_id == tenant.id,
                             OperationalProblem.created_at > previous_start.occurred_at,
                             OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                            *(
+                                (OperationalProblem.responsible_employee_id == client_context.employee_id,)
+                                if employee_view
+                                else ()
+                            ),
                         )
                     )
                     or 0
@@ -597,7 +630,7 @@ def build_client_router(
             if linked_problem is None:
                 await message.answer(
                     "Эта ситуация недоступна вашему аккаунту или уже удалена.",
-                    reply_markup=client_main_menu(mini_app_url),
+                    reply_markup=client_main_menu(mini_app_url, role=client_context.role),
                 )
                 return
             await message.answer(
@@ -611,11 +644,17 @@ def build_client_router(
             return
         if start_parameter.startswith("report_"):
             await message.answer(
-                "<b>Регулярная сводка готова</b>\n\nОткройте Ventrix AI, чтобы посмотреть полный отчёт по проекту.",
+                "<b>Регулярная сводка готова</b>\n\nОткройте Ventrix AI, чтобы посмотреть доступные вам итоги.",
                 reply_markup=mini_app_section_markup("Открыть отчёты", "reports"),
             )
             return
         if start_parameter == "group_connected":
+            if employee_view:
+                await message.answer(
+                    "Рабочая группа подключена. Управление доставкой доступно руководителю проекта.",
+                    reply_markup=client_main_menu(mini_app_url, role=client_context.role),
+                )
+                return
             await message.answer(
                 "<b>Рабочая группа подключена</b>\n\nНастройте доставку карточек и регулярных отчётов в разделе «Команда».",
                 reply_markup=mini_app_section_markup("Открыть команду", "employees"),
@@ -626,7 +665,10 @@ def build_client_router(
             or (tenant.owner_name or "").strip().split()[0]
             or "Здравствуйте"
         )
-        metrics = await key_metrics(tenant.id)
+        metrics = await key_metrics(
+            tenant.id,
+            employee_id=client_context.employee_id if employee_view else None,
+        )
         if connections:
             activity = (
                 f"За время отсутствия найдено новых ситуаций: <b>{new_situations}</b>."
@@ -641,7 +683,16 @@ def build_client_router(
                 f"Клиенты ждут ответа: <b>{metrics['waiting']}</b>\n"
                 f"Подключённые аккаунты: <b>{len(connections)}</b>\n"
                 f"Готовые сводки: <b>{metrics['reports']}</b></blockquote>",
-                reply_markup=client_main_menu(mini_app_url),
+                reply_markup=client_main_menu(mini_app_url, role=client_context.role),
+            )
+            return
+        if employee_view:
+            await message.answer(
+                f"<b>{escape(first_name)}, добрый день.</b>\n\n"
+                f"Вы подключены к проекту <b>{escape(tenant.name)}</b> как сотрудник.\n\n"
+                "Здесь доступны только ваши рабочие ситуации и персональные сводки. "
+                "Если рабочая Telegram-сессия ещё не связана, обратитесь к руководителю проекта.",
+                reply_markup=client_main_menu(mini_app_url, role=client_context.role),
             )
             return
         await message.answer(
@@ -657,22 +708,31 @@ def build_client_router(
     @router.callback_query(F.data == "client:menu")
     async def menu(query: CallbackQuery, client_context: ClientContext) -> None:
         await record(client_context, "client_menu_opened")
-        metrics = await key_metrics(client_context.tenant_id)
+        metrics = await key_metrics(
+            client_context.tenant_id,
+            employee_id=(
+                client_context.employee_id if client_context.role == "employee" else None
+            ),
+        )
         await render(
             query,
             f"<b>{escape(client_context.tenant.name)}</b>\n\n"
             f"В работе: <b>{metrics['problems']}</b> · ждут ответа: <b>{metrics['waiting']}</b>\n"
             f"Последние действия доступны в панели Ventrix AI.\n\nВыберите действие:",
             main=True,
+            context=client_context,
         )
 
     @router.callback_query(F.data == "client:more")
     async def more_menu(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role in {"employee", "observer"}:
+            await query.answer("Для вашей роли здесь нет дополнительных настроек", show_alert=True)
+            return
         await record(client_context, "client_more_opened")
         await edit_screen(
             query,
             "<b>Ещё</b>\n\nПодключения, команда и настройки проекта.",
-            client_more_menu(),
+            client_more_menu(role=client_context.role),
         )
 
     @router.callback_query(F.data.startswith("np:open:"))
@@ -999,6 +1059,9 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:summary")
     async def summary(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role == "observer":
+            await query.answer("Для вашей роли доступен только раздел отчётов", show_alert=True)
+            return
         await record(client_context, "summary_opened")
         tenant = client_context.tenant
         try:
@@ -1030,7 +1093,13 @@ def build_client_router(
                         )
                     ).all()
                 )
-        live = await key_metrics(tenant.id)
+        employee_view = client_context.role == "employee"
+        live = await key_metrics(
+            tenant.id,
+            employee_id=client_context.employee_id if employee_view else None,
+        )
+        if employee_view:
+            metrics = {}
         last_report = (
             report.ready_at.strftime("%d.%m.%Y %H:%M")
             if report and report.ready_at
@@ -1041,16 +1110,26 @@ def build_client_router(
             if schedule and schedule.next_analysis_at
             else next_report.strftime("%d.%m.%Y %H:%M")
         )
+        report_block = (
+            f"<blockquote><b>Моя последняя сводка</b>\nПоследняя сводка: {last_report}\n"
+            f"Следующая проверка: {next_at}</blockquote>"
+            if employee_view
+            else f"<blockquote><b>Последняя рабочая сводка</b>\nИзучено сообщений: <b>{int(metrics.get('messages', 0))}</b>\nВажных ситуаций: <b>{int(metrics.get('high', 0))}</b>\nСреднего приоритета: <b>{int(metrics.get('medium', 0))}</b>\n\nПоследняя сводка: {last_report}\nСледующая проверка: {next_at}</blockquote>"
+        )
         await render(
             query,
-            f"<b>📊 Ключевые показатели · {escape(tenant.name)}</b>\n\n"
+            f"<b>📊 {'Мои показатели' if employee_view else 'Ключевые показатели'} · {escape(tenant.name)}</b>\n\n"
             f"<blockquote><b>Сейчас требуют реакции</b>\nРабочие ситуации: <b>{live['problems']}</b>\nКлиенты ждут ответа: <b>{live['waiting']}</b></blockquote>\n\n"
-            f"<blockquote><b>Последняя рабочая сводка</b>\nИзучено сообщений: <b>{int(metrics.get('messages', 0))}</b>\nВажных ситуаций: <b>{int(metrics.get('high', 0))}</b>\nСреднего приоритета: <b>{int(metrics.get('medium', 0))}</b>\n\nПоследняя сводка: {last_report}\nСледующая проверка: {next_at}</blockquote>",
+            f"{report_block}",
             main=True,
+            context=client_context,
         )
 
     @router.callback_query(F.data == "client:important")
     async def important(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role == "observer":
+            await query.answer("Для вашей роли доступен только раздел отчётов", show_alert=True)
+            return
         await record(client_context, "problems_opened")
         async with events.session_factory() as session:
             rows = list(
@@ -1059,6 +1138,11 @@ def build_client_router(
                     .where(
                         OperationalProblem.tenant_id == client_context.tenant_id,
                         OperationalProblem.status.in_(ACTIVE_PROBLEM_STATUSES),
+                        *(
+                            (OperationalProblem.responsible_employee_id == client_context.employee_id,)
+                            if client_context.role == "employee"
+                            else ()
+                        ),
                     )
                     .order_by(OperationalProblem.occurred_at.desc())
                     .limit(5)
@@ -1125,20 +1209,27 @@ def build_client_router(
                 continue
             seen.add(key)
             canonical.append(item)
+        employee_view = client_context.role == "employee"
         lines = [
-            f"• <b>{item.period_end:%d.%m.%Y}</b> — {escape(item.summary.replace('Обработано сообщений', 'изучено сообщений').replace('Проблем', 'ситуаций'))}"
+            (
+                f"• <b>{item.period_end:%d.%m.%Y}</b> — персональная сводка готова"
+                if employee_view
+                else f"• <b>{item.period_end:%d.%m.%Y}</b> — {escape(item.summary.replace('Обработано сообщений', 'изучено сообщений').replace('Проблем', 'ситуаций'))}"
+            )
             for item in canonical[:5]
         ]
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    text="Сводка за 7 дней", callback_data="client:report:request:week"
-                ),
-                InlineKeyboardButton(
-                    text="За 30 дней", callback_data="client:report:request:month"
-                ),
-            ]
-        ]
+        buttons: list[list[InlineKeyboardButton]] = []
+        if not employee_view and client_context.role in {"owner", "manager"}:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Сводка за 7 дней", callback_data="client:report:request:week"
+                    ),
+                    InlineKeyboardButton(
+                        text="За 30 дней", callback_data="client:report:request:month"
+                    ),
+                ]
+            )
         if mini_app_url:
             buttons.append(
                 [
@@ -1147,7 +1238,7 @@ def build_client_router(
                     )
                 ]
             )
-        if canonical:
+        if canonical and not employee_view:
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -1165,12 +1256,19 @@ def build_client_router(
                 if lines
                 else "Готовых сводок пока нет — пустые отчёты не создаются."
             )
-            + "\n\n<i>Недельную сводку можно обновлять раз в день, месячную — раз в неделю.</i>",
+            + (
+                "\n\n<i>Здесь показаны только ваши рабочие итоги.</i>"
+                if employee_view
+                else "\n\n<i>Недельную сводку можно обновлять раз в день, месячную — раз в неделю.</i>"
+            ),
             InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
     @router.callback_query(F.data.startswith("client:report:request:"))
     async def request_report(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await query.answer("Запуск общей сводки доступен руководителю", show_alert=True)
+            return
         if connection_service is None:
             await query.answer("Анализ временно недоступен", show_alert=True)
             return
@@ -1212,6 +1310,9 @@ def build_client_router(
 
     @router.callback_query(F.data.startswith("client:report:pdf:"))
     async def report_pdf(query: CallbackQuery, client_context: ClientContext) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await query.answer("Общий PDF доступен руководителю проекта", show_alert=True)
+            return
         report_id = (query.data or "").rsplit(":", 1)[-1]
         async with events.session_factory() as session:
             report = await session.scalar(
@@ -1263,6 +1364,8 @@ def build_client_router(
     @router.callback_query(F.data == "client:connections")
     @router.callback_query(F.data == "client:connect")
     async def connections(query: CallbackQuery, client_context: ClientContext) -> None:
+        if await deny_project_management(query, client_context):
+            return
         await record(client_context, "telegram_connection_started")
         if connection_service is None:
             await render(
@@ -2007,6 +2110,8 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:settings")
     async def settings(query: CallbackQuery, client_context: ClientContext) -> None:
+        if await deny_project_management(query, client_context):
+            return
         await record(client_context, "settings_opened")
         tenant = client_context.tenant
         await edit_screen(
@@ -2027,6 +2132,8 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:employees")
     async def employees(query: CallbackQuery, client_context: ClientContext) -> None:
+        if await deny_project_management(query, client_context):
+            return
         async with events.session_factory() as session:
             rows = list(
                 await session.scalars(
@@ -2061,6 +2168,8 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:groups")
     async def groups(query: CallbackQuery, client_context: ClientContext) -> None:
+        if await deny_project_management(query, client_context):
+            return
         async with events.session_factory() as session:
             rows = list(
                 await session.scalars(
@@ -2089,6 +2198,8 @@ def build_client_router(
 
     @router.callback_query(F.data == "client:groups:check")
     async def check_groups(query: CallbackQuery, client_context: ClientContext) -> None:
+        if await deny_project_management(query, client_context):
+            return
         async with events.session_factory() as session:
             rows = list(
                 await session.scalars(

@@ -323,6 +323,8 @@ export class VentrixClientApi {
 
 function apiErrorMessage(detail: string | undefined, status: number) {
   if (status >= 500) return "Ventrix временно не отвечает. Повторите через несколько секунд.";
+  if (status === 403) return "Этот раздел недоступен для вашей роли в проекте.";
+  if (status === 401) return "Сессия Telegram устарела. Закройте Mini App и откройте её из бота снова.";
   if (!detail || /^(load failed|failed to fetch|network error)$/i.test(detail.trim())) {
     return "Не удалось загрузить данные. Проверьте соединение и повторите.";
   }

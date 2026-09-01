@@ -59,7 +59,7 @@ export function MiniAppRoot() {
       case "problems": return <ProblemsView api={api} initialProblemId={dashboardProblemId ?? requestedProblemId} />;
       case "commitments": return <CommitmentsView api={api} onOpenProblem={() => navigate("problems")} />;
       case "statistics": return <StatisticsView api={api} summary={session.auth.dashboard_summary} />;
-      case "reports": return <ReportsView api={api} />;
+      case "reports": return <ReportsView api={api} personal={session.auth.user.role === "employee" && !session.auth.permissions.includes("reports.read")} />;
       case "employees": return <EmployeesView api={api} canManage={session.auth.permissions.includes("*") || session.auth.permissions.includes("employees.manage")} onOpenGroups={() => navigate("groups")} />;
       case "connections": return <ConnectionManager api={api} connections={session.bootstrap.connections} />;
       case "groups": return <GroupsView api={api} />;

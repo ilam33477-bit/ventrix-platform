@@ -19,7 +19,7 @@ import { ConnectionManager } from "../connections/connection-manager";
 import { useResource } from "../../hooks/use-resource";
 import type { ClientSettings, ReportDetail, TabId } from "../../types";
 
-export function ReportsView({ api }: { api: VentrixClientApi }) {
+export function ReportsView({ api, personal = false }: { api: VentrixClientApi; personal?: boolean }) {
   const loader = useCallback(() => api.reports(), [api]);
   const { data, loading, error, reload } = useResource(loader);
   const [detail, setDetail] = useState<ReportDetail | null>(null);
@@ -65,7 +65,7 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
             <StatusBadge tone="success">Готова</StatusBadge>
             <small>{formatReportPeriod(detail.period.start, detail.period.end)}</small>
           </div>
-          <h2>Итоги работы команды</h2>
+          <h2>{personal ? "Мои рабочие итоги" : "Итоги работы команды"}</h2>
           <p>{humanReportSummary(detail.summary)}</p>
         </Card>
         {headlineMetrics.length > 0 && (
@@ -75,8 +75,9 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
             ))}
           </div>
         )}
-        <ReportNarrative value={narrative} />
+        {!personal && <ReportNarrative value={narrative} />}
         <div className="report-detail-grid">
+          {!personal && (
           <Card className="report-summary-panel">
             <h3>Компания</h3>
             <p>Состояние рабочих ситуаций и обязательств за выбранный период.</p>
@@ -88,14 +89,15 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
               <ReportRow label="Активные группы" value={company.active_groups} />
             </div>
           </Card>
+          )}
           <Card className="report-summary-panel">
-            <h3>Команда</h3>
-            <p>Только показатели, которые рассчитаны в этой сводке.</p>
+            <h3>{personal ? "Мои показатели" : "Команда"}</h3>
+            <p>{personal ? "Только ваши рабочие результаты за выбранный период." : "Только показатели, которые рассчитаны в этой сводке."}</p>
             <ReportEmployees value={employees} />
           </Card>
         </div>
-        <ReportClients value={clients} />
-        <ReportRecommendations value={recommendations} />
+        {!personal && <ReportClients value={clients} />}
+        {!personal && <ReportRecommendations value={recommendations} />}
       </section>
     );
   }
@@ -106,7 +108,7 @@ export function ReportsView({ api }: { api: VentrixClientApi }) {
       <SectionHeading
         eyebrow="ОТЧЁТЫ"
         title="Рабочие сводки"
-        description="Периодические итоги по рабочим ситуациям, обязательствам и команде. Пустые технические запуски здесь не показываются."
+        description={personal ? "Ваши рабочие ситуации, обязательства и результаты за выбранный период." : "Периодические итоги по рабочим ситуациям, обязательствам и команде. Пустые технические запуски здесь не показываются."}
       />
       {loading ? (
         <div className="report-loading"><Skeleton lines={4} /></div>

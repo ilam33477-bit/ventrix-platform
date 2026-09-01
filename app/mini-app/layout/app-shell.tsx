@@ -74,9 +74,11 @@ export function MiniAppShell({ auth, access, active, onNavigate, canGoBack, onBa
     setProfileOpen(true);
   };
   const canManageProject = auth.permissions.includes("*") || auth.permissions.includes("settings.manage");
+  const employeeView = auth.user.role === "employee";
   const visibleSections = allSections.filter((item) =>
-    canManageProject || !["connections", "groups", "settings"].includes(item.id),
+    canManageProject || !["connections", "groups", "settings", ...(employeeView ? ["employees"] : [])].includes(item.id),
   );
+  const visiblePrimaryTabs = primaryTabs.filter((item) => !employeeView || item.id !== "employees");
   return <main className="mini-app-shell">
     <aside className="mini-sidebar">
       <div className="mini-brand"><span>V</span><strong>Ventrix</strong></div>
@@ -88,8 +90,8 @@ export function MiniAppShell({ auth, access, active, onNavigate, canGoBack, onBa
       <header className="mini-topbar">{canGoBack && <IconButton className="mini-back" label="Назад" onClick={onBack}><Icon name="back" /></IconButton>}<div><p className="eyebrow">{auth.tenant_name}</p><h1>{active === "more" ? "Ещё" : allSections.find((item) => item.id === active)?.label ?? "Ventrix"}</h1></div><ProfileButton initials={initials} label="Открыть профиль" aria-expanded={profileOpen} onClick={openProfile} /></header>
       <div className="mini-view screen-enter" key={active}>{children}</div>
     </section>
-    <nav className="mini-bottom-nav" aria-label="Основная навигация">
-      {primaryTabs.map((item) => <button key={item.id} className={active === item.id || (item.id === "more" && !primaryTabs.some((tab) => tab.id === active)) ? "active" : ""} onClick={() => onNavigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}
+    <nav className="mini-bottom-nav" aria-label="Основная навигация" style={{ gridTemplateColumns: `repeat(${visiblePrimaryTabs.length}, minmax(0, 1fr))` }}>
+      {visiblePrimaryTabs.map((item) => <button key={item.id} className={active === item.id || (item.id === "more" && !visiblePrimaryTabs.some((tab) => tab.id === active)) ? "active" : ""} onClick={() => onNavigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}
     </nav>
     {profileOpen && <div className="profile-overlay" role="presentation" onMouseDown={(event) => event.currentTarget === event.target && setProfileOpen(false)}><section className="profile-sheet" role="dialog" aria-modal="true" aria-labelledby="profile-title" ref={profileRef}><header><div className="profile-identity"><span>{initials}</span><div><h2 id="profile-title">{userName}</h2><p>{auth.user.username ? `@${auth.user.username}` : "Username не указан"}</p></div></div><IconButton label="Закрыть профиль" onClick={() => setProfileOpen(false)}><Icon name="close" /></IconButton></header><div className={`access-card ${accessState.tone}`}><StatusBadge tone={accessState.tone}>{accessState.label}</StatusBadge><strong>{accessState.title}</strong><p>{accessState.description}</p></div><div className="profile-facts"><span><small>Роль в проекте</small><strong>{roleLabel(auth.user.role)}</strong></span><span><small>Мониторинг</small><strong>{access.analysis_enabled ? "Работает" : "Приостановлен"}</strong></span></div><div className="profile-theme"><h3>Тема</h3><SegmentedControl label="Тема интерфейса" value={theme} onChange={chooseTheme} options={[{ value: "light", label: "Светлая" }, { value: "dark", label: "Тёмная" }, { value: "telegram", label: "Telegram" }]} /></div>{canManageProject && <button className="profile-settings" onClick={openSettings}><Icon name="settings" /><span><strong>Настройки</strong><small>Расписание регулярных отчётов</small></span></button>}</section></div>}
   </main>;

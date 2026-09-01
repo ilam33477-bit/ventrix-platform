@@ -408,28 +408,42 @@ def bot_actions(bot_id: str, username: str) -> InlineKeyboardMarkup:
     )
 
 
-def client_main_menu(mini_app_url: str | None = None) -> InlineKeyboardMarkup:
+def client_main_menu(
+    mini_app_url: str | None = None, *, role: str | None = None
+) -> InlineKeyboardMarkup:
     panel = (
         InlineKeyboardButton(text="Открыть Ventrix AI", web_app=WebAppInfo(url=mini_app_url))
         if mini_app_url
         else InlineKeyboardButton(text="Открыть Ventrix AI", callback_data="client:panel")
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [panel],
-            [
-                InlineKeyboardButton(text="Сводка", callback_data="client:summary"),
-                InlineKeyboardButton(text="Ситуации", callback_data="client:important"),
-            ],
+    rows = [
+        [panel],
+        [
+            InlineKeyboardButton(text="Сводка", callback_data="client:summary"),
+            InlineKeyboardButton(text="Ситуации", callback_data="client:important"),
+        ],
+    ]
+    if role == "employee":
+        rows.append([InlineKeyboardButton(text="Мои отчёты", callback_data="client:reports")])
+    elif role == "observer":
+        rows = [[panel], [InlineKeyboardButton(text="Отчёты", callback_data="client:reports")]]
+    else:
+        rows.append(
             [
                 InlineKeyboardButton(text="Отчёты", callback_data="client:reports"),
                 InlineKeyboardButton(text="Ещё", callback_data="client:more"),
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def client_more_menu() -> InlineKeyboardMarkup:
+def client_more_menu(*, role: str | None = None) -> InlineKeyboardMarkup:
+    if role in {"employee", "observer"}:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="← Главное меню", callback_data="client:menu")]
+            ]
+        )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [

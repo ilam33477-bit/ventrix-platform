@@ -5,6 +5,7 @@ import hmac
 import importlib
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -20,6 +21,7 @@ from services.backend.api.client_router import (
 from services.backend.api.dependencies import get_foundation_service
 from services.backend.config import get_settings
 from services.backend.database import get_session
+from services.backend.models import AnalysisRun, Report, ReportMetric, ReportSection
 
 
 def signed_init_data(token: str, user_id: int, auth_date: int, username: str | None = None) -> str:
@@ -406,11 +408,98 @@ async def test_owner_api_endpoints(
             headers={"Authorization": f"tma {employee_init_data}"},
         )
         assert [item["telegram_user_id"] for item in employee_visible_staff.json()] == [700001]
+        now = datetime.now(UTC)
+        async with session_factory() as session:
+            run = AnalysisRun(
+                tenant_id=tenant_id,
+                trigger="scheduled",
+                status="completed",
+                stage="completed",
+                correlation_id="employee-report-access-test",
+                finished_at=now,
+                metrics_json={},
+            )
+            session.add(run)
+            await session.flush()
+            report_row = Report(
+                tenant_id=tenant_id,
+                analysis_run_id=run.id,
+                status="ready",
+                period_start=now - timedelta(days=1),
+                period_end=now,
+                ready_at=now,
+                summary="Общая сводка компании, недоступная сотруднику.",
+            )
+            session.add(report_row)
+            await session.flush()
+            session.add_all(
+                [
+                    ReportMetric(
+                        tenant_id=tenant_id,
+                        report_id=report_row.id,
+                        metric_key="messages",
+                        numeric_value=999,
+                        data_json={},
+                    ),
+                    ReportSection(
+                        tenant_id=tenant_id,
+                        report_id=report_row.id,
+                        section_key="employee_report",
+                        position=1,
+                        data_json={
+                            "employees": [
+                                {
+                                    "employee_id": employee.json()["id"],
+                                    "name": "Мария",
+                                    "resolved": 2,
+                                    "clients_waiting": 1,
+                                    "open_promises": 3,
+                                },
+                                {
+                                    "employee_id": second_employee.json()["id"],
+                                    "name": "Иван",
+                                    "resolved": 100,
+                                    "clients_waiting": 50,
+                                    "open_promises": 25,
+                                },
+                            ]
+                        },
+                    ),
+                    ReportSection(
+                        tenant_id=tenant_id,
+                        report_id=report_row.id,
+                        section_key="company_report",
+                        position=2,
+                        data_json={"revenue": 1_000_000},
+                    ),
+                ]
+            )
+            await session.commit()
+            report_id = report_row.id
         employee_reports = await client.get(
             "/api/v1/client/reports",
             headers={"Authorization": f"tma {employee_init_data}"},
         )
-        assert employee_reports.status_code == 403
+        assert employee_reports.status_code == 200
+        assert employee_reports.json()[0]["summary"] == "Персональная сводка за период готова."
+        employee_report = await client.get(
+            f"/api/v1/client/reports/{report_id}",
+            headers={"Authorization": f"tma {employee_init_data}"},
+        )
+        assert employee_report.status_code == 200
+        assert employee_report.json()["metrics"] == {}
+        assert [section["key"] for section in employee_report.json()["sections"]] == [
+            "employee_report"
+        ]
+        assert employee_report.json()["sections"][0]["data"]["employees"] == [
+            {
+                "employee_id": employee.json()["id"],
+                "name": "Мария",
+                "resolved": 2,
+                "clients_waiting": 1,
+                "open_promises": 3,
+            }
+        ]
 
         group = await client.post(
             "/api/v1/client/group-integrations",

@@ -41,6 +41,12 @@ def test_owner_and_client_navigation_is_inline_only() -> None:
     assert button_texts(welcome) == ["Настроить Ventrix"]
 
 
+def test_employee_navigation_contains_only_personal_sections() -> None:
+    employee = button_texts(client_main_menu(role="employee"))
+    assert employee == ["Открыть Ventrix AI", "Сводка", "Ситуации", "Мои отчёты"]
+    assert button_texts(client_more_menu(role="employee")) == ["← Главное меню"]
+
+
 def test_client_interface_hides_platform_owner_support_and_commercial_terms() -> None:
     source = inspect.getsource(build_client_router).lower()
     for forbidden in ("platform_owner", "поддержка", "тариф", "цена", "deepseek"):
