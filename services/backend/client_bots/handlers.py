@@ -113,6 +113,47 @@ CONNECTION_STATUS_LABELS = {
 }
 
 
+EMPLOYEE_CALLBACKS = {
+    "client:menu",
+    "client:summary",
+    "client:important",
+    "client:reports",
+    "client:employees",
+    "client:panel",
+    "client:how",
+    "client:employee-guide:1",
+    "client:employee-guide:2",
+    "client:employee-guide:3",
+    "client:employee-guide:finish",
+}
+OBSERVER_CALLBACKS = {"client:menu", "client:reports", "client:panel"}
+
+
+def can_access_bot_problem(context: ClientContext, problem: OperationalProblem) -> bool:
+    if problem.tenant_id != context.tenant_id:
+        return False
+    return context.role in {"owner", "manager"} or bool(
+        context.role == "employee"
+        and context.employee_id
+        and problem.responsible_employee_id == context.employee_id
+    )
+
+
+def callback_allowed_for_role(role: str, callback_data: str) -> bool:
+    """Keep bot navigation aligned with the API's role-scoped read model."""
+
+    if role in {"owner", "manager"}:
+        return True
+    if role == "employee" and callback_data.startswith(("np:open:", "np:close:")):
+        # These handlers additionally check the situation's responsible employee.
+        return True
+    if role == "employee":
+        return callback_data in EMPLOYEE_CALLBACKS
+    if role == "observer":
+        return callback_data in OBSERVER_CALLBACKS
+    return False
+
+
 class TenantOwnerMiddleware(BaseMiddleware):
     def __init__(
         self,
@@ -205,10 +246,8 @@ class TenantOwnerMiddleware(BaseMiddleware):
             elif isinstance(event, Message):
                 await event.answer("У вас нет доступа к этому проекту.")
             return None
-        if (
-            membership.role not in {"owner", "manager"}
-            and isinstance(event, CallbackQuery)
-            and not (event.data or "").startswith("np:")
+        if isinstance(event, CallbackQuery) and not callback_allowed_for_role(
+            membership.role, event.data or ""
         ):
             await event.answer("Для этого действия недостаточно прав.", show_alert=True)
             return None
@@ -323,6 +362,45 @@ def build_client_router(
             "Посмотреть в системе",
             "problems",
             problem_id=problem_id,
+        )
+
+    def employee_guide_markup(step: int) -> InlineKeyboardMarkup:
+        labels = {
+            1: ("Что мне будет приходить", "client:employee-guide:2"),
+            2: ("Что можно делать", "client:employee-guide:3"),
+            3: ("Перейти в меню", "client:employee-guide:finish"),
+        }
+        label, callback = labels[step]
+        rows = [[InlineKeyboardButton(text=label, callback_data=callback)]]
+        if step > 1:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="← Назад", callback_data=f"client:employee-guide:{step - 1}"
+                    )
+                ]
+            )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def employee_guide_text(step: int, tenant_name: str) -> str:
+        if step == 1:
+            return (
+                f"<b>Добро пожаловать в Ventrix · {escape(tenant_name)}</b>\n\n"
+                "Это ваш рабочий помощник. Вы увидите только ситуации, закреплённые "
+                "за вашей Telegram-сессией; чужие диалоги и настройки проекта закрыты."
+            )
+        if step == 2:
+            return (
+                "<b>Уведомления без лишнего шума</b>\n\n"
+                "Бот пришлёт карточку, когда в вашем диалоге действительно нужна реакция: "
+                "клиент ждёт ответа, есть риск по обещанию или другой подтверждённый вопрос.\n\n"
+                "Кнопка в карточке откроет именно эту ситуацию."
+            )
+        return (
+            "<b>Ваши действия и отчёты</b>\n\n"
+            "В ситуации можно посмотреть контекст, ответить через рабочий Telegram, взять её "
+            "в работу или завершить. В «Моих отчётах» — только ваши показатели. Раздел "
+            "«Команда» доступен для просмотра, но управление остаётся у руководителя."
         )
 
     def problem_status_markup(
@@ -557,12 +635,16 @@ def build_client_router(
             if len(command_parts) == 2:
                 start_parameter = command_parts[1].strip()
         linked_problem: OperationalProblem | None = None
+        first_employee_start = False
         async with events.session_factory() as session:
             membership = await session.scalar(
                 select(TenantMembership).where(
                     TenantMembership.tenant_id == tenant.id,
                     TenantMembership.telegram_user_id == client_context.telegram_user_id,
                 )
+            )
+            first_employee_start = bool(
+                employee_view and membership is not None and membership.bot_started_at is None
             )
             if membership is not None and membership.bot_started_at is None:
                 membership.bot_started_at = datetime.now(UTC)
@@ -577,8 +659,7 @@ def build_client_router(
                 )
                 if (
                     linked_problem is not None
-                    and client_context.role == "employee"
-                    and linked_problem.responsible_employee_id != client_context.employee_id
+                    and not can_access_bot_problem(client_context, linked_problem)
                 ):
                     linked_problem = None
             connections = list(
@@ -660,6 +741,12 @@ def build_client_router(
                 reply_markup=mini_app_section_markup("Открыть команду", "employees"),
             )
             return
+        if first_employee_start:
+            await message.answer(
+                employee_guide_text(1, tenant.name),
+                reply_markup=employee_guide_markup(1),
+            )
+            return
         first_name = (
             (message.from_user.first_name if message.from_user else None)
             or (tenant.owner_name or "").strip().split()[0]
@@ -718,9 +805,37 @@ def build_client_router(
             query,
             f"<b>{escape(client_context.tenant.name)}</b>\n\n"
             f"В работе: <b>{metrics['problems']}</b> · ждут ответа: <b>{metrics['waiting']}</b>\n"
-            f"Последние действия доступны в панели Ventrix AI.\n\nВыберите действие:",
+            "Последние действия доступны в панели Ventrix AI.\n\nВыберите действие:",
             main=True,
             context=client_context,
+        )
+
+    @router.callback_query(F.data.startswith("client:employee-guide:"))
+    async def employee_guide(
+        query: CallbackQuery, client_context: ClientContext
+    ) -> None:
+        if client_context.role != "employee":
+            await query.answer("Инструкция предназначена для сотрудника", show_alert=True)
+            return
+        suffix = (query.data or "").rsplit(":", 1)[-1]
+        if suffix == "finish":
+            await record(client_context, "employee_onboarding_completed")
+            await render(
+                query,
+                "<b>Всё готово</b>\n\nVentrix покажет только ваши рабочие ситуации и персональные показатели.",
+                main=True,
+                context=client_context,
+            )
+            return
+        if suffix not in {"1", "2", "3"}:
+            await query.answer("Этот шаг инструкции недоступен")
+            return
+        step = int(suffix)
+        await record(client_context, "employee_onboarding_step", step=step)
+        await edit_screen(
+            query,
+            employee_guide_text(step, client_context.tenant.name),
+            employee_guide_markup(step),
         )
 
     @router.callback_query(F.data == "client:more")
@@ -750,10 +865,7 @@ def build_client_router(
         if problem is None:
             await query.answer("Ситуация не найдена", show_alert=True)
             return
-        if (
-            client_context.role == "employee"
-            and problem.responsible_employee_id != client_context.employee_id
-        ):
+        if not can_access_bot_problem(client_context, problem):
             await query.answer("Эта ситуация назначена другому сотруднику", show_alert=True)
             return
         if problem.status == ProblemStatus.FALSE_POSITIVE.value:
@@ -863,10 +975,7 @@ def build_client_router(
         if problem is None:
             await query.answer("Ситуация не найдена", show_alert=True)
             return
-        if (
-            client_context.role == "employee"
-            and problem.responsible_employee_id != client_context.employee_id
-        ):
+        if not can_access_bot_problem(client_context, problem):
             await query.answer("Эта ситуация назначена другому сотруднику", show_alert=True)
             return
         try:

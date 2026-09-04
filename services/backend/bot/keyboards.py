@@ -430,6 +430,13 @@ def client_main_menu(
                 InlineKeyboardButton(text="Команда", callback_data="client:employees"),
             ]
         )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Как работать", callback_data="client:employee-guide:1"
+                )
+            ]
+        )
     elif role == "observer":
         rows = [[panel], [InlineKeyboardButton(text="Отчёты", callback_data="client:reports")]]
     else:
