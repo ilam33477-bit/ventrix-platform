@@ -85,6 +85,7 @@ async def ensure_onboarding_welcome(
                 "desired_outcomes": list(tenant.ai_profile.critical_events or [])[:5],
             },
             max_tokens=700,
+            user_id=tenant.id,
         )
         copy = OnboardingWelcomeCopy.model_validate(json.loads(content))
     except Exception as exc:  # noqa: BLE001 - onboarding has a safe product fallback

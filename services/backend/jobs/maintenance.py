@@ -14,6 +14,7 @@ from ..database import SQLiteTransactionManager
 from ..models import (
     BackgroundJob,
     BotInstance,
+    Employee,
     GroupIntegration,
     NotificationLog,
     OperationalProblem,
@@ -22,9 +23,19 @@ from ..models import (
     ReportSection,
     TelegramDialog,
     Tenant,
+    TenantMembership,
 )
 from ..telegram_sessions.service import TelegramConnectionService
 from .queue import JobLease
+
+
+def _report_age(minutes: object) -> str:
+    value = max(0, int(minutes or 0))
+    if value >= 60 * 24:
+        return f"{value // (60 * 24)} дн."
+    if value >= 60:
+        return f"{value // 60} ч"
+    return f"{value} мин."
 
 
 class MaintenanceJobHandlers:
@@ -89,7 +100,7 @@ class MaintenanceJobHandlers:
     async def report_delivery(self, job: JobLease) -> dict[str, object]:
         report_id = str(job.payload["report_id"])
 
-        async def write(session: AsyncSession) -> tuple[str, list[tuple[str, str]]]:
+        async def write(session: AsyncSession) -> tuple[str, list[tuple[str, str]], str]:
             report = await session.scalar(
                 select(Report).where(
                     Report.id == report_id,
@@ -139,7 +150,10 @@ class MaintenanceJobHandlers:
             highlights = [escape(str(item)) for item in list(narrative.get("highlights") or [])[:4]]
             risks = [escape(str(item)) for item in list(narrative.get("risks") or [])[:4]]
             employee_blocks: list[str] = []
-            for row in employee_rows[:8]:
+            employee_blocks_by_id: dict[str, str] = {}
+            employee_attention_by_id: dict[str, str] = {}
+            manager_attention: list[tuple[int, str]] = []
+            for row_index, row in enumerate(employee_rows):
                 open_tasks = int(row.get("open_promises", 0)) + int(row.get("clients_waiting", 0))
                 response_minutes = row.get("average_response_minutes")
                 response_change = row.get("response_time_change_percent")
@@ -154,6 +168,17 @@ class MaintenanceJobHandlers:
                             f" ({abs(float(response_change)):g}% {direction} прошлого периода)"
                         )
                 outcome_lines: list[str] = []
+                contacted = int(row.get("response_rate_denominator", 0))
+                responded = int(row.get("responded_dialogs", 0))
+                if contacted:
+                    outcome_lines.append(
+                        f"Ответили: <b>{responded} из {contacted}</b> "
+                        f"({float(row.get('response_rate_percent') or 0):g}%)"
+                    )
+                if int(row.get("interests_confirmed", 0)):
+                    outcome_lines.append(
+                        f"Подтверждённый интерес: <b>{int(row['interests_confirmed'])}</b>"
+                    )
                 if int(row.get("calls_scheduled", 0)):
                     outcome_lines.append(
                         f"Подтверждённых созвонов: <b>{int(row['calls_scheduled'])}</b>"
@@ -173,7 +198,7 @@ class MaintenanceJobHandlers:
                     outcome_lines.append(
                         f"Факт периода: {escape(str(outcomes[0].get('summary') or ''))}"
                     )
-                employee_blocks.append(
+                employee_block = (
                     "<blockquote>"
                     f"<b>{escape(str(row.get('name') or 'Сотрудник'))}</b>\n"
                     f"Активность: <b>{int(row.get('messages_sent', 0))}</b> сообщений "
@@ -186,6 +211,26 @@ class MaintenanceJobHandlers:
                     + ("\n" + "\n".join(outcome_lines) if outcome_lines else "")
                     + "</blockquote>"
                 )
+                attention_lines: list[str] = []
+                for item in list(row.get("attention_items") or [])[:5]:
+                    dialog = escape(str(item.get("dialog") or "Диалог"))
+                    evidence = escape(str(item.get("evidence") or ""))[:180]
+                    age_minutes = int(item.get("age_minutes") or 0)
+                    line = f"• <b>{dialog}</b> — {_report_age(age_minutes)}"
+                    if evidence:
+                        line += f" · «{evidence}»"
+                    attention_lines.append(line)
+                    manager_attention.append((age_minutes, line))
+                if row_index < 8:
+                    employee_blocks.append(employee_block)
+                if row.get("employee_id"):
+                    employee_id = str(row["employee_id"])
+                    employee_blocks_by_id[employee_id] = employee_block
+                    if attention_lines:
+                        employee_attention_by_id[employee_id] = (
+                            "\n\n<b>Требуют внимания</b>\n"
+                            + "\n".join(attention_lines)
+                        )
             no_activity = int(metrics.get("messages", 0)) == 0
             partial_analysis = bool(metrics.get("analysis_partial", 0))
             text = (
@@ -223,14 +268,24 @@ class MaintenanceJobHandlers:
                     else ""
                 )
                 + (
+                    "<b>Текущие рабочие ситуации</b>\n"
+                    + "\n".join(
+                        item[1]
+                        for item in sorted(manager_attention, reverse=True)[:5]
+                    )
+                    + "\n\n"
+                    if manager_attention
+                    else ""
+                )
+                + (
                     "<b>По сотрудникам</b>\n" + "\n".join(employee_blocks) + "\n\n"
                     if employee_blocks
                     else ""
                 )
                 + "Полная сводка и связанные ситуации доступны в Mini App."
             )[:4000]
-            destinations: list[tuple[str, str, str | None]] = [
-                ("manager", str(tenant.owner_telegram_user_id), None)
+            destinations: list[tuple[str, str, str | None, str | None, str]] = [
+                ("manager", str(tenant.owner_telegram_user_id), None, None, text)
             ]
             groups = list(
                 await session.scalars(
@@ -238,19 +293,76 @@ class MaintenanceJobHandlers:
                         GroupIntegration.tenant_id == tenant.id,
                         GroupIntegration.status == "active",
                         GroupIntegration.notifications_enabled.is_(True),
+                        GroupIntegration.approved_at.is_not(None),
                     )
                 )
             )
             destinations.extend(
-                ("group", str(group.telegram_chat_id), group.id) for group in groups
+                (
+                    "group",
+                    str(group.telegram_chat_id),
+                    group.id,
+                    None,
+                    (
+                        "📊 <b>Сводка проекта готова</b>\n\n"
+                        "Откройте личный чат с ботом. "
+                        "Он покажет только доступные вам данные."
+                    ),
+                )
+                for group in groups
             )
+            employee_ids = list(employee_blocks_by_id)
+            report_employees = list(
+                await session.scalars(
+                    select(Employee)
+                    .join(
+                        TenantMembership,
+                        TenantMembership.employee_id == Employee.id,
+                    )
+                    .where(
+                        Employee.tenant_id == tenant.id,
+                        Employee.id.in_(employee_ids),
+                        Employee.status == "active",
+                        Employee.notifications_enabled.is_(True),
+                        Employee.telegram_user_id.is_not(None),
+                        TenantMembership.tenant_id == tenant.id,
+                        TenantMembership.telegram_user_id == Employee.telegram_user_id,
+                        TenantMembership.status == "active",
+                        TenantMembership.role.in_(("employee", "manager", "owner")),
+                    )
+                )
+            ) if employee_ids else []
+            for employee in report_employees:
+                destinations.append(
+                    (
+                        "employee",
+                        str(employee.telegram_user_id),
+                        None,
+                        employee.id,
+                        (
+                            f"📊 <b>{report_title} · {escape(employee.display_name)}</b>\n"
+                            f"{report.period_start:%d.%m.%Y} — {report.period_end:%d.%m.%Y}\n\n"
+                            f"{employee_blocks_by_id[employee.id]}"
+                            f"{employee_attention_by_id.get(employee.id, '')}\n\n"
+                            "В сообщении показаны только ваши показатели. "
+                            "Подробности доступны в Mini App."
+                        )[:4000],
+                    )
+                )
             queued: list[tuple[str, str]] = []
+            delivery_states: list[str] = []
             mini_app_url = get_settings().client_mini_app_url
             report_url = None
             if mini_app_url:
                 separator = "&" if "?" in mini_app_url else "?"
                 report_url = f"{mini_app_url}{separator}section=reports&report_id={report.id}"
-            for destination_type, destination_id, group_id in destinations:
+            for (
+                destination_type,
+                destination_id,
+                group_id,
+                employee_id,
+                destination_text,
+            ) in destinations:
                 destination_report_url = report_url
                 if destination_type == "group" and group_id:
                     destination_group = await session.get(GroupIntegration, group_id)
@@ -271,12 +383,13 @@ class MaintenanceJobHandlers:
                     existing = NotificationLog(
                         tenant_id=tenant.id,
                         group_integration_id=group_id,
+                        employee_id=employee_id,
                         destination_type=destination_type,
                         destination_id=destination_id,
                         deduplication_key=dedup,
                         criticality=0,
                         payload_json={
-                            "text": text,
+                            "text": destination_text,
                             "privacy_safe": True,
                             "report_id": report.id,
                             "reply_markup": {
@@ -297,14 +410,21 @@ class MaintenanceJobHandlers:
                     )
                     session.add(existing)
                     await session.flush()
-                if existing.status != "sent":
+                delivery_states.append(existing.status)
+                if existing.status not in {"sent", "cancelled", "delivery_uncertain"}:
                     queued.append((existing.id, destination_type))
-            report.delivery_status = "pending" if queued else "sent"
-            if not queued:
+            report.delivery_status = (
+                "pending" if queued
+                else "sent" if all(state == "sent" for state in delivery_states)
+                else "partial" if "sent" in delivery_states
+                else "delivery_uncertain" if "delivery_uncertain" in delivery_states
+                else "cancelled"
+            )
+            if not queued and "sent" in delivery_states:
                 report.delivered_at = datetime.now(UTC)
-            return report.id, queued
+            return report.id, queued, report.delivery_status
 
-        delivered_id, notifications = await self.transactions.run(write)
+        delivered_id, notifications, delivery_status = await self.transactions.run(write)
         for notification_id, destination_type in notifications:
             await self.analysis.queue.enqueue(
                 f"notification.{destination_type}",
@@ -317,7 +437,7 @@ class MaintenanceJobHandlers:
             )
         return {
             "report_id": delivered_id,
-            "delivery_status": "queued" if notifications else "sent",
+            "delivery_status": "queued" if notifications else delivery_status,
             "notifications": len(notifications),
         }
 

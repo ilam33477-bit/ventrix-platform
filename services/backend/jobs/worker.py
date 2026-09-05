@@ -26,12 +26,20 @@ from ..intelligence.reconciliation import ReconciliationService
 from ..intelligence.signals import SignalService
 from ..observability import configure_structured_logging, log_event
 from ..services.encryption import EncryptionService
+from ..services.owner_monitoring import PlatformOwnerAlertDispatcher
+from ..services.runtime_monitoring import runtime_heartbeat_loop
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.event_ingestion import TelegramEventIngestion
 from ..telegram_sessions.gateway import TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionService
 from .maintenance import MaintenanceJobHandlers
-from .queue import JobDeferred, JobLease, SQLiteJobQueue
+from .queue import (
+    AI_PROVIDER_COST_CLASSES,
+    AI_PROVIDER_JOB_TYPES,
+    JobDeferred,
+    JobLease,
+    SQLiteJobQueue,
+)
 
 logger = logging.getLogger(__name__)
 JobHandler = Callable[[JobLease], Awaitable[dict[str, Any]]]
@@ -118,6 +126,7 @@ class BackgroundWorker:
                 retry_count=lease.attempts + 1,
                 status=status,
                 error_type=type(exc).__name__,
+                error_code=getattr(exc, "error_code", None),
             )
         else:
             await self.queue.complete(lease, result)
@@ -160,6 +169,15 @@ async def run() -> None:
             "sync": settings.max_active_sync_jobs,
             "report": settings.max_active_report_jobs,
             "notification": settings.max_active_notification_jobs,
+        },
+        resource_limits={
+            "ai": (
+                AI_PROVIDER_COST_CLASSES,
+                settings.max_active_ai_requests,
+            )
+        },
+        resource_job_types={
+            "ai": AI_PROVIDER_JOB_TYPES
         },
     )
     worker_id = f"{settings.worker_id}:{socket.gethostname()}:{os.getpid()}"
@@ -235,6 +253,12 @@ async def run() -> None:
         settings.telegram_api_base_url,
     )
     notification_dispatcher = NotificationDispatcher(session_factory, notification_sender)
+    platform_alert_dispatcher = PlatformOwnerAlertDispatcher(
+        api_base_url=settings.telegram_api_base_url,
+        bot_token=settings.telegram_owner_bot_token.get_secret_value(),
+        owner_telegram_id=settings.platform_owner_telegram_id,
+        timeout_seconds=min(30, settings.telegram_request_timeout_seconds),
+    )
     handlers.update(
         {
             "analysis.pipeline": analysis.pipeline,
@@ -270,6 +294,7 @@ async def run() -> None:
             "notification.manager": notification_dispatcher.dispatch,
             "notification.group": notification_dispatcher.dispatch,
             "notification.initial_summary": notification_dispatcher.initial_summary,
+            "platform.alert": platform_alert_dispatcher.dispatch,
             "maintenance.session_health": maintenance.session_health_check,
         }
     )
@@ -334,6 +359,18 @@ async def run() -> None:
         pools={name: concurrency for name, _, concurrency in pool_specs},
     )
     async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(
+            runtime_heartbeat_loop(
+                session_factory,
+                f"worker:{socket.gethostname()}:{os.getpid()}",
+                interval_seconds=settings.worker_heartbeat_seconds,
+                details={
+                    "release_revision": settings.release_revision,
+                    "pools": {name: concurrency for name, _, concurrency in pool_specs},
+                },
+            ),
+            name="worker-runtime-heartbeat",
+        )
         for pool_name, categories, concurrency in pool_specs:
             for index in range(concurrency):
                 tasks.create_task(

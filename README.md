@@ -94,8 +94,9 @@ docker compose up --build
 curl http://localhost:8000/health
 curl http://localhost:8000/health/live
 curl http://localhost:8000/health/ready
-curl http://localhost:8000/metrics
 curl http://localhost:8000/ready
+curl -H "X-Owner-Token: $OWNER_API_TOKEN" http://localhost:8000/metrics
+curl -H "X-Owner-Token: $OWNER_API_TOKEN" http://localhost:8000/health/details
 ```
 
 Локальный режим без Docker (в пяти терминалах, после `.venv/bin/alembic upgrade head`):
@@ -155,6 +156,20 @@ docker compose run --rm backend alembic upgrade head
 Mini App отправляет backend только подписанную строку `Telegram.WebApp.initData`. Backend проверяет HMAC и срок `auth_date`, затем сопоставляет Telegram user ID с владельцем tenant. Для отдельного frontend origin укажите HTTPS `CLIENT_MINI_APP_URL`, а во frontend — `NEXT_PUBLIC_API_BASE_URL`.
 
 Frontend готовится к Vercel из корня репозитория — именно там лежит `package.json`. Основной `npm run build` выполняет стандартный `next build`; прежний Cloudflare-вариант сохранён как `npm run build:cloudflare`. После получения HTTPS URL в Vercel укажите его в backend `.env` как `CLIENT_MINI_APP_URL`, а адрес публичного backend API задайте в Vercel как `NEXT_PUBLIC_API_BASE_URL`.
+
+VPS-релиз выполняется из checkout `/opt/ventrix` только после успешного локального preflight. Скрипт принимает Git SHA или безопасную метку релиза, собирает неизменяемый Docker image, делает согласованный SQLite backup через backup API, запускает только шесть Ventrix-сервисов и ждёт readiness:
+
+```bash
+./scripts/deploy_vps.sh "$(git rev-parse --short=12 HEAD)"
+```
+
+Предыдущий image фиксируется локально на сервере и возвращается без автоматического изменения БД:
+
+```bash
+./scripts/rollback_vps.sh
+```
+
+Если rollback требует возврата схемы/данных, сначала остановите Ventrix и используйте отдельно проверенный backup по процедуре ниже. Скрипт rollback намеренно не выбирает backup автоматически.
 
 Архитектурный UI-контракт зафиксирован в `docs/telegram-inline-ui.md`. Подробное ТЗ следующего вертикального этапа находится в `docs/NEXT_STAGE_PROMPT.md`.
 

@@ -6,6 +6,8 @@ import logging
 from ..config import get_settings
 from ..database import get_session_factory
 from ..jobs.queue import SQLiteJobQueue
+from ..observability import configure_structured_logging
+from ..services.owner_monitoring import PlatformAlertMonitor
 from .service import TenantAnalysisScheduler
 
 logger = logging.getLogger(__name__)
@@ -13,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 async def run() -> None:
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_structured_logging(settings.log_level)
     session_factory = get_session_factory()
     queue = SQLiteJobQueue(
         session_factory,
@@ -34,9 +36,18 @@ async def run() -> None:
         incremental_interval_seconds=int(settings.incremental_sync_interval_seconds),
         reconciliation_interval_seconds=settings.hourly_reconciliation_interval_seconds,
     )
+    alert_monitor = PlatformAlertMonitor(
+        session_factory,
+        queue,
+        backlog_age_seconds=settings.platform_backlog_alert_seconds,
+        delivery_failure_count=settings.platform_delivery_failure_alert_count,
+        sqlite_lock_count=settings.platform_sqlite_lock_alert_count,
+        disk_free_percent=settings.platform_disk_free_alert_percent,
+    )
     while True:
         try:
             await scheduler.tick()
+            await alert_monitor.evaluate()
         except Exception:
             logger.exception("Scheduler tick failed; continuing after poll interval")
         await asyncio.sleep(settings.scheduler_poll_interval_seconds)

@@ -11,19 +11,19 @@ def _aware(value: datetime) -> datetime:
 
 
 def _response_latencies(messages: list[Any]) -> list[float]:
-    waiting_since: datetime | None = None
+    waiting_since: dict[str, datetime] = {}
     result: list[float] = []
     for message in sorted(
         messages, key=lambda item: (_aware(item.sent_at), item.telegram_message_id)
     ):
         if message.outgoing:
-            if waiting_since is not None:
+            started_at = waiting_since.pop(message.dialog_id, None)
+            if started_at is not None:
                 result.append(
-                    max(0.0, (_aware(message.sent_at) - waiting_since).total_seconds() / 60)
+                    max(0.0, (_aware(message.sent_at) - started_at).total_seconds() / 60)
                 )
-                waiting_since = None
-        elif waiting_since is None:
-            waiting_since = _aware(message.sent_at)
+        elif message.dialog_id not in waiting_since:
+            waiting_since[message.dialog_id] = _aware(message.sent_at)
     return result
 
 
@@ -81,6 +81,19 @@ def build_employee_business_performance(
         current_latencies = _response_latencies(current)
         previous_latencies = _response_latencies(previous)
         outgoing = [item for item in current if item.outgoing]
+        contacted_dialog_ids = {item.dialog_id for item in outgoing}
+        replied_dialog_ids: set[str] = set()
+        for dialog_id in contacted_dialog_ids:
+            sent_first = False
+            for item in sorted(
+                (message for message in current if message.dialog_id == dialog_id),
+                key=lambda message: (_aware(message.sent_at), message.telegram_message_id),
+            ):
+                if item.outgoing:
+                    sent_first = True
+                elif sent_first:
+                    replied_dialog_ids.add(dialog_id)
+                    break
         active_dates = {_aware(item.sent_at).date() for item in outgoing}
         activity_windows = []
         for active_date in active_dates:
@@ -94,6 +107,12 @@ def build_employee_business_performance(
         outcomes = outcomes_by_employee.get(employee_id, [])
         calls = [item for item in outcomes if item.get("outcome_type") == "call_scheduled"]
         sales = [item for item in outcomes if item.get("outcome_type") == "sale_confirmed"]
+        interests = [
+            item for item in outcomes if item.get("outcome_type") == "interest_confirmed"
+        ]
+        follow_ups = [
+            item for item in outcomes if item.get("outcome_type") == "follow_up_agreed"
+        ]
         amounts: dict[str, float] = defaultdict(float)
         for outcome in sales:
             amount = outcome.get("amount")
@@ -116,6 +135,14 @@ def build_employee_business_performance(
                 "username": employee.telegram_username,
                 "messages_sent": len(outgoing),
                 "active_dialogs": len({item.dialog_id for item in current}),
+                "contacted_dialogs": len(contacted_dialog_ids),
+                "responded_dialogs": len(replied_dialog_ids),
+                "response_rate_denominator": len(contacted_dialog_ids),
+                "response_rate_percent": (
+                    round(len(replied_dialog_ids) / len(contacted_dialog_ids) * 100, 1)
+                    if contacted_dialog_ids
+                    else None
+                ),
                 "average_response_minutes": round(avg_response, 1)
                 if avg_response is not None
                 else None,
@@ -130,6 +157,8 @@ def build_employee_business_performance(
                     else None
                 ),
                 "calls_scheduled": len(calls),
+                "interests_confirmed": len(interests),
+                "follow_ups_agreed": len(follow_ups),
                 "sales_confirmed": len(sales),
                 "confirmed_sales_amounts": dict(amounts),
                 "business_outcomes": outcomes[:12],

@@ -102,6 +102,7 @@ class RemediationVerifier:
                 ),
                 payload=payload,
                 max_tokens=350,
+                user_id=problem.tenant_id,
             )
             parsed = _AIResult.model_validate(json.loads(raw))
         except (ValueError, TypeError, ValidationError, json.JSONDecodeError):

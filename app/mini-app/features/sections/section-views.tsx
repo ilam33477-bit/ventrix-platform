@@ -197,16 +197,69 @@ function ReportEmployees({ value }: { value: Record<string, unknown> }) {
       {rows.map((row, index) => (
         <div key={String(row.employee_id ?? index)}>
           <strong>{String(row.name ?? "Сотрудник")}</strong>
+          <ReportRow label="Активность" value={reportActivity(row)} />
+          <ReportRow label="Ответили" value={reportResponseRate(row)} />
+          <ReportRow label="Среднее время ответа" value={reportResponseTime(row)} />
+          <ReportRow label="Подтверждённый интерес" value={row.interests_confirmed} />
+          <ReportRow label="Созвоны назначены" value={row.calls_scheduled} />
+          <ReportRow label="Продажи подтверждены" value={row.sales_confirmed} />
           <ReportRow label="Открытые обещания" value={row.open_promises} />
           <ReportRow label="Клиенты ждут ответа" value={row.clients_waiting} />
           <ReportRow label="Пропущенные сроки" value={row.missed_deadlines} />
           <ReportRow label="Решено" value={row.resolved} />
+          <ReportAttention value={row.attention_items} />
         </div>
       ))}
     </div>
   ) : (
     <p className="muted-copy">Данных по сотрудникам пока нет.</p>
   );
+}
+
+function ReportAttention({ value }: { value: unknown }) {
+  const rows = Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
+  if (!rows.length) return null;
+  return (
+    <div className="report-attention-list">
+      <span>Требуют внимания</span>
+      <ul>
+        {rows.slice(0, 5).map((item, index) => (
+          <li key={String(item.problem_id ?? index)}>
+            <strong>{String(item.dialog ?? "Диалог")}</strong>
+            <small>{formatReportAge(item.age_minutes)}</small>
+            {typeof item.evidence === "string" && item.evidence && <p>{item.evidence}</p>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function formatReportAge(value: unknown) {
+  const minutes = Math.max(0, Number(value ?? 0));
+  if (minutes >= 1440) return `${Math.floor(minutes / 1440)} дн.`;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)} ч`;
+  return `${Math.floor(minutes)} мин.`;
+}
+
+function reportActivity(row: Record<string, unknown>) {
+  if (typeof row.messages_sent !== "number" && typeof row.active_dialogs !== "number") return null;
+  return `${Number(row.messages_sent ?? 0)} сообщ. · ${Number(row.active_dialogs ?? 0)} диал.`;
+}
+
+function reportResponseRate(row: Record<string, unknown>) {
+  if (typeof row.response_rate_denominator !== "number") return null;
+  return `${Number(row.responded_dialogs ?? 0)} из ${row.response_rate_denominator} · ${Number(row.response_rate_percent ?? 0)}%`;
+}
+
+function reportResponseTime(row: Record<string, unknown>) {
+  if (typeof row.average_response_minutes !== "number") return null;
+  const base = `${row.average_response_minutes} мин.`;
+  if (typeof row.response_time_change_percent !== "number" || row.response_time_change_percent === 0) return base;
+  const direction = row.response_time_change_percent > 0 ? "медленнее" : "быстрее";
+  return `${base} · ${Math.abs(row.response_time_change_percent)}% ${direction}`;
 }
 
 function ReportClients({ value }: { value: Record<string, unknown> }) {
@@ -750,6 +803,7 @@ export function GroupsView({ api }: { api: VentrixClientApi }) {
                 <div><h3>{item.title}</h3><p>{item.participants_count ?? 0} участников</p></div>
                 <StatusBadge tone={item.status === "active" ? "success" : "neutral"}>{groupStatusLabel(item.status)}</StatusBadge>
               </header>
+              {item.status !== "active" && item.status !== "disabled" && <p>Чтобы разрешить доставку, руководитель проекта с правами администратора этой группы должен отправить в ней <code>/ventrix_connect</code> со своего аккаунта, не анонимно. Бот тоже должен быть администратором. Затем обновите список.</p>}
               <div className="group-policy">
                 <label className="toggle-row">
                   <span><strong>Уведомления в группе</strong><small>Ventrix сможет отправлять сюда разрешённые напоминания.</small></span>
@@ -769,7 +823,7 @@ export function GroupsView({ api }: { api: VentrixClientApi }) {
           ))}
         </div>
       ) : (
-        <Card className="group-connect-guide"><Icon name="groups" /><div><h3>Подключите рабочую группу</h3><ol><li>Добавьте клиентского Ventrix-бота непосредственно в нужную группу.</li><li>Назначьте его администратором и оставьте право отправлять сообщения.</li><li>Напишите в группе команду <code>/ventrix_connect</code>.</li><li>Вернитесь сюда и обновите список.</li></ol><p>Для приватной группы ссылка-приглашение не требуется: одной ссылки недостаточно — бот должен состоять в группе. После подключения здесь можно включить карточки ситуаций и регулярные отчёты.</p></div><Button variant="secondary" onClick={() => void reload()}>Обновить список</Button></Card>
+        <Card className="group-connect-guide"><Icon name="groups" /><div><h3>Подключите рабочую группу</h3><ol><li>Добавьте бота проекта в нужную группу.</li><li>Назначьте его администратором с правом отправлять сообщения.</li><li>Руководитель проекта с правами администратора группы должен отправить <code>/ventrix_connect</code> со своего аккаунта, не анонимно.</li><li>Вернитесь сюда и обновите список.</li></ol><p>Приватная ссылка-приглашение не нужна. В группе появятся краткие уведомления с переходом в личный чат бота; подробности доступны по правам сотрудника. После удаления и повторного добавления бота подключение нужно подтвердить снова.</p></div><Button variant="secondary" onClick={() => void reload()}>Обновить список</Button></Card>
       )}
       {(error || actionError) && <div className="inline-error"><p>{actionError || error}</p><Button onClick={() => void reload()}>Повторить</Button></div>}
     </section>
@@ -780,6 +834,7 @@ function groupStatusLabel(status: string) {
   if (status === "active") return "Подключена";
   if (status === "pending") return "Ожидает";
   if (status === "disabled") return "Выключена";
+  if (status === "revoked") return "Нужно подключить заново";
   return status;
 }
 

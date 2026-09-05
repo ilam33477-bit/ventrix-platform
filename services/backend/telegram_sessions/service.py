@@ -22,6 +22,8 @@ from ..models import (
     TelegramSyncCursor,
     TenantSettings,
 )
+from ..services.employee_access import ConnectionEmployeeConflict, bind_connection_employee
+from ..services.employee_activation import enqueue_employee_activation
 from ..services.encryption import EncryptionService
 from .gateway import (
     LoginChallenge,
@@ -421,6 +423,11 @@ class TelegramConnectionService:
             phone_value = self.encryption.decrypt(phone.ciphertext)
             hash_value = self.encryption.decrypt(code_hash.ciphertext)
             connection_id = connection.id
+            expected_challenge = (
+                connection.pending_session_secret_id,
+                connection.phone_code_hash_secret_id,
+                connection.assigned_employee_id,
+            )
         result = await self.gateway.complete_login(
             session_string,
             phone_value,
@@ -429,15 +436,67 @@ class TelegramConnectionService:
             password=password,
         )
         session_string = phone_value = hash_value = ""
-        return await self._store_login_result(connection_id, result)
+        try:
+            return await self._store_login_result(
+                connection_id, result, expected_challenge=expected_challenge
+            )
+        except ConnectionEmployeeConflict:
+            # A successful Telegram login is not sufficient to grant project
+            # access. Drop the rejected challenge and revoke only a newly issued
+            # session, never credentials already used by a working connection.
+            try:
+                await self.cancel_login(tenant_id, connection_id)
+                async with self.session_factory() as session:
+                    in_use = await session.scalar(
+                        select(TelegramConnection.id)
+                        .join(
+                            EncryptedSecret,
+                            TelegramConnection.session_secret_id == EncryptedSecret.id,
+                        )
+                        .where(
+                            EncryptedSecret.fingerprint
+                            == self.encryption.fingerprint(result.session_string),
+                            TelegramConnection.deleted_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                if not in_use:
+                    await self.gateway.terminate_session(result.session_string)
+            except Exception as exc:  # noqa: BLE001 - preserve the safe identity error
+                logger.warning(
+                    "Rejected login cleanup failed tenant_id=%s connection_id=%s error_type=%s",
+                    tenant_id,
+                    connection_id,
+                    type(exc).__name__,
+                )
+            raise
 
     async def _store_login_result(
-        self, connection_id: str, result: LoginResult
+        self,
+        connection_id: str,
+        result: LoginResult,
+        *,
+        expected_challenge: tuple[str, str, str | None] | None = None,
     ) -> TelegramConnection:
         async def write(session: AsyncSession) -> str:
             connection = await session.get(TelegramConnection, connection_id)
-            if connection is None:
-                raise TelegramConnectionError("connection disappeared")
+            if (
+                connection is None
+                or connection.deleted_at is not None
+                or connection.status not in {"awaiting_code", "awaiting_2fa"}
+                or (
+                    expected_challenge is not None
+                    and expected_challenge
+                    != (
+                        connection.pending_session_secret_id,
+                        connection.phone_code_hash_secret_id,
+                        connection.assigned_employee_id,
+                    )
+                )
+            ):
+                raise TelegramConnectionError("login challenge is no longer active")
+            if result.status not in {"awaiting_2fa", "connected"}:
+                raise TelegramConnectionError("unexpected login result")
             pending = await self._replace_secret(
                 session,
                 connection.tenant_id,
@@ -446,7 +505,7 @@ class TelegramConnectionService:
             )
             old_pending = connection.pending_session_secret_id
             connection.pending_session_secret_id = pending.id
-            if old_pending:
+            if old_pending and old_pending != pending.id:
                 old = await session.get(EncryptedSecret, old_pending)
                 if old:
                     old.deleted_at = datetime.now(UTC)
@@ -461,17 +520,22 @@ class TelegramConnectionService:
                     TelegramConnection.deleted_at.is_(None),
                 )
             )
+            target = existing or connection
+            target.telegram_user_id = result.telegram_user_id
+            target.username = result.username
+            target.display_name = result.display_name
+            await bind_connection_employee(
+                session, target, requested_employee_id=connection.assigned_employee_id
+            )
             permanent = await self._replace_secret(
                 session,
                 connection.tenant_id,
                 "telegram_user_session",
                 result.session_string,
             )
-            target = existing or connection
             target.session_secret_id = permanent.id
-            target.telegram_user_id = result.telegram_user_id
-            target.username = result.username
-            target.display_name = result.display_name
+            target.phone_masked = connection.phone_masked
+            target.last_error_code = None
             target.status = "connected"
             target.progress_stage = "account_connected"
             target.progress_percent = 10
@@ -489,6 +553,7 @@ class TelegramConnectionService:
             connection.phone_code_hash_secret_id = None
             if existing is not None:
                 await session.delete(connection)
+            await enqueue_employee_activation(session, target)
             return target.id
 
         target_id = await self.transactions.run(write)

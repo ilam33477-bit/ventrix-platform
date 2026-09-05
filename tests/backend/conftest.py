@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import time
+from datetime import UTC, datetime, time
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.backend.config import Settings
 from services.backend.database import Base, build_engine
+from services.backend.models import BotInstance, EncryptedSecret
 from services.backend.schemas import TenantCreate
 from services.backend.services.encryption import EncryptionService
 from services.backend.services.foundation import FoundationService
@@ -28,6 +30,34 @@ class FakeVerifier:
 @pytest.fixture
 def encryption_key() -> str:
     return Fernet.generate_key().decode()
+
+
+@pytest.fixture
+def make_group_bot(encryption_key):
+    async def create(session, tenant):
+        tag = uuid4().hex
+        encryption = EncryptionService(encryption_key)
+        secret = EncryptedSecret(
+            tenant_id=tenant.id,
+            kind="telegram_bot_token",
+            ciphertext=encryption.encrypt(f"test-bot-token-{tag}"),
+            fingerprint=tag,
+        )
+        session.add(secret)
+        await session.flush()
+        bot = BotInstance(
+            tenant_id=tenant.id,
+            secret_id=secret.id,
+            telegram_bot_id=int(tag[:12], 16),
+            username=f"test_{tag}_bot",
+            display_name="TEST",
+            verified_at=datetime.now(UTC),
+        )
+        session.add(bot)
+        await session.flush()
+        return bot
+
+    return create
 
 
 @pytest.fixture

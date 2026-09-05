@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -10,13 +11,16 @@ from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.jobs.worker import BackgroundWorker
 from services.backend.models import (
     BackgroundJob,
+    Employee,
     EncryptedSecret,
     InitialAnalysisRun,
     Signal,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
+    TenantMembership,
 )
+from services.backend.services.employee_access import ConnectionEmployeeConflict
 from services.backend.services.encryption import EncryptionService
 from services.backend.telegram_sessions.gateway import (
     LoginChallenge,
@@ -130,6 +134,249 @@ async def connected_service(
         connection = await service.complete_login(tenant.id, password="not-stored")
     assert connection.status == "connected"
     return tenant, gateway, service
+
+
+@pytest.mark.parametrize("require_2fa", [False, True])
+async def test_shared_login_atomically_binds_employee_and_membership(
+    session_factory, make_service, tenant_payload, encryption_key, require_2fa
+):
+    tenant, _, service = await connected_service(
+        session_factory, make_service, tenant_payload, encryption_key, require_2fa=require_2fa
+    )
+    connection = await service.get(tenant.id)
+    async with session_factory() as session:
+        employee = await session.get(Employee, connection.assigned_employee_id)
+        assert employee.telegram_user_id == connection.telegram_user_id == 777001
+        member = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == tenant.id, TenantMembership.employee_id == employee.id
+            )
+        )
+        assert member.telegram_user_id == employee.telegram_user_id
+        assert member.role == "employee" and member.status == "active"
+
+
+async def test_pending_2fa_does_not_grant_employee_access(
+    session_factory, make_service, tenant_payload, encryption_key
+):
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    service = TelegramConnectionService(
+        session_factory, EncryptionService(encryption_key), FakeTelegramGateway(require_2fa=True)
+    )
+    pending = await service.begin_login(tenant.id, "+79990001122")
+    result = await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+    assert result.status == "awaiting_2fa" and result.assigned_employee_id is None
+    assert result.session_secret_id is None
+    async with session_factory() as session:
+        assert (
+            await session.scalar(select(Employee.id).where(Employee.tenant_id == tenant.id)) is None
+        )
+
+
+async def test_owner_login_preserves_ownership_in_shared_service(
+    session_factory, make_service, tenant_payload, encryption_key, monkeypatch
+):
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    gateway = FakeTelegramGateway()
+
+    async def owner_login(*args, **kwargs):
+        return LoginResult(
+            "connected", "owner-session", tenant_payload.owner_telegram_user_id, "owner", "Owner"
+        )
+
+    monkeypatch.setattr(gateway, "complete_login", owner_login)
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    pending = await service.begin_login(tenant.id, "+79990001122")
+    result = await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+    async with session_factory() as session:
+        employee = await session.get(Employee, result.assigned_employee_id)
+        member = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == tenant.id,
+                TenantMembership.telegram_user_id == employee.telegram_user_id,
+            )
+        )
+        assert member.role == "owner" and member.status == "active"
+
+
+async def test_parallel_projects_do_not_share_employee_or_membership_bindings(
+    session_factory, make_service, tenant_payload, encryption_key
+):
+    async with session_factory() as session:
+        first = await make_service(session).create_tenant(tenant_payload)
+        second = await make_service(session).create_tenant(
+            tenant_payload.model_copy(update={"name": "Second project"})
+        )
+    service = TelegramConnectionService(
+        session_factory, EncryptionService(encryption_key), FakeTelegramGateway()
+    )
+
+    async def connect(tenant):
+        pending = await service.begin_login(tenant.id, "+79990001122")
+        return await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+
+    one, two = await asyncio.gather(connect(first), connect(second))
+    assert one.id != two.id
+    assert one.assigned_employee_id != two.assigned_employee_id
+    assert one.session_secret_id != two.session_secret_id
+    async with session_factory() as session:
+        for tenant, connection in [(first, one), (second, two)]:
+            employee = await session.get(Employee, connection.assigned_employee_id)
+            assert employee.tenant_id == tenant.id
+            member = await session.scalar(
+                select(TenantMembership).where(TenantMembership.employee_id == employee.id)
+            )
+            assert member.tenant_id == tenant.id
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+async def test_reconnect_reuses_employee_preserving_settings_and_access(
+    session_factory, make_service, tenant_payload, encryption_key, revoked
+):
+    tenant, _, service = await connected_service(
+        session_factory, make_service, tenant_payload, encryption_key
+    )
+    original = await service.get(tenant.id)
+    async with session_factory() as session:
+        employee = await session.get(Employee, original.assigned_employee_id)
+        employee.criticality_threshold = 72
+        employee.notifications_enabled = False
+        employee.display_name = "Имя от администратора"
+        member = await session.scalar(
+            select(TenantMembership).where(TenantMembership.employee_id == employee.id)
+        )
+        member.status = "inactive" if revoked else "active"
+        await session.commit()
+    pending = await service.begin_login(tenant.id, "+79990001122")
+    result = await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+    assert result.id == original.id
+    assert result.assigned_employee_id == original.assigned_employee_id
+    async with session_factory() as session:
+        assert await session.get(TelegramConnection, pending.id) is None
+        employee = await session.get(Employee, result.assigned_employee_id)
+        assert employee.criticality_threshold == 72
+        assert employee.notifications_enabled is False
+        assert employee.display_name == "Имя от администратора"
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(Employee).where(Employee.tenant_id == tenant.id)
+            )
+            == 1
+        )
+        updated = await session.get(TenantMembership, member.id)
+        assert updated.status == ("inactive" if revoked else "active")
+
+
+@pytest.mark.parametrize("selected_id", [None, 777001, 888002])
+async def test_selected_employee_requires_matching_verified_telegram_identity(
+    session_factory, make_service, tenant_payload, encryption_key, selected_id
+):
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        employee = Employee(
+            tenant_id=tenant.id, display_name="Выбранный сотрудник", telegram_user_id=selected_id
+        )
+        session.add(employee)
+        await session.commit()
+    gateway = FakeTelegramGateway()
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    pending = await service.begin_login(tenant.id, "+79990001122", employee.id)
+    if selected_id == 888002:
+        with pytest.raises(ConnectionEmployeeConflict):
+            await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+        assert gateway.terminated_sessions == ["authorized-session"]
+    else:
+        result = await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+        assert result.assigned_employee_id == employee.id
+    async with session_factory() as session:
+        stored = await session.get(Employee, employee.id)
+        connection = await session.get(TelegramConnection, pending.id)
+        if selected_id == 888002:
+            assert stored.telegram_user_id == 888002
+            assert connection.session_secret_id is None
+            assert connection.status == "disconnected"
+            assert connection.deleted_at is not None
+            assert (
+                await session.scalar(
+                    select(TenantMembership.id).where(TenantMembership.employee_id == employee.id)
+                )
+                is None
+            )
+        else:
+            assert stored.telegram_user_id == 777001
+
+
+async def test_reconnect_cannot_transfer_existing_account_to_another_employee(
+    session_factory, make_service, tenant_payload, encryption_key
+):
+    tenant, gateway, service = await connected_service(
+        session_factory, make_service, tenant_payload, encryption_key
+    )
+    original = await service.get(tenant.id)
+    async with session_factory() as session:
+        another = Employee(tenant_id=tenant.id, display_name="Другой сотрудник")
+        session.add(another)
+        await session.commit()
+    pending = await service.begin_login(tenant.id, "+79990001122", another.id)
+    with pytest.raises(ConnectionEmployeeConflict):
+        await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+    current = await service.get(tenant.id, original.id)
+    assert current.status == "connected"
+    assert current.assigned_employee_id == original.assigned_employee_id
+    assert current.session_secret_id == original.session_secret_id
+    assert gateway.terminated_sessions == []  # Fake gateway reused the existing session key.
+
+
+@pytest.mark.parametrize("change", ["cancelled", "superseded", "challenge_changed", "reassigned"])
+async def test_login_result_cannot_revive_cancelled_or_superseded_challenge(
+    session_factory, make_service, tenant_payload, encryption_key, monkeypatch, change
+):
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    gateway = FakeTelegramGateway()
+    service = TelegramConnectionService(session_factory, EncryptionService(encryption_key), gateway)
+    pending = await service.begin_login(tenant.id, "+79990001122")
+    complete = gateway.complete_login
+
+    async def delayed_result(*args, **kwargs):
+        result = await complete(*args, **kwargs)
+        if change == "cancelled":
+            await service.cancel_login(tenant.id, pending.id)
+        elif change == "superseded":
+            await service.begin_login(tenant.id, "+79990003344")
+        else:
+            async with session_factory() as session:
+                stored = await session.get(TelegramConnection, pending.id)
+                if change == "reassigned":
+                    employee = Employee(tenant_id=tenant.id, display_name="Новый ответственный")
+                    session.add(employee)
+                    await session.flush()
+                    stored.assigned_employee_id = employee.id
+                else:
+                    secret = service._secret(tenant.id, "telegram_phone_code_hash", "new-code-hash")
+                    session.add(secret)
+                    await session.flush()
+                    stored.phone_code_hash_secret_id = secret.id
+                await session.commit()
+        return result
+
+    monkeypatch.setattr(gateway, "complete_login", delayed_result)
+    with pytest.raises(TelegramConnectionError):
+        await service.complete_login(tenant.id, connection_id=pending.id, code="12345")
+    async with session_factory() as session:
+        stored = await session.get(TelegramConnection, pending.id)
+        assert stored.session_secret_id is None
+        if change == "reassigned":
+            employee = await session.get(Employee, stored.assigned_employee_id)
+            assert employee.telegram_user_id is None
+        else:
+            assert stored.assigned_employee_id is None
+            assert (
+                await session.scalar(select(Employee.id).where(Employee.tenant_id == tenant.id))
+                is None
+            )
 
 
 @pytest.mark.asyncio

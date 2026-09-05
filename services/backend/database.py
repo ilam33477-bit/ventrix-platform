@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TypeVar
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import (
@@ -119,11 +119,23 @@ class SQLiteTransactionManager:
             for attempt in range(self.max_attempts):
                 async with self.session_factory() as session:
                     try:
-                        async with session.begin():
-                            return await operation(session)
+                        # SQLite starts ordinary transactions as DEFERRED. A queue
+                        # claimant could therefore read the available capacity in
+                        # two OS processes before either one acquired the write
+                        # lock. BEGIN IMMEDIATE takes the database write reservation
+                        # before the read/modify/write operation, so resource counts
+                        # and lease acquisition remain one cross-process critical
+                        # section.
+                        await session.execute(text("BEGIN IMMEDIATE"))
+                        result = await operation(session)
+                        await session.commit()
+                        return result
                     except OperationalError as exc:
                         await session.rollback()
                         if not is_database_locked(exc) or attempt + 1 >= self.max_attempts:
                             raise
                         await asyncio.sleep(self.base_delay_seconds * (2**attempt))
+                    except BaseException:
+                        await session.rollback()
+                        raise
         raise RuntimeError("unreachable SQLite retry state")

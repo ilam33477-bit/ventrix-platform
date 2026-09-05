@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -18,12 +19,15 @@ from services.backend.api.client_router import (
     reply_to_problem,
 )
 from services.backend.database import SQLiteTransactionManager
+from services.backend.intelligence.notifications import NotificationDispatcher
 from services.backend.intelligence.signals import SignalService
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
     BackgroundJob,
     DialogState,
+    Employee,
     EncryptedSecret,
+    NotificationLog,
     OperationalProblem,
     OutboundTelegramMessage,
     TelegramConnection,
@@ -31,7 +35,87 @@ from services.backend.models import (
     TelegramMessage,
     TenantMembership,
 )
+from services.backend.services.employee_access import sync_employee_membership
 from services.backend.telegram_sessions.runtime import TelegramSessionActor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["none", "reassign", "revoke", "disable", "cancelled", "delivery_uncertain"]
+)
+async def test_queued_employee_card_revalidates_recipient(
+    session_factory, make_service, tenant_payload, change
+):
+    tenant, _, _, problem, _ = await reply_fixture(session_factory, make_service, tenant_payload)
+    async with session_factory() as session:
+        employee = Employee(tenant_id=tenant.id, display_name="Сотрудник", telegram_user_id=12345)
+        session.add(employee)
+        await session.flush()
+        membership = await sync_employee_membership(session, employee)
+        stored = await session.get(OperationalProblem, problem.id)
+        stored.responsible_employee_id = employee.id
+        log = NotificationLog(
+            tenant_id=tenant.id,
+            employee_id=employee.id,
+            problem_id=problem.id,
+            destination_type="employee",
+            destination_id="12345",
+            criticality=90,
+            deduplication_key="test-queued-recipient",
+            payload_json={"text": "Личная карточка"},
+        )
+        session.add(log)
+        await session.flush()
+        if change == "reassign":
+            stored.responsible_employee_id = None
+        elif change == "revoke":
+            membership.status = "inactive"
+        elif change == "disable":
+            employee.notifications_enabled = False
+        elif change in {"cancelled", "delivery_uncertain"}:
+            log.status = change
+        await session.commit()
+    sender = SimpleNamespace(send=AsyncMock())
+    dispatcher = NotificationDispatcher(session_factory, sender)
+    job = SimpleNamespace(payload={"notification_id": log.id}, tenant_id=tenant.id)
+    result = await dispatcher.dispatch(job)
+    if change == "none":
+        assert result["status"] == "sent"
+        sender.send.assert_awaited_once()
+    else:
+        assert result["status"] in {"cancelled", "delivery_uncertain"}
+        sender.send.assert_not_awaited()
+    await dispatcher.dispatch(job)
+    assert sender.send.await_count == (1 if change == "none" else 0)
+
+
+@pytest.mark.asyncio
+async def test_employee_cannot_open_or_reply_to_other_employees_problem(
+    session_factory, make_service, tenant_payload
+):
+    tenant, _, _, problem, _ = await reply_fixture(session_factory, make_service, tenant_payload)
+    async with session_factory() as session:
+        context = ClientAuthContext(
+            tenant=tenant,
+            bot=SimpleNamespace(id="test"),
+            membership=SimpleNamespace(role="employee", employee_id="different-employee"),
+            permissions=frozenset({"problems.read_own", "problems.manage_own"}),
+            telegram_user={"id": 123},
+        )
+        with pytest.raises(HTTPException) as detail_error:
+            await client_router.problem_detail(problem.id, context, session)
+        assert detail_error.value.status_code == 404
+        with pytest.raises(HTTPException) as conversation_error:
+            await problem_conversation(problem.id, context, before=None, limit=30, session=session)
+        assert conversation_error.value.status_code == 404
+        with pytest.raises(HTTPException) as reply_error:
+            await reply_to_problem(
+                problem.id,
+                ProblemReply(text="Нельзя отправить", client_request_id=uuid4()),
+                context,
+                session,
+            )
+        assert reply_error.value.status_code == 404
 
 
 class SendClient:

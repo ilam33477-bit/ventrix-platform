@@ -6,8 +6,10 @@ from datetime import timedelta
 
 from ..config import get_settings
 from ..database import get_session_factory
+from ..observability import configure_structured_logging
 from ..services.encryption import EncryptionService
 from ..services.product_events import ProductEventService
+from ..services.runtime_monitoring import runtime_heartbeat_loop
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.gateway import TelethonGateway
 from ..telegram_sessions.service import TelegramConnectionService
@@ -18,7 +20,7 @@ async def run() -> None:
     settings = get_settings()
     session_factory = get_session_factory()
     settings = await load_runtime_secret_overrides(session_factory, settings)
-    logging.basicConfig(level=settings.log_level)
+    configure_structured_logging(settings.log_level)
     # Telegram embeds bot tokens in request URLs. Never allow HTTP client URL logs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -60,9 +62,20 @@ async def run() -> None:
         heartbeat_seconds=settings.client_bot_heartbeat_seconds,
         restart_backoff_seconds=settings.client_bot_restart_backoff_seconds,
     )
+    heartbeat = asyncio.create_task(
+        runtime_heartbeat_loop(
+            session_factory,
+            "client_bots",
+            interval_seconds=settings.worker_heartbeat_seconds,
+            details={"release_revision": settings.release_revision},
+        ),
+        name="client-bots-runtime-heartbeat",
+    )
     try:
         await manager.run()
     finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
         await manager.stop()
 
 

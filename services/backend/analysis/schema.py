@@ -30,7 +30,12 @@ class DetectedProblem(BaseModel):
 class BusinessOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    outcome_type: Literal["call_scheduled", "sale_confirmed", "follow_up_agreed"]
+    outcome_type: Literal[
+        "interest_confirmed",
+        "call_scheduled",
+        "sale_confirmed",
+        "follow_up_agreed",
+    ]
     explicitly_supported: bool = False
     confidence: float = Field(ge=0, le=1)
     source_message_ids: list[str | int] = Field(default_factory=list)
@@ -66,6 +71,34 @@ class AnalysisResponse(BaseModel):
     batch_id: str
     dialog_results: list[DialogAnalysisResult]
     usage: AIUsage = Field(default_factory=AIUsage)
+
+
+class ReportEmployeeNote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    employee_id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    summary: str = Field(min_length=1, max_length=1200)
+
+
+class ReportDialogNote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dialog: str = Field(min_length=1, max_length=256)
+    summary: str = Field(min_length=1, max_length=1200)
+
+
+class ReportNarrative(BaseModel):
+    """Strict client-visible report copy returned by the optional AI provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    executive_summary: str = Field(min_length=1, max_length=2400)
+    highlights: list[str] = Field(default_factory=list, max_length=12)
+    risks: list[str] = Field(default_factory=list, max_length=12)
+    employee_notes: list[ReportEmployeeNote] = Field(default_factory=list, max_length=30)
+    dialog_notes: list[ReportDialogNote] = Field(default_factory=list, max_length=30)
+    recommendations: list[str] = Field(default_factory=list, max_length=12)
 
 
 def repair_json(raw: str) -> str:

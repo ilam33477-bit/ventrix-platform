@@ -39,6 +39,7 @@ export class VentrixClientApi {
     try {
       response = await fetch(`${this.baseUrl}/api/v1/client${path}`, {
         ...options,
+        cache: "no-store",
         headers: {
           Authorization: `tma ${this.initData}`,
           ...(options.body ? { "Content-Type": "application/json" } : {}),

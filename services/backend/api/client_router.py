@@ -60,9 +60,18 @@ from ..models import (
 )
 from ..repositories.client_data import TenantClientRepository
 from ..scheduler.service import TenantAnalysisScheduler, next_analysis_time
-from ..services.employee_access import claim_employee_by_username, sync_employee_membership
+from ..services.ai_provider_gate import SharedAIProvider
+from ..services.employee_access import (
+    ROLE_PERMISSIONS,
+    ConnectionEmployeeConflict,
+    claim_employee_by_username,
+    employee_membership_is_valid,
+    sync_employee_membership,
+)
 from ..services.encryption import EncryptionService
+from ..services.group_access import group_is_approved
 from ..services.onboarding_welcome import ensure_onboarding_welcome, fallback_welcome
+from ..services.report_access import own_report_rows, personal_report_ids
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.gateway import (
     TelegramFloodWait,
@@ -219,7 +228,7 @@ class EmployeePatch(BaseModel):
 
 
 class GroupIntegrationCreate(BaseModel):
-    telegram_chat_id: int
+    telegram_chat_id: int = Field(lt=0)
     title: str = Field(min_length=1, max_length=300)
     notifications_enabled: bool = True
     minimum_criticality: int = Field(default=85, ge=0, le=100)
@@ -483,6 +492,8 @@ async def require_client_context(
                 await session.commit()
         if membership is None:
             continue
+        if not await employee_membership_is_valid(session, membership):
+            continue
         permissions = frozenset(
             await session.scalars(
                 select(Permission.permission).where(
@@ -491,6 +502,9 @@ async def require_client_context(
                 )
             )
         )
+        if membership.role == "employee":
+            # Stale grants from a former manager role must not widen employee access.
+            permissions &= ROLE_PERMISSIONS["employee"] | {"reports.read"}
         return ClientAuthContext(tenant, bot, membership, permissions, validated["user"])
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Mini App authentication"
@@ -649,71 +663,6 @@ async def reconcile_connected_onboarding(
     return True
 
 
-async def ensure_connection_employee(
-    session: AsyncSession,
-    *,
-    tenant_id: str,
-    connection: TelegramConnection,
-) -> tuple[TelegramConnection, Employee]:
-    """Persist the accountable employee for a successfully authorized session.
-
-    TelegramConnectionService owns a separate transaction and returns a detached
-    model. Always load the connection into the request session before assigning
-    its employee; otherwise the employee/link disappears when onboarding has
-    already been completed and no unrelated commit happens later in the request.
-    """
-    stored_connection = await session.scalar(
-        select(TelegramConnection).where(
-            TelegramConnection.id == connection.id,
-            TelegramConnection.tenant_id == tenant_id,
-            TelegramConnection.deleted_at.is_(None),
-        )
-    )
-    target = stored_connection or connection
-    employee = (
-        await session.scalar(
-            select(Employee).where(
-                Employee.id == target.assigned_employee_id,
-                Employee.tenant_id == tenant_id,
-            )
-        )
-        if getattr(target, "assigned_employee_id", None)
-        else None
-    )
-    connection_user_id = getattr(target, "telegram_user_id", None)
-    if employee is None and connection_user_id:
-        employee = await session.scalar(
-            select(Employee).where(
-                Employee.tenant_id == tenant_id,
-                Employee.telegram_user_id == connection_user_id,
-            )
-        )
-    if employee is None:
-        employee = Employee(
-            tenant_id=tenant_id,
-            display_name=target.display_name or target.username or "Сотрудник",
-            telegram_user_id=connection_user_id,
-            telegram_username=target.username,
-            role="employee",
-            status="active",
-            notifications_enabled=True,
-            criticality_threshold=85,
-        )
-        session.add(employee)
-        await session.flush()
-    else:
-        employee.status = "active"
-        employee.display_name = target.display_name or employee.display_name
-        employee.telegram_username = target.username or employee.telegram_username
-        if employee.telegram_user_id is None:
-            employee.telegram_user_id = connection_user_id
-    target.assigned_employee_id = employee.id
-    if stored_connection is not None:
-        session.add(stored_connection)
-    await sync_employee_membership(session, employee)
-    return target, employee
-
-
 @router.post("/mini-app/auth")
 async def mini_app_auth(
     context: ClientContext,
@@ -724,9 +673,8 @@ async def mini_app_auth(
     )
     connection = await TenantClientRepository(session, context.tenant.id).current_connection()
     await reconcile_connected_onboarding(session, settings, connection)
-    if context.membership.bot_started_at is None:
-        context.membership.bot_started_at = datetime.now(UTC)
-        await session.commit()
+    # Opening a Web App does not prove that the user started the private bot.
+    # Only an actual bot /start update sets bot_started_at.
     permissions = ["*"] if context.membership.role == "owner" else sorted(context.permissions)
     return {
         "tenant_id": context.tenant.id,
@@ -824,10 +772,15 @@ async def client_bootstrap(
         runtime_settings = await load_runtime_secret_overrides(factory, app_settings)
         provider = None
         if runtime_settings.deepseek_api_key:
-            provider = DeepSeekProvider(
-                base_url=runtime_settings.deepseek_base_url,
-                timeout_seconds=min(30, runtime_settings.ai_request_timeout_seconds),
-                api_key_value=runtime_settings.deepseek_api_key.get_secret_value(),
+            provider = SharedAIProvider(
+                factory,
+                DeepSeekProvider(
+                    base_url=runtime_settings.deepseek_base_url,
+                    timeout_seconds=min(30, runtime_settings.ai_request_timeout_seconds),
+                    api_key_value=runtime_settings.deepseek_api_key.get_secret_value(),
+                ),
+                max_active_requests=runtime_settings.max_active_ai_requests,
+                heartbeat_seconds=runtime_settings.worker_heartbeat_seconds,
             )
         welcome_copy = await ensure_onboarding_welcome(
             session,
@@ -1626,6 +1579,11 @@ async def reports(
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     rows = await TenantClientRepository(session, context.tenant.id).reports()
+    if personal_only:
+        visible = await personal_report_ids(
+            session, context.tenant.id, context.membership.employee_id, [row.id for row in rows]
+        )
+        rows = [row for row in rows if row.id in visible]
     canonical_rows: list[Report] = []
     seen: set[tuple[object, str]] = set()
     for item in rows:
@@ -1721,13 +1679,7 @@ async def report_detail(
         for item in section_payloads:
             if item["key"] != "employee_report":
                 continue
-            rows = item["data"].get("employees", [])
-            own_rows = [
-                row
-                for row in rows
-                if isinstance(row, dict)
-                and row.get("employee_id") == context.membership.employee_id
-            ]
+            own_rows = own_report_rows(item["data"], context.membership.employee_id)
             if own_rows:
                 personal_sections.append(
                     {
@@ -1744,6 +1696,8 @@ async def report_detail(
                 )
             break
         section_payloads = personal_sections
+        if not personal_sections:
+            raise HTTPException(status_code=404, detail="Report not found")
     await record_event(session, context, "report_opened", {"report_id": report.id})
     await session.commit()
     return {
@@ -2036,6 +1990,12 @@ async def complete_connection_login(
             status_code=409,
             detail="Сервис перезапускался во время входа. Начните подключение заново.",
         ) from exc
+    except ConnectionEmployeeConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Этот Telegram-аккаунт не соответствует выбранному сотруднику. "
+            "Проверьте сотрудника и начните подключение заново с его номером.",
+        ) from exc
     except TelegramConnectionError as exc:
         raise HTTPException(
             status_code=409, detail="Код истёк или сессия входа завершена. Запросите новый код."
@@ -2056,16 +2016,8 @@ async def complete_connection_login(
         tenant_settings = await session.scalar(
             select(TenantSettings).where(TenantSettings.tenant_id == context.tenant.id)
         )
-        connection, employee = await ensure_connection_employee(
-            session,
-            tenant_id=context.tenant.id,
-            connection=connection,
-        )
-        # This commit is intentional and unconditional. The Telegram service has
-        # already committed the session in its own transaction; the employee and
-        # connection mapping must be durable even for tenants whose onboarding
-        # was completed long ago.
-        await session.commit()
+        # The shared login service atomically persists credentials, employee and
+        # membership before either the Mini App or bot can begin preparation.
         await reconcile_connected_onboarding(session, tenant_settings, connection)
         # Authorization is complete at this point. Catalog loading and initial
         # analysis are retryable background work and must never be reported as
@@ -2094,7 +2046,7 @@ async def complete_connection_login(
             "preparation_job_id=%s",
             context.tenant.id,
             connection.id,
-            employee.id,
+            connection.assigned_employee_id,
             preparation_job_id,
         )
     return {
@@ -2408,6 +2360,8 @@ async def employees(
     if context.membership.role == "observer" and not context.allows("employees.read"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     employee_filters = [Employee.tenant_id == context.tenant.id, Employee.status == "active"]
+    if context.membership.role == "employee":
+        employee_filters.append(Employee.id == context.membership.employee_id)
     rows = list(
         await session.scalars(
             select(Employee).where(*employee_filters).order_by(Employee.display_name)
@@ -2655,6 +2609,7 @@ async def group_integrations(
     context: ClientContext,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[dict[str, Any]]:
+    require_permission(context, "groups.manage")
     rows = list(
         await session.scalars(
             select(GroupIntegration)
@@ -2723,6 +2678,8 @@ async def update_group_integration(
     )
     if group is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    if payload.status == "active" and not group_is_approved(group):
+        raise HTTPException(status_code=409, detail="Подтвердите группу командой /ventrix_connect от руководителя проекта.")
     for key, value in payload.model_dump(exclude_none=True).items():
         setattr(group, key, value)
     await session.commit()

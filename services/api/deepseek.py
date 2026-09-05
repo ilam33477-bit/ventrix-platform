@@ -2,10 +2,29 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+
+class DeepSeekAPIError(RuntimeError):
+    """Sanitized provider failure with optional retry guidance for the job queue."""
+
+    def __init__(self, status_code: int, *, retry_after_seconds: int | None = None) -> None:
+        super().__init__(f"DeepSeek API request failed with status {status_code}")
+        self.status_code = status_code
+        self.error_code = f"deepseek_http_{status_code}"
+        self.retry_after_seconds = retry_after_seconds
+        self.retryable = status_code == 429 or status_code >= 500
+
+
+def _provider_user_id(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_-]", "-", value)[:512]
+    if not normalized:
+        raise ValueError("user_id must contain a letter, number, dash or underscore")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +65,7 @@ class DeepSeekProvider:
         thinking: bool = False,
         reasoning_effort: str | None = None,
         max_tokens: int = 4000,
+        user_id: str | None = None,
     ) -> tuple[str, dict[str, int]]:
         request: dict[str, Any] = {
             "model": model,
@@ -59,11 +79,22 @@ class DeepSeekProvider:
         }
         if reasoning_effort:
             request["reasoning_effort"] = reasoning_effort
+        if user_id:
+            request["user_id"] = _provider_user_id(user_id)
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout_seconds) as client:
             response = await client.post(
                 "/chat/completions", headers=self._headers(), json=request
             )
-            response.raise_for_status()
+            if response.is_error:
+                retry_after = None
+                if response.status_code == 429:
+                    try:
+                        retry_after = max(1, min(86_400, int(response.headers.get("Retry-After", "30"))))
+                    except ValueError:
+                        retry_after = 30
+                raise DeepSeekAPIError(
+                    response.status_code, retry_after_seconds=retry_after
+                )
             body: dict[str, Any] = response.json()
         content = str(body["choices"][0]["message"].get("content") or "")
         usage = body.get("usage") or {}

@@ -3,9 +3,9 @@
 ## Before pilot
 
 1. Back up the SQLite database and verify restore into a separate file.
-2. Apply Alembic migrations through `20260809_0014`.
+2. Confirm the repository has one Alembic head and apply migrations through that exact head.
 3. Run secret scan, backend tests, frontend lint/typecheck/build and Docker build.
-4. Confirm only the Ventrix compose project is restarted.
+4. Deploy with `scripts/deploy_vps.sh <git-sha>` and confirm only the six Ventrix compose services are restarted.
 5. Confirm `/health/live`, `/health/ready`, `/health/details` and metrics.
 
 ## Pilot checks
@@ -27,6 +27,7 @@ lock data.
 
 ## Rollback
 
-Stop only the Ventrix compose project, preserve its data directory, restore the verified
-backup if a data migration must be reverted, and deploy the previous image. Never delete
-the active database or Telegram sessions as part of rollback.
+Use `scripts/rollback_vps.sh` for an application-image rollback. It intentionally preserves the
+database. If a data migration must be reverted, stop only the Ventrix compose project, preserve
+its data directory, restore the explicitly selected verified backup, and then start the previous
+image. Never delete the active database or Telegram sessions as part of rollback.

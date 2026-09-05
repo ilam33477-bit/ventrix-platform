@@ -430,7 +430,7 @@ class SignalService:
                 idempotency_key=f"problem-evaluate:{problem.id}:{reply.id}",
                 correlation_id=problem.id,
                 category="reconciliation",
-                cost_class="light",
+                cost_class="ai_fast",
             )
 
     async def enqueue_triage(self, signals: list[Signal]) -> list[str]:

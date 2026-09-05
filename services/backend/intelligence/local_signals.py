@@ -129,6 +129,18 @@ class LocalSignalEngine:
         attachment_mimes = {
             str(item.get("mime_type") or "").lower() for item in message.attachments_json
         }
+        document_attachment = any(
+            mime in {
+                "application/pdf",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }
+            for mime in attachment_mimes
+        ) or any(
+            name.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx"))
+            for name in attachment_names
+        )
         invoice_filename = any(
             any(marker in name for marker in ("invoice", "счет", "счёт", "payment", "оплат"))
             for name in attachment_names
@@ -154,6 +166,7 @@ class LocalSignalEngine:
             "date": bool(DATE_RE.search(text)),
             "time": bool(TIME_RE.search(text)),
             "attachment": bool(message.attachments_json),
+            "document_attachment": document_attachment,
             "complaint": bool(COMPLAINT_RE.search(text)),
             # Commercial interest is evidence only when the external person says it.
             "confirmed_interest": bool(external_sender and INTEREST_RE.search(text)),
@@ -179,7 +192,7 @@ class LocalSignalEngine:
             ("payment_question", features["payment"], 47, "оплата, счёт или реквизиты"),
             (
                 "document_request",
-                features["document"] or features["attachment"],
+                features["document"] or features["document_attachment"],
                 36,
                 "документ или вложение",
             ),

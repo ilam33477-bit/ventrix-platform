@@ -47,7 +47,7 @@ export function MiniAppRoot() {
     return <main className="state-shell"><section className="state-card"><p className="eyebrow">ДОСТУП НЕ ПОДТВЕРЖДЁН</p><h1>У вас нет доступа к этому проекту</h1><p>Откройте Ventrix из клиентского бота, в tenant которого вы добавлены.</p></section></main>;
   }
   if (launchState === "error") return <ErrorState message={error} retry={() => void refresh()} />;
-  if (!session || !api) {
+  if (launchState !== "authenticated" || !session || !api) {
     return <main className="state-shell"><section className="state-card"><p className="eyebrow">VENTRIX</p><h1>{launchState === "authenticating" ? "Проверяем доступ к проекту…" : "Открываем Mini App…"}</h1><Skeleton lines={3} /></section></main>;
   }
   if (!session.bootstrap.onboarding.completed) {

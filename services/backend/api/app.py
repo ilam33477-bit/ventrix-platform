@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Response, status
+from fastapi import Depends, FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select, text
 
@@ -12,15 +13,33 @@ from ..config import get_settings
 from ..database import get_session_factory
 from ..metrics import collect_runtime_metrics
 from ..models import BackgroundJob, BotInstance, RuntimeHealth, TelegramConnection
+from ..observability import configure_structured_logging
 from ..services.encryption import EncryptionService
+from ..services.runtime_monitoring import runtime_heartbeat_loop
 from .client_router import router as client_router
+from .dependencies import require_owner_api_token
 from .router import router as owner_router
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Migrations are applied by the container entrypoint. Startup remains side-effect free.
-    yield
+    settings = get_settings()
+    configure_structured_logging(settings.log_level)
+    heartbeat = asyncio.create_task(
+        runtime_heartbeat_loop(
+            get_session_factory(),
+            "api",
+            interval_seconds=settings.worker_heartbeat_seconds,
+            details={"release_revision": settings.release_revision},
+        ),
+        name="api-runtime-heartbeat",
+    )
+    try:
+        yield
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 def create_app() -> FastAPI:
@@ -31,6 +50,17 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     settings = get_settings()
+    @app.middleware("http")
+    async def private_api_cache_policy(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/client/"):
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Pragma"] = "no-cache"
+            vary = response.headers.get("Vary", "")
+            if "authorization" not in {part.strip().lower() for part in vary.split(",")}:
+                response.headers["Vary"] = f"{vary}, Authorization" if vary else "Authorization"
+        return response
+
     mini_app_url = settings.client_mini_app_url
     allowed_origins: list[str] = []
     if mini_app_url:
@@ -76,20 +106,36 @@ def create_app() -> FastAPI:
     async def health_ready(response: Response) -> dict[str, str]:
         return await ready(response)
 
-    @app.get("/metrics", tags=["system"])
+    @app.get(
+        "/metrics",
+        tags=["system"],
+        dependencies=[Depends(require_owner_api_token)],
+    )
     async def metrics() -> dict[str, object]:
         async with get_session_factory()() as session:
             return await collect_runtime_metrics(session)
 
-    @app.get("/health/details", tags=["system"])
+    @app.get(
+        "/health/details",
+        tags=["system"],
+        dependencies=[Depends(require_owner_api_token)],
+    )
     async def health_details() -> dict[str, object]:
         settings = get_settings()
         async with get_session_factory()() as session:
+            runtime_metrics = await collect_runtime_metrics(session)
             queue_pending = int(
                 await session.scalar(
                     select(func.count(BackgroundJob.id)).where(
                         BackgroundJob.status.in_(
-                            ("pending", "scheduled", "waiting", "retry", "running")
+                            (
+                                "pending",
+                                "scheduled",
+                                "waiting",
+                                "retry",
+                                "retry_scheduled",
+                                "running",
+                            )
                         )
                     )
                 )
@@ -119,7 +165,13 @@ def create_app() -> FastAPI:
                 ).all()
             )
         return {
-            "status": "healthy",
+            "status": (
+                "attention"
+                if runtime_metrics["runtime"]["stale"]
+                or runtime_metrics["reports"]["overdue"]
+                else "healthy"
+            ),
+            "release_revision": settings.release_revision,
             "database": "healthy",
             "queue": {"pending_or_running": queue_pending, "failed": failed_jobs},
             "scheduler": {
@@ -132,6 +184,8 @@ def create_app() -> FastAPI:
             "telethon_connections": sessions,
             "ai_provider": "configured" if settings.deepseek_api_key else "not_configured",
             "mini_app_api": "healthy",
+            "runtime": runtime_metrics["runtime"],
+            "host": runtime_metrics["host"],
         }
 
     app.include_router(owner_router)

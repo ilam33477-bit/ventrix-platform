@@ -26,6 +26,26 @@ def back_to_owner_menu() -> InlineKeyboardMarkup:
     )
 
 
+def system_monitoring_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="↻ Обновить", callback_data="owner:system"),
+                InlineKeyboardButton(text="⚠️ Ошибки", callback_data="owner:system:errors"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Логи за 1 час", callback_data="owner:system:logs:1"
+                ),
+                InlineKeyboardButton(
+                    text="Логи за 2 часа", callback_data="owner:system:logs:2"
+                ),
+            ],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="owner:menu")],
+        ]
+    )
+
+
 def system_settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

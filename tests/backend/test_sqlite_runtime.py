@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
+from queue import Empty
 from uuid import UUID
 
 import pytest
 from aiogram.fsm.storage.base import StorageKey
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from services.api.deepseek import DeepSeekAPIError
 from services.backend.bot.sqlite_storage import SQLiteFSMStorage
+from services.backend.database import SQLiteTransactionManager, build_engine
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.jobs.worker import HANDLERS, BackgroundWorker
 from services.backend.models import (
@@ -21,6 +26,25 @@ from services.backend.models import (
 )
 from services.backend.scripts.backup_sqlite import backup_database, restore_database
 from services.backend.telegram_sessions.leases import TelegramRuntimeLeaseStore
+
+
+def _transaction_probe(database_url, started, entered, release) -> None:
+    async def probe() -> None:
+        engine = build_engine(database_url, 5000)
+        factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        manager = SQLiteTransactionManager(factory)
+        started.put(True)
+
+        async def operation(_session) -> None:
+            entered.put(True)
+            release.wait(timeout=5)
+
+        try:
+            await manager.run(operation)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(probe())
 
 
 @pytest.mark.asyncio
@@ -35,6 +59,50 @@ async def test_sqlite_pragmas_are_enabled(session_factory) -> None:
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 1  # NORMAL
     assert busy_timeout == 5000
+
+
+def test_write_transaction_reserves_sqlite_before_operation_across_processes(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'process-lock.db'}"
+    context = multiprocessing.get_context("spawn")
+    started = context.Queue()
+    entered = context.Queue()
+    release_first = context.Event()
+    release_second = context.Event()
+    first = context.Process(
+        target=_transaction_probe,
+        args=(database_url, started, entered, release_first),
+    )
+    second = context.Process(
+        target=_transaction_probe,
+        args=(database_url, started, entered, release_second),
+    )
+
+    first.start()
+    assert started.get(timeout=5) is True
+    assert entered.get(timeout=5) is True
+    second.start()
+    assert started.get(timeout=5) is True
+    try:
+        with pytest.raises(Empty):
+            entered.get(timeout=0.25)
+        release_first.set()
+        assert entered.get(timeout=5) is True
+    finally:
+        release_first.set()
+        release_second.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        if first.is_alive():
+            first.terminate()
+            first.join(timeout=5)
+        if second.is_alive():
+            second.terminate()
+            second.join(timeout=5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
 
 
 @pytest.mark.asyncio
@@ -122,6 +190,46 @@ async def test_background_job_retry_then_completion(session_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_honors_provider_retry_after(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue("test.rate_limited", {}, max_attempts=3)
+
+    async def rate_limited(_lease):
+        raise DeepSeekAPIError(429, retry_after_seconds=45)
+
+    before = datetime.now(UTC)
+    worker = BackgroundWorker(queue, "ai-worker", {"test.rate_limited": rate_limited})
+    assert await worker.run_once()
+    job = await queue.get(job_id)
+
+    assert job.status == "retry_scheduled"
+    assert job.attempts == 1
+    scheduled_at = (
+        job.scheduled_at.replace(tzinfo=UTC)
+        if job.scheduled_at.tzinfo is None
+        else job.scheduled_at
+    )
+    assert scheduled_at >= before + timedelta(seconds=44)
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_retry_permanent_provider_error(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    job_id = await queue.enqueue("test.bad_credentials", {}, max_attempts=3)
+
+    async def bad_credentials(_lease):
+        raise DeepSeekAPIError(401)
+
+    worker = BackgroundWorker(queue, "ai-worker", {"test.bad_credentials": bad_credentials})
+    assert await worker.run_once()
+    job = await queue.get(job_id)
+
+    assert job.status == "failed"
+    assert job.attempts == 1
+    assert job.finished_at is not None
+
+
+@pytest.mark.asyncio
 async def test_stale_running_job_is_recovered(session_factory) -> None:
     queue = SQLiteJobQueue(session_factory)
     job_id = await queue.enqueue("system.echo", {})
@@ -138,6 +246,37 @@ async def test_stale_running_job_is_recovered(session_factory) -> None:
     job = await queue.get(job_id)
     assert job.status == "retry_scheduled"
     assert job.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_interactive_ai_lease_is_failed_not_requeued(session_factory) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        lease = BackgroundJob(
+            job_type="ai.interactive",
+            category="ai_interactive",
+            cost_class="ai_fast",
+            payload_json={},
+            status="running",
+            priority=0,
+            scheduled_at=now,
+            started_at=now,
+            locked_at=now - timedelta(minutes=20),
+            heartbeat_at=now - timedelta(minutes=20),
+            locked_by="dead-api",
+            max_attempts=3,
+        )
+        session.add(lease)
+        await session.commit()
+        lease_id = lease.id
+
+    queue = SQLiteJobQueue(session_factory)
+    assert await queue.recover_stale(timedelta(minutes=5)) == 1
+    stored = await queue.get(lease_id)
+
+    assert stored.status == "failed"
+    assert stored.attempts == 1
+    assert stored.finished_at is not None
 
 
 @pytest.mark.asyncio
@@ -255,6 +394,170 @@ async def test_heavy_jobs_from_two_tenants_run_independently_and_fairly(
     )
     assert next_for_first_tenant is not None
     assert next_for_first_tenant.id == second_a
+
+
+@pytest.mark.asyncio
+async def test_fairness_keeps_second_tenant_visible_beyond_large_backlog(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        first = await make_service(session).create_tenant(tenant_payload)
+        second = await make_service(session).create_tenant(
+            tenant_payload.model_copy(update={
+                "name": "Second Backlog Tenant",
+                "owner_telegram_username": "backlog_owner",
+                "owner_telegram_user_id": 555000333,
+            })
+        )
+
+    queue = SQLiteJobQueue(session_factory, category_limits={"ai_fast": 2})
+    first_ids = [
+        await queue.enqueue(
+            "signal.ai_triage", {"index": index}, tenant_id=first.id, category="ai_fast"
+        )
+        for index in range(125)
+    ]
+    second_id = await queue.enqueue(
+        "signal.ai_triage", {}, tenant_id=second.id, category="ai_fast"
+    )
+
+    first_lease = await queue.claim_next("ai-1", allowed_categories=frozenset({"ai_fast"}))
+    second_lease = await queue.claim_next("ai-2", allowed_categories=frozenset({"ai_fast"}))
+
+    assert first_lease is not None and first_lease.id == first_ids[0]
+    assert second_lease is not None and second_lease.id == second_id
+
+
+@pytest.mark.asyncio
+async def test_category_limit_is_shared_between_queue_instances(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    first_queue = SQLiteJobQueue(session_factory, category_limits={"ai_fast": 1})
+    second_queue = SQLiteJobQueue(session_factory, category_limits={"ai_fast": 1})
+    await first_queue.enqueue(
+        "signal.ai_triage", {"index": 1}, tenant_id=tenant.id, category="ai_fast"
+    )
+    await first_queue.enqueue(
+        "signal.ai_triage", {"index": 2}, tenant_id=tenant.id, category="ai_fast"
+    )
+
+    first = await first_queue.claim_next("process-a", allowed_categories=frozenset({"ai_fast"}))
+    blocked = await second_queue.claim_next(
+        "process-b", allowed_categories=frozenset({"ai_fast"})
+    )
+
+    assert first is not None
+    assert blocked is None
+
+
+@pytest.mark.asyncio
+async def test_total_ai_limit_spans_fast_heavy_report_and_reconciliation(
+    session_factory, make_service, tenant_payload
+) -> None:
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+    resources = {"ai": (frozenset({"ai_fast", "ai_heavy"}), 1)}
+    job_types = {"ai": frozenset({"signal.ai_triage", "report_generation"})}
+    first_queue = SQLiteJobQueue(
+        session_factory, resource_limits=resources, resource_job_types=job_types
+    )
+    second_queue = SQLiteJobQueue(
+        session_factory, resource_limits=resources, resource_job_types=job_types
+    )
+    fast_id = await first_queue.enqueue(
+        "signal.ai_triage",
+        {},
+        tenant_id=tenant.id,
+        category="ai_fast",
+        cost_class="ai_fast",
+    )
+    await first_queue.enqueue(
+        "report_generation",
+        {},
+        tenant_id=tenant.id,
+        category="report",
+        cost_class="heavy",
+    )
+
+    fast = await first_queue.claim_next("process-a")
+    blocked = await second_queue.claim_next("process-b")
+
+    assert fast is not None and fast.id == fast_id
+    assert blocked is None
+
+
+@pytest.mark.asyncio
+async def test_ten_tenant_ai_burst_drains_without_duplicates_or_starvation(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenants = []
+    async with session_factory() as session:
+        for index in range(10):
+            tenants.append(
+                await make_service(session).create_tenant(
+                    tenant_payload.model_copy(update={
+                        "name": f"Load tenant {index}",
+                        "owner_telegram_username": f"load_owner_{index}",
+                        "owner_telegram_user_id": 555001000 + index,
+                    })
+                )
+            )
+    queue = SQLiteJobQueue(
+        session_factory,
+        category_limits={"ai_fast": 4},
+        resource_limits={"ai": (frozenset({"ai_fast", "ai_heavy"}), 2)},
+    )
+    job_ids = [
+        await queue.enqueue(
+            "test.ai",
+            {"tenant": tenant.id, "index": index},
+            tenant_id=tenant.id,
+            category="ai_fast",
+            cost_class="ai_fast",
+        )
+        for tenant in tenants
+        for index in range(3)
+    ]
+    active = 0
+    peak_active = 0
+    executions: list[str] = []
+    lock = asyncio.Lock()
+
+    async def handler(lease):
+        nonlocal active, peak_active
+        async with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            executions.append(lease.id)
+        await asyncio.sleep(0.05)
+        async with lock:
+            active -= 1
+        return {"tenant_id": lease.tenant_id}
+
+    workers = [
+        BackgroundWorker(
+            queue,
+            f"ai-load-{index}",
+            {"test.ai": handler},
+            heartbeat_seconds=0.01,
+            allowed_categories=frozenset({"ai_fast"}),
+        )
+        for index in range(4)
+    ]
+
+    async def drain(worker):
+        while await worker.run_once():
+            pass
+
+    await asyncio.gather(*(drain(worker) for worker in workers))
+    jobs = [await queue.get(job_id) for job_id in job_ids]
+
+    assert peak_active == 2
+    assert len(executions) == len(set(executions)) == 30
+    assert all(job.status == "completed" for job in jobs)
+    assert {job.tenant_id for job in jobs} == {tenant.id for tenant in tenants}
 
 
 @pytest.mark.asyncio

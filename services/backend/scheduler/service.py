@@ -187,6 +187,7 @@ class TenantAnalysisScheduler:
                     {
                         "report_due_at": report_due_at.isoformat(),
                         "history_window_days": schedule.history_window_days,
+                        "report_window_days": 7 if len(schedule.enabled_days) == 1 else 1,
                         "trigger": "scheduled",
                     },
                     tenant_id=schedule.tenant_id,
@@ -319,7 +320,7 @@ class TenantAnalysisScheduler:
                     correlation_id=str(uuid4()),
                     is_heavy=False,
                     category="reconciliation",
-                    cost_class="light",
+                    cost_class="ai_fast",
                     max_attempts=3,
                 )
             )
@@ -337,7 +338,7 @@ class TenantAnalysisScheduler:
                     correlation_id=str(uuid4()),
                     is_heavy=False,
                     category="ai",
-                    cost_class="standard",
+                    cost_class="ai_fast",
                     max_attempts=3,
                 )
             )

@@ -20,7 +20,7 @@ from aiogram.types import (
     TelegramObject,
     WebAppInfo,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.problems import ProblemStatus
@@ -44,6 +44,7 @@ from ..models import (
     InitialAnalysisRun,
     NotificationLog,
     OperationalProblem,
+    Permission,
     ProductEvent,
     Report,
     ReportMetric,
@@ -57,8 +58,15 @@ from ..models import (
     TenantSettings,
 )
 from ..reporting.pdf import build_report_pdf
-from ..services.employee_access import claim_employee_by_username
+from ..services.employee_access import (
+    ConnectionEmployeeConflict,
+    claim_employee_by_username,
+    employee_membership_is_valid,
+)
+from ..services.employee_activation import ACTIVATION_PARAMETER
+from ..services.group_access import group_is_approved, observe_group
 from ..services.product_events import ProductEventService
+from ..services.report_access import personal_report_ids
 from ..telegram_sessions.service import TelegramConnectionError, TelegramConnectionService
 from ..timezones import timezone_info
 from .links import private_bot_link
@@ -73,6 +81,7 @@ class ClientContext:
     role: str
     tenant: Tenant
     employee_id: str | None = None
+    reports_read_all: bool = False
 
 
 PROBLEM_TYPE_LABELS = {
@@ -193,6 +202,7 @@ class TenantOwnerMiddleware(BaseMiddleware):
                 )
             )
             membership = None
+            reports_read_all = False
             if tenant is not None and user_id is not None:
                 membership = await session.scalar(
                     select(TenantMembership).where(
@@ -210,25 +220,24 @@ class TenantOwnerMiddleware(BaseMiddleware):
                     )
                     if membership is not None:
                         await session.commit()
+                if membership is not None and not await employee_membership_is_valid(
+                    session, membership
+                ):
+                    membership = None
+                if membership is not None:
+                    reports_read_all = bool(await session.scalar(select(Permission.id).where(
+                        Permission.tenant_id == tenant.id,
+                        Permission.membership_id == membership.id,
+                        Permission.permission == "reports.read",
+                    )))
         group_membership_update = isinstance(event, ChatMemberUpdated)
         group_connect_command = (
             isinstance(event, Message)
             and event.chat.type in {"group", "supergroup"}
             and (event.text or "").split("@", 1)[0].strip() == "/ventrix_connect"
         )
-        verified_group_admin = False
-        if (
-            tenant is not None
-            and user_id is not None
-            and membership is None
-            and group_connect_command
-        ):
-            try:
-                actor_member = await event.bot.get_chat_member(event.chat.id, user_id)
-                verified_group_admin = actor_member.status in {"administrator", "creator"}
-            except TelegramBadRequest:
-                verified_group_admin = False
-        tenant_scoped_group_event = group_membership_update or verified_group_admin
+        # Membership events may discover/revoke a group, but never grant project authority.
+        tenant_scoped_group_event = group_membership_update
         if (
             tenant is None
             or user_id is None
@@ -246,6 +255,13 @@ class TenantOwnerMiddleware(BaseMiddleware):
             elif isinstance(event, Message):
                 await event.answer("У вас нет доступа к этому проекту.")
             return None
+        event_chat = event.chat if isinstance(event, Message) else getattr(getattr(event, "message", None), "chat", None)
+        if event_chat is not None and event_chat.type in {"group", "supergroup"} and not group_connect_command:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Откройте карточку в личном чате с ботом.", show_alert=True)
+            elif isinstance(event, Message) and (event.text or "").startswith("/"):
+                await event.answer("Меню и персональные данные доступны только в личном чате с ботом.")
+            return None
         if isinstance(event, CallbackQuery) and not callback_allowed_for_role(
             membership.role, event.data or ""
         ):
@@ -255,9 +271,10 @@ class TenantOwnerMiddleware(BaseMiddleware):
             bot_instance_id=self.bot_instance_id,
             tenant_id=self.tenant_id,
             telegram_user_id=user_id,
-            role=membership.role if membership is not None else "manager",
+            role=membership.role if membership is not None else "observer",
             tenant=tenant,
             employee_id=membership.employee_id if membership is not None else None,
+            reports_read_all=reports_read_all,
         )
         return await handler(event, data)
 
@@ -380,14 +397,25 @@ def build_client_router(
                     )
                 ]
             )
+        if step < 3:
+            rows.append([InlineKeyboardButton(
+                text="Пропустить обучение", callback_data="client:employee-guide:finish"
+            )])
+        if mini_app_url:
+            rows.append([InlineKeyboardButton(
+                text="Открыть Ventrix AI", web_app=WebAppInfo(url=mini_app_url)
+            )])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def employee_guide_text(step: int, tenant_name: str) -> str:
         if step == 1:
             return (
                 f"<b>Добро пожаловать в Ventrix · {escape(tenant_name)}</b>\n\n"
-                "Это ваш рабочий помощник. Вы увидите только ситуации, закреплённые "
-                "за вашей Telegram-сессией; чужие диалоги и настройки проекта закрыты."
+                "Руководитель подключил ваш рабочий Telegram к проекту. "
+                "Ventrix следит за рабочими диалогами этой сессии и поможет заметить "
+                "клиентов без ответа, незакрытые обещания и упущенные возможности.\n\n"
+                "Вам приходят только ваши ситуации. Чужие диалоги и управление проектом закрыты. "
+                "Коротко покажем, где что находится."
             )
         if step == 2:
             return (
@@ -399,8 +427,9 @@ def build_client_router(
         return (
             "<b>Ваши действия и отчёты</b>\n\n"
             "В ситуации можно посмотреть контекст, ответить через рабочий Telegram, взять её "
-            "в работу или завершить. В «Моих отчётах» — только ваши показатели. Раздел "
-            "«Команда» доступен для просмотра, но управление остаётся у руководителя."
+            "в работу или завершить. В «Моих отчётах» по умолчанию — ваши показатели; "
+            "доступ к общим сводкам может отдельно дать руководитель. Раздел "
+            "«Команда» показывает ваш аккаунт; управление остаётся у руководителя."
         )
 
     def problem_status_markup(
@@ -636,6 +665,7 @@ def build_client_router(
                 start_parameter = command_parts[1].strip()
         linked_problem: OperationalProblem | None = None
         first_employee_start = False
+        started_at = datetime.now(UTC)
         async with events.session_factory() as session:
             membership = await session.scalar(
                 select(TenantMembership).where(
@@ -643,11 +673,13 @@ def build_client_router(
                     TenantMembership.telegram_user_id == client_context.telegram_user_id,
                 )
             )
-            first_employee_start = bool(
-                employee_view and membership is not None and membership.bot_started_at is None
-            )
             if membership is not None and membership.bot_started_at is None:
-                membership.bot_started_at = datetime.now(UTC)
+                claimed = await session.execute(update(TenantMembership).where(
+                    TenantMembership.id == membership.id,
+                    TenantMembership.status == "active",
+                    TenantMembership.bot_started_at.is_(None),
+                ).values(bot_started_at=started_at))
+                first_employee_start = employee_view and claimed.rowcount == 1
                 await session.commit()
             if start_parameter.startswith("problem_"):
                 problem_id = start_parameter.removeprefix("problem_")
@@ -705,6 +737,8 @@ def build_client_router(
                     )
                     or 0
                 )
+        if employee_view and start_parameter == ACTIVATION_PARAMETER and not first_employee_start:
+            return  # Retried automatic starts must not resend a welcome or menu.
         await record(client_context, "client_user_started_bot")
         await record(client_context, "client_menu_opened")
         if start_parameter.startswith("problem_"):
@@ -714,19 +748,46 @@ def build_client_router(
                     reply_markup=client_main_menu(mini_app_url, role=client_context.role),
                 )
                 return
+            markup = problem_system_markup(linked_problem.id)
+            if first_employee_start:
+                markup.inline_keyboard.append([InlineKeyboardButton(
+                    text="Как работать с Ventrix", callback_data="client:employee-guide:1"
+                )])
             await message.answer(
                 f"<b>{escape(PROBLEM_TYPE_LABELS.get(linked_problem.problem_type, 'Рабочая ситуация'))}</b>\n\n"
-                f"{escape(linked_problem.title)}\n\n"
+                f"{escape(linked_problem.evidence[:400])}\n\n"
                 f"Статус: <b>{escape(PROBLEM_STATUS_LABELS.get(linked_problem.status, linked_problem.status))}</b>\n"
                 f"Приоритет: <b>{escape(PRIORITY_LABELS.get(linked_problem.priority, linked_problem.priority))}</b>\n\n"
                 "Откройте Ventrix AI, чтобы увидеть переписку и доступные действия.",
-                reply_markup=problem_system_markup(linked_problem.id),
+                reply_markup=markup,
             )
             return
         if start_parameter.startswith("report_"):
+            report_id = start_parameter.removeprefix("report_")
+            async with events.session_factory() as session:
+                report = await session.scalar(select(Report).where(
+                    Report.id == report_id, Report.tenant_id == tenant.id, Report.status == "ready",
+                ))
+                if report is not None and employee_view and not client_context.reports_read_all:
+                    visible = await personal_report_ids(
+                        session, tenant.id, client_context.employee_id, [report_id]
+                    )
+                    if report_id not in visible:
+                        report = None
+            if report is None:
+                await message.answer(
+                    "Эта сводка недоступна вашему аккаунту или уже удалена.",
+                    reply_markup=client_main_menu(mini_app_url, role=client_context.role),
+                )
+                return
+            markup = mini_app_section_markup("Открыть отчёты", "reports")
+            if first_employee_start:
+                markup.inline_keyboard.append([InlineKeyboardButton(
+                    text="Как работать с Ventrix", callback_data="client:employee-guide:1"
+                )])
             await message.answer(
                 "<b>Регулярная сводка готова</b>\n\nОткройте Ventrix AI, чтобы посмотреть доступные вам итоги.",
-                reply_markup=mini_app_section_markup("Открыть отчёты", "reports"),
+                reply_markup=markup,
             )
             return
         if start_parameter == "group_connected":
@@ -742,10 +803,19 @@ def build_client_router(
             )
             return
         if first_employee_start:
-            await message.answer(
-                employee_guide_text(1, tenant.name),
-                reply_markup=employee_guide_markup(1),
-            )
+            try:
+                await message.answer(
+                    employee_guide_text(1, tenant.name),
+                    reply_markup=employee_guide_markup(1),
+                )
+            except Exception:
+                async with events.session_factory() as session:
+                    await session.execute(update(TenantMembership).where(
+                        TenantMembership.id == membership.id,
+                        TenantMembership.bot_started_at == started_at,
+                    ).values(bot_started_at=None))
+                    await session.commit()
+                raise
             return
         first_name = (
             (message.from_user.first_name if message.from_user else None)
@@ -1310,6 +1380,12 @@ def build_client_router(
                     .limit(10)
                 )
             )
+            if client_context.role == "employee" and not client_context.reports_read_all:
+                visible = await personal_report_ids(
+                    session, client_context.tenant_id, client_context.employee_id,
+                    [row.id for row in report_rows],
+                )
+                report_rows = [row for row in report_rows if row.id in visible]
         canonical: list[Report] = []
         seen: set[tuple[object, str]] = set()
         for item in report_rows:
@@ -1319,10 +1395,11 @@ def build_client_router(
             seen.add(key)
             canonical.append(item)
         employee_view = client_context.role == "employee"
+        personal_only = employee_view and not client_context.reports_read_all
         lines = [
             (
                 f"• <b>{item.period_end:%d.%m.%Y}</b> — персональная сводка готова"
-                if employee_view
+                if personal_only
                 else f"• <b>{item.period_end:%d.%m.%Y}</b> — {escape(item.summary.replace('Обработано сообщений', 'изучено сообщений').replace('Проблем', 'ситуаций'))}"
             )
             for item in canonical[:5]
@@ -1367,7 +1444,7 @@ def build_client_router(
             )
             + (
                 "\n\n<i>Здесь показаны только ваши рабочие итоги.</i>"
-                if employee_view
+                if personal_only
                 else "\n\n<i>Недельную сводку можно обновлять раз в день, месячную — раз в неделю.</i>"
             ),
             InlineKeyboardMarkup(inline_keyboard=buttons),
@@ -1807,6 +1884,28 @@ def build_client_router(
         )
         await state.clear()
 
+    async def show_identity_conflict(state: FSMContext, bot: Any) -> None:
+        await edit_saved_screen(
+            state,
+            bot,
+            "<b>Аккаунт не привязан</b>\n\n"
+            "Этот Telegram-аккаунт не соответствует выбранному сотруднику. "
+            "Проверьте сотрудника и начните подключение заново с его номером.",
+            connection_actions(None),
+        )
+        await state.clear()
+
+    async def show_login_restart(state: FSMContext, bot: Any) -> None:
+        await edit_saved_screen(
+            state,
+            bot,
+            "<b>Начните подключение заново</b>\n\n"
+            "Предыдущий запрос входа завершён или заменён новым. "
+            "Нажмите «Подключить аккаунт», чтобы запросить новый код.",
+            connection_actions(None),
+        )
+        await state.clear()
+
     @router.message(TelegramConnectionStates.code)
     async def receive_code(
         message: Message, state: FSMContext, client_context: ClientContext
@@ -1826,6 +1925,12 @@ def build_client_router(
                 connection_id=data.get("connection_id"),
                 code=code,
             )
+        except ConnectionEmployeeConflict:
+            await show_identity_conflict(state, message.bot)
+            return
+        except TelegramConnectionError:
+            await show_login_restart(state, message.bot)
+            return
         except Exception as exc:  # noqa: BLE001 - auth errors are intentionally sanitized
             await record(client_context, "telegram_code_rejected", error_type=type(exc).__name__)
             await edit_saved_screen(
@@ -1839,6 +1944,7 @@ def build_client_router(
                 ),
             )
             return
+        await state.update_data(connection_id=connection.id)
         if connection.status == "awaiting_2fa":
             await record(client_context, "telegram_2fa_requested")
             await state.set_state(TelegramConnectionStates.password)
@@ -1882,11 +1988,17 @@ def build_client_router(
             return
         try:
             data = await state.get_data()
-            await connection_service.complete_login(
+            connection = await connection_service.complete_login(
                 client_context.tenant_id,
                 connection_id=data.get("connection_id"),
                 password=password,
             )
+        except ConnectionEmployeeConflict:
+            await show_identity_conflict(state, message.bot)
+            return
+        except TelegramConnectionError:
+            await show_login_restart(state, message.bot)
+            return
         except Exception as exc:  # noqa: BLE001 - auth errors are intentionally sanitized
             await record(client_context, "telegram_2fa_rejected", error_type=type(exc).__name__)
             await edit_saved_screen(
@@ -1901,6 +2013,7 @@ def build_client_router(
             )
             return
         password = ""
+        await state.update_data(connection_id=connection.id)
         try:
             await activate_connected_account(state, message.bot, client_context)
         except Exception as exc:  # noqa: BLE001 - catalog/sync can safely be retried
@@ -2248,7 +2361,13 @@ def build_client_router(
             rows = list(
                 await session.scalars(
                     select(Employee)
-                    .where(Employee.tenant_id == client_context.tenant_id)
+                    .where(
+                        Employee.tenant_id == client_context.tenant_id,
+                        *(
+                            (Employee.id == client_context.employee_id,)
+                            if client_context.role == "employee" else ()
+                        ),
+                    )
                     .order_by(Employee.display_name)
                 )
             )
@@ -2273,7 +2392,7 @@ def build_client_router(
             + (
                 "<i>Управление сотрудниками и сессиями доступно в Ventrix AI.</i>"
                 if manager_view
-                else "<i>Состав команды доступен для просмотра. Изменения выполняет руководитель проекта.</i>"
+                else "<i>Это ваш рабочий аккаунт. Изменения выполняет руководитель проекта.</i>"
             ),
             settings_markup() if manager_view else back_to_client_menu(),
         )
@@ -2313,7 +2432,7 @@ def build_client_router(
             "1. Откройте нужную Telegram-группу.\n"
             "2. Добавьте этого Ventrix-бота и назначьте его администратором.\n"
             "3. Оставьте боту право отправлять сообщения — так он сможет публиковать карточки и отчёты.\n"
-            "4. Отправьте в группе команду <code>/ventrix_connect</code>.\n"
+            "4. Руководитель проекта, который также является администратором группы, должен отправить <code>/ventrix_connect</code> со своего аккаунта, не анонимно.\n"
             "5. Вернитесь сюда и нажмите «Проверить подключение».\n\n"
             "<i>Для приватной группы ссылка-приглашение не нужна: бот должен быть добавлен в участники напрямую. Одной пересланной ссылки недостаточно.</i>\n\n"
             + ("\n".join(lines) if lines else "Подключённых групп пока нет."),
@@ -2335,19 +2454,23 @@ def build_client_router(
             for item in rows:
                 try:
                     member = await query.bot.get_chat_member(item.telegram_chat_id, query.bot.id)
-                    item.status = (
-                        "active"
-                        if member.status == "administrator"
-                        else "pending"
-                        if member.status == "member"
-                        else "revoked"
-                    )
+                    if member.status != "administrator":
+                        item.approved_at = None
+                        item.approved_by_telegram_user_id = None
+                    if item.status != "disabled":
+                        item.status = (
+                            "active" if member.status == "administrator" and group_is_approved(item)
+                            else "pending" if member.status in {"member", "administrator"}
+                            else "revoked"
+                        )
                     item.participants_count = await query.bot.get_chat_member_count(
                         item.telegram_chat_id
                     )
                     item.last_verified_at = datetime.now(UTC)
                 except TelegramBadRequest:
                     item.status = "revoked"
+                    item.approved_at = None
+                    item.approved_by_telegram_user_id = None
             await session.commit()
         await groups(query, client_context)
 
@@ -2356,34 +2479,27 @@ def build_client_router(
         *,
         chat_id: int,
         title: str,
-        active: bool,
+        bot_status: str,
         participants_count: int | None = None,
+        approver_user_id: int | None = None,
     ) -> GroupIntegration:
         async with events.session_factory() as session:
-            row = await session.scalar(
-                select(GroupIntegration).where(
-                    GroupIntegration.tenant_id == client_context.tenant_id,
-                    GroupIntegration.telegram_chat_id == chat_id,
-                )
-            )
-            if row is None:
-                row = GroupIntegration(
-                    tenant_id=client_context.tenant_id,
-                    bot_instance_id=client_context.bot_instance_id,
-                    telegram_chat_id=chat_id,
-                    title=title or "Рабочая группа",
-                )
-                session.add(row)
-            row.title = title or row.title
-            row.bot_instance_id = client_context.bot_instance_id
-            row.status = "active" if active else "pending"
-            row.participants_count = participants_count
-            row.last_verified_at = datetime.now(UTC)
+            row = await observe_group(session, tenant_id=client_context.tenant_id,
+                bot_instance_id=client_context.bot_instance_id, chat_id=chat_id,
+                title=title or "Рабочая группа", bot_status=bot_status,
+                participants_count=participants_count, approver_user_id=approver_user_id)
             await session.commit()
             return row
 
     @router.message(Command("ventrix_connect"), F.chat.type.in_({"group", "supergroup"}))
     async def connect_group(message: Message, client_context: ClientContext) -> None:
+        if client_context.role not in {"owner", "manager"}:
+            await message.answer("Подключить группу может только руководитель этого проекта.")
+            return
+        actor = await message.bot.get_chat_member(message.chat.id, client_context.telegram_user_id)
+        if actor.status not in {"creator", "administrator"}:
+            await message.answer("Для подключения нужны права администратора этой Telegram-группы.")
+            return
         member = await message.bot.get_chat_member(message.chat.id, message.bot.id)
         is_admin = member.status == "administrator"
         participants = await message.bot.get_chat_member_count(message.chat.id)
@@ -2391,8 +2507,9 @@ def build_client_router(
             client_context,
             chat_id=message.chat.id,
             title=message.chat.title or "Рабочая группа",
-            active=is_admin,
+            bot_status=member.status,
             participants_count=participants,
+            approver_user_id=client_context.telegram_user_id if is_admin else None,
         )
         if not is_admin:
             await message.answer(
@@ -2424,26 +2541,19 @@ def build_client_router(
         if event.chat.type not in {"group", "supergroup"}:
             return
         is_present = event.new_chat_member.status in {"member", "administrator"}
-        is_admin = event.new_chat_member.status == "administrator"
         participants = None
         if is_present:
             try:
                 participants = await event.bot.get_chat_member_count(event.chat.id)
             except TelegramBadRequest:
                 pass
-        row = await persist_group(
+        await persist_group(
             client_context,
             chat_id=event.chat.id,
             title=event.chat.title or "Рабочая группа",
-            active=is_admin,
+            bot_status=event.new_chat_member.status,
             participants_count=participants,
         )
-        if not is_present:
-            async with events.session_factory() as session:
-                stored = await session.get(GroupIntegration, row.id)
-                if stored is not None:
-                    stored.status = "revoked"
-                    await session.commit()
 
     @router.callback_query(F.data == "client:panel")
     async def panel(query: CallbackQuery, client_context: ClientContext) -> None:

@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     client_mini_app_url: str | None = None
     cors_allowed_origins: str | None = None
     platform_support_contact: str | None = None
+    release_revision: str = Field(default="development", min_length=1, max_length=100)
+    platform_backlog_alert_seconds: int = Field(default=900, ge=60, le=86_400)
+    platform_delivery_failure_alert_count: int = Field(default=5, ge=1, le=10_000)
+    platform_sqlite_lock_alert_count: int = Field(default=3, ge=1, le=10_000)
+    platform_disk_free_alert_percent: float = Field(default=10.0, ge=1, le=50)
     log_level: str = "INFO"
 
     @field_validator("signal_immediate_threshold")

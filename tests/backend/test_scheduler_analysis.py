@@ -14,15 +14,19 @@ from services.backend.analysis.preprocessing import (
     local_features,
     pack_dialog_payloads,
 )
-from services.backend.analysis.schema import parse_analysis_response
+from services.backend.analysis.schema import ReportNarrative, parse_analysis_response
 from services.backend.analysis.service import AnalysisPipelineService, canonical_problem_type
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
     AnalysisBatch,
     AnalysisRun,
     BackgroundJob,
+    Employee,
     EncryptedSecret,
+    OperationalProblem,
     Report,
+    ReportMetric,
+    ReportSection,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
@@ -59,6 +63,20 @@ def test_problem_types_are_canonicalized(raw_type: str, expected: str) -> None:
     assert canonical_problem_type(raw_type) == expected
 
 
+def test_report_narrative_rejects_malformed_list_fields() -> None:
+    with pytest.raises(ValueError):
+        ReportNarrative.model_validate(
+            {
+                "executive_summary": "Краткий итог.",
+                "highlights": "не список",
+                "risks": [],
+                "employee_notes": [],
+                "dialog_notes": [],
+                "recommendations": [],
+            }
+        )
+
+
 def test_next_analysis_time_respects_timezone_days_and_advance() -> None:
     now = datetime(2026, 8, 3, 5, 0, tzinfo=UTC)  # Monday, 08:00 in Moscow
     planned = next_analysis_time(
@@ -69,6 +87,157 @@ def test_next_analysis_time_respects_timezone_days_and_advance() -> None:
         advance_minutes=15,
     )
     assert planned == datetime(2026, 8, 3, 5, 45, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_weekly_schedule_passes_seven_day_report_window(
+    session_factory, make_service, tenant_payload
+) -> None:
+    now = datetime(2026, 9, 7, 6, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        settings = await session.scalar(
+            select(TenantSettings).where(TenantSettings.tenant_id == tenant.id)
+        )
+        settings.enabled_days = [0]
+        schedule = TenantAnalysisSchedule(
+            tenant_id=tenant.id,
+            timezone="Europe/Moscow",
+            report_time=time(9, 0),
+            enabled_days=[0],
+            history_window_days=30,
+            advance_minutes=15,
+            analysis_enabled=True,
+            next_analysis_at=now - timedelta(minutes=1),
+            access_status="active",
+        )
+        session.add(schedule)
+        await session.commit()
+
+    queue = SQLiteJobQueue(session_factory)
+    await TenantAnalysisScheduler(session_factory, queue=queue).tick(now)
+
+    async with session_factory() as session:
+        job = await session.scalar(
+            select(BackgroundJob).where(BackgroundJob.job_type == "analysis.pipeline")
+        )
+    assert job.payload_json["report_window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_report_includes_old_open_problem_as_carryover(
+    session_factory, make_service, tenant_payload, encryption_key
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        employee = Employee(
+            tenant_id=tenant.id,
+            display_name="Мария",
+            telegram_user_id=555_009_001,
+            telegram_username="maria",
+        )
+        session.add(employee)
+        await session.flush()
+        connection = TelegramConnection(
+            tenant_id=tenant.id,
+            assigned_employee_id=employee.id,
+            telegram_user_id=555_009_001,
+            status="ready",
+        )
+        session.add(connection)
+        await session.flush()
+        dialog = TelegramDialog(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            telegram_dialog_id=777_001,
+            title="Старый клиент",
+            username="old_client",
+            dialog_type="personal",
+            source="personal",
+            selected=True,
+        )
+        session.add(dialog)
+        await session.flush()
+        source = TelegramMessage(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            telegram_message_id=1,
+            sent_at=now - timedelta(days=10),
+            outgoing=False,
+            body_text="Когда вернётесь с договором?",
+            attachments_json=[],
+        )
+        session.add(source)
+        await session.flush()
+        session.add(
+            OperationalProblem(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                source_message_id=source.id,
+                responsible_employee_id=employee.id,
+                fingerprint="old-open-report-carryover",
+                problem_type="client_without_answer",
+                issue_family="UNANSWERED_REQUEST",
+                status="assigned",
+                priority="high",
+                confidence=0.95,
+                evidence=source.body_text,
+                explanation="Клиент всё ещё ждёт договор.",
+                recommended_action="Отправить договор или назвать срок.",
+                occurred_at=source.sent_at,
+            )
+        )
+        run = AnalysisRun(
+            tenant_id=tenant.id,
+            trigger="scheduled",
+            status="running",
+            stage="report_generation",
+            started_at=now,
+            report_due_at=now,
+            correlation_id="old-open-report",
+            metrics_json={"history_window_days": 30, "report_window_days": 1},
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    result = await AnalysisPipelineService(
+        session_factory,
+        EncryptionService(encryption_key),
+    )._build_report(run_id)
+
+    async with session_factory() as session:
+        report = await session.scalar(select(Report).where(Report.analysis_run_id == run_id))
+        metrics = {
+            row.metric_key: int(row.numeric_value)
+            for row in await session.scalars(
+                select(ReportMetric).where(ReportMetric.report_id == report.id)
+            )
+        }
+        important = await session.scalar(
+            select(ReportSection).where(
+                ReportSection.report_id == report.id,
+                ReportSection.section_key == "important_dialogs",
+            )
+        )
+        employee_section = await session.scalar(
+            select(ReportSection).where(
+                ReportSection.report_id == report.id,
+                ReportSection.section_key == "employee_report",
+            )
+        )
+
+    assert result["metrics"]["problems"] == 0
+    assert metrics["open_problems"] == 1
+    assert metrics["carried_open_problems"] == 1
+    assert important.data_json["rows"][0]["dialog_username"] == "old_client"
+    assert important.data_json["rows"][0]["age_minutes"] >= 10 * 24 * 60
+    attention = employee_section.data_json["employees"][0]["attention_items"][0]
+    assert attention["dialog"] == "@old_client"
+    assert attention["evidence"] == "Когда вернётесь с договором?"
 
 
 @pytest.mark.asyncio
@@ -259,6 +428,23 @@ def test_compaction_keeps_fresh_tail_and_relevant_historical_evidence() -> None:
     ids = [item["id"] for item in compact]
     assert ids[-2:] == [8, 9]
     assert 1 in ids
+
+
+def test_compaction_preserves_attachment_metadata_without_inventing_transcript() -> None:
+    item = TelegramMessage(
+        telegram_message_id=102,
+        sender_id=777,
+        sent_at=datetime.now(UTC),
+        outgoing=False,
+        body_text=None,
+        attachments_json=[{"kind": "voice", "mime_type": "audio/ogg"}],
+    )
+
+    compact = compact_messages([item])
+
+    assert compact[0]["id"] == 102
+    assert compact[0]["text"] == "[Вложение без текстовой расшифровки: audio/ogg]"
+    assert compact[0]["attachments"] == [{"kind": "voice", "mime_type": "audio/ogg"}]
 
 
 def test_model_budget_reserves_prompt_output_and_safety() -> None:

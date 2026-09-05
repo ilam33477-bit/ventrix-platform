@@ -26,12 +26,14 @@ def test_business_metrics_require_explicit_matching_evidence() -> None:
             message("dialog-1", 10, 0, outgoing=False),
             message("dialog-1", 11, 15, outgoing=True),
             message("dialog-1", 12, 20, outgoing=True),
+            message("dialog-2", 20, 2, outgoing=True),
+            message("dialog-2", 21, 4, outgoing=False),
         ],
         previous_messages=[
             message("dialog-1", 1, 0, outgoing=False),
             message("dialog-1", 2, 30, outgoing=True),
         ],
-        dialog_employee_ids={"dialog-1": "employee-1"},
+        dialog_employee_ids={"dialog-1": "employee-1", "dialog-2": "employee-1"},
         employees=[employee],
         dialog_outcomes={
             "dialog-1": [
@@ -60,7 +62,16 @@ def test_business_metrics_require_explicit_matching_evidence() -> None:
                     "amount": 100000,
                     "currency": "RUB",
                 },
-            ]
+            ],
+            "dialog-2": [
+                {
+                    "outcome_type": "interest_confirmed",
+                    "explicitly_supported": True,
+                    "confidence": 0.9,
+                    "source_message_ids": [21],
+                    "summary": "Клиент явно запросил подробности.",
+                }
+            ],
         },
     )
 
@@ -68,5 +79,11 @@ def test_business_metrics_require_explicit_matching_evidence() -> None:
     assert row["average_response_minutes"] == 15
     assert row["response_time_change_percent"] == -50
     assert row["calls_scheduled"] == 1
+    assert row["messages_sent"] == 3
+    assert row["contacted_dialogs"] == 2
+    assert row["responded_dialogs"] == 1
+    assert row["response_rate_denominator"] == 2
+    assert row["response_rate_percent"] == 50
+    assert row["interests_confirmed"] == 1
     assert row["sales_confirmed"] == 0
     assert row["confirmed_sales_amounts"] == {}

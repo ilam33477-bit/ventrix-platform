@@ -42,8 +42,14 @@ HISTORICAL_EVIDENCE_RE = re.compile(
 
 def local_features(messages: list[TelegramMessage], now: datetime | None = None) -> dict[str, Any]:
     current = now or datetime.now(UTC)
-    normalized = [item for item in messages if (item.body_text or "").strip()]
-    texts = [" ".join((item.body_text or "").split()) for item in normalized]
+    normalized = [
+        item for item in messages if (item.body_text or "").strip() or item.attachments_json
+    ]
+    texts = [
+        " ".join((item.body_text or "").split())
+        for item in normalized
+        if (item.body_text or "").strip()
+    ]
     authors = Counter(str(item.sender_id or "unknown") for item in normalized)
     last = normalized[-1] if normalized else None
     last_at = last.sent_at if last else None
@@ -74,10 +80,25 @@ def compact_messages(
     seen: set[tuple[int | None, datetime, str]] = set()
     for item in messages:
         text = " ".join((item.body_text or "").split())
+        if not text and item.attachments_json:
+            attachment_labels = []
+            for attachment in item.attachments_json[:5]:
+                label = str(
+                    attachment.get("name")
+                    or attachment.get("mime_type")
+                    or attachment.get("kind")
+                    or "файл"
+                ).strip()
+                if label:
+                    attachment_labels.append(label[:120])
+            text = (
+                "[Вложение без текстовой расшифровки: "
+                + ", ".join(attachment_labels or ["файл"])
+                + "]"
+            )
         relevance = classify_message_relevance(text)
         if (
-            not text
-            or text.lower().startswith(SYSTEM_EVENT_PREFIXES)
+            text.lower().startswith(SYSTEM_EVENT_PREFIXES)
             or not relevance.business_relevant
         ):
             continue

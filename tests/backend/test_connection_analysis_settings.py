@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import func, select
 
-from services.backend.api.client_router import ensure_connection_employee
 from services.backend.intelligence.connection_settings import effective_connection_settings
 from services.backend.models import Employee, TelegramConnection, TenantMembership, TenantSettings
+from services.backend.services.employee_access import bind_connection_employee
 
 
 @pytest.mark.asyncio
@@ -47,7 +47,7 @@ async def test_connection_analysis_settings_override_tenant_defaults(
 
 
 @pytest.mark.asyncio
-async def test_connected_session_persists_employee_from_detached_connection(
+async def test_connection_employee_binding_is_durable_and_idempotent(
     session_factory, make_service, tenant_payload
 ) -> None:
     async with session_factory() as session:
@@ -60,22 +60,15 @@ async def test_connected_session_persists_employee_from_detached_connection(
             display_name="Новый сотрудник",
         )
         session.add(connection)
+        await session.flush()
+        employee = await bind_connection_employee(session, connection)
         await session.commit()
         tenant_id = tenant.id
         connection_id = connection.id
-
-    # TelegramConnectionService returns an instance detached from the API
-    # request session. The binding must still update the persisted row.
-    async with session_factory() as session:
-        stored, employee = await ensure_connection_employee(
-            session,
-            tenant_id=tenant_id,
-            connection=connection,
-        )
-        await session.commit()
         employee_id = employee.id
-        assert stored.id == connection_id
 
+    # The shared service now binds before returning a detached connection;
+    # the API no longer needs a second transaction to make the employee visible.
     async with session_factory() as session:
         stored = await session.get(TelegramConnection, connection_id)
         employee = await session.get(Employee, employee_id)
@@ -92,11 +85,7 @@ async def test_connected_session_persists_employee_from_detached_connection(
         assert membership is not None
         assert membership.status == "active"
 
-        await ensure_connection_employee(
-            session,
-            tenant_id=tenant_id,
-            connection=stored,
-        )
+        await bind_connection_employee(session, stored)
         await session.commit()
         employee_count = await session.scalar(
             select(func.count(Employee.id)).where(

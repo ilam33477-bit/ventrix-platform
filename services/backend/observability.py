@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,7 +21,33 @@ SAFE_CONTEXT_FIELDS = {
     "retry_count",
     "status",
     "error_type",
+    "error_code",
+    "component",
 }
+
+SENSITIVE_PATTERNS = (
+    re.compile(r"(?i)(/bot)\d{6,12}:[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"(?i)\b(authorization|api[_-]?key|token|initdata|password|2fa|otp|code)"
+        r"\s*[:=]\s*[^\s,;]+"
+    ),
+    re.compile(r"(?<!\d)(?:\+?\d[\s().-]*){10,15}(?!\d)"),
+)
+
+
+def redact_log_text(value: object) -> str:
+    text = str(value)
+    for index, pattern in enumerate(SENSITIVE_PATTERNS):
+        replacement = r"\1[REDACTED]" if index == 0 else "[REDACTED]"
+        text = pattern.sub(replacement, text)
+    return text[:1000]
+
+
+def _safe_context_value(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return redact_log_text(value)
 
 
 class StructuredJSONFormatter(logging.Formatter):
@@ -29,10 +56,16 @@ class StructuredJSONFormatter(logging.Formatter):
             "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "event": record.getMessage(),
+            "event": redact_log_text(record.getMessage()),
         }
         context = getattr(record, "safe_context", {})
-        payload.update({key: value for key, value in context.items() if key in SAFE_CONTEXT_FIELDS})
+        payload.update(
+            {
+                key: _safe_context_value(value)
+                for key, value in context.items()
+                if key in SAFE_CONTEXT_FIELDS
+            }
+        )
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 

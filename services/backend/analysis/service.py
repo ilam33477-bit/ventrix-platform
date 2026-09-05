@@ -7,7 +7,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.ops_core.ai_router import RouteName
@@ -15,7 +15,10 @@ from packages.ops_core.ai_router import RouteName
 from ..database import SQLiteTransactionManager
 from ..intelligence.conversation_state import assess_conversation
 from ..intelligence.message_relevance import dialogue_is_explicitly_closed
-from ..intelligence.problem_lifecycle import initialize_problem_lifecycle
+from ..intelligence.problem_lifecycle import (
+    TERMINAL_PROBLEM_STATUSES,
+    initialize_problem_lifecycle,
+)
 from ..jobs.queue import JobDeferred, JobLease, SQLiteJobQueue
 from ..models import (
     AIUsageCall,
@@ -46,7 +49,7 @@ from ..services.product_events import add_system_event
 from ..telegram_sessions.service import TelegramConnectionService
 from .budget import ConservativeTokenEstimator, ModelInputBudget
 from .preprocessing import AnalysisBatchBuilder
-from .schema import AnalysisResponse, parse_analysis_response
+from .schema import AnalysisResponse, ReportNarrative, parse_analysis_response
 
 
 class JSONAIProvider(Protocol):
@@ -59,6 +62,7 @@ class JSONAIProvider(Protocol):
         thinking: bool = False,
         reasoning_effort: str | None = None,
         max_tokens: int = 4000,
+        user_id: str | None = None,
     ) -> tuple[str, dict[str, int]]: ...
 
 
@@ -66,6 +70,9 @@ SYSTEM_PROMPT = """Analyze each Telegram business dialog in the supplied dialogs
 Use schema_version 1.0 and exactly this structure:
 {"schema_version":"1.0","tenant_id":"...","batch_id":"...","dialog_results":[{"chat_id":"...","dialog_type":"...","summary":"...","participants":[],"detected_patterns":[],"problems":[{"event_type":"...","is_problem":true,"priority":"medium","confidence":0.8,"requires_review":false,"source_message_ids":[],"evidence":[],"summary":"...","recommended_action":"..."}],"business_outcomes":[{"outcome_type":"call_scheduled","explicitly_supported":true,"confidence":0.9,"source_message_ids":[],"summary":"...","amount":null,"currency":null}]}],"usage":{"input_tokens":0,"output_tokens":0}}.
 Never invent source message IDs or facts. Use the tenant profile and local features supplied.
+An attachment placeholder contains metadata only. Without a transcript or explicit text, never
+invent the contents of voice, video, image or document media and never treat media alone as a
+question, complaint, promise, interest, sale or unresolved problem.
 Never transfer facts, participants, message IDs, evidence, or conclusions between dialogs. Return one dialog_result for every supplied dialog id.
 Use only these event_type values: client_without_answer, customer_complaint,
 customer_question, commitment_risk, overdue_commitment, payment_risk, deal_risk,
@@ -95,7 +102,9 @@ All user-facing summary and recommended_action values must be written in Russian
 Do not translate names, usernames or verbatim evidence. Keep JSON keys and enum values
 in the required English schema. Emit client_without_answer only when supplied data
 explicitly proves that the configured response deadline has already passed.
-Extract business_outcomes only from literal evidence in the same dialog. A call is
+Extract business_outcomes only from literal evidence in the same dialog. Confirmed
+interest requires an explicit positive customer response or request for details; an
+employee pitch alone is not interest. A call is
 scheduled only when its time/date or explicit agreement is confirmed. A sale is
 confirmed only when purchase, payment or order acceptance is explicit; never treat a
 pitch, price discussion or client interest as a sale. Set explicitly_supported=false
@@ -253,7 +262,7 @@ class AnalysisPipelineService:
                 correlation_id=run.correlation_id,
                 is_heavy=True,
                 category="ai_heavy",
-                cost_class="heavy",
+                cost_class="ai_heavy",
                 max_attempts=3,
             )
         if not job.payload.get("tenant_run_id") and job.job_type != "analysis.deep":
@@ -267,7 +276,7 @@ class AnalysisPipelineService:
                 correlation_id=run.correlation_id,
                 is_heavy=True,
                 category="report",
-                cost_class="heavy",
+                cost_class="ai_heavy",
                 max_attempts=3,
             )
         if job.job_type == "analysis.deep" and not batch_ids:
@@ -319,6 +328,7 @@ class AnalysisPipelineService:
             thinking=deep,
             reasoning_effort="high" if deep else None,
             max_tokens=self.model_budget.max_output_tokens,
+            user_id=batch.tenant_id,
         )
         repaired = False
         try:
@@ -333,6 +343,7 @@ class AnalysisPipelineService:
                 thinking=deep,
                 reasoning_effort="high" if deep else None,
                 max_tokens=self.model_budget.max_output_tokens,
+                user_id=batch.tenant_id,
             )
             parsed, repaired = parse_analysis_response(raw)
             self._validate_identity(parsed, batch)
@@ -554,6 +565,9 @@ class AnalysisPipelineService:
                 token_budget=self.token_budget,
                 metrics_json={
                     "history_window_days": int(job.payload.get("history_window_days", 30)),
+                    "report_window_days": int(
+                        job.payload.get("report_window_days", 1)
+                    ),
                     "tenant_run_id": job.payload.get("tenant_run_id"),
                 },
                 correlation_id=job.id,
@@ -597,6 +611,9 @@ class AnalysisPipelineService:
                 token_budget=self.token_budget,
                 metrics_json={
                     "history_window_days": int(job.payload.get("history_window_days", 30)),
+                    "report_window_days": int(
+                        job.payload.get("report_window_days", 1)
+                    ),
                     "expected_connection_ids": [item.id for item in connections],
                 },
                 correlation_id=correlation_id,
@@ -905,7 +922,32 @@ class AnalysisPipelineService:
                 if run.trigger == "scheduled"
                 else history_window_days
             )
-            period_start = self._aware(run.started_at) - timedelta(days=report_window_days)
+            if run.trigger == "scheduled":
+                report_window_days = max(
+                    1, int((run.metrics_json or {}).get("report_window_days", 1))
+                )
+            now = datetime.now(UTC)
+            planned_end = self._aware(run.report_due_at) if run.report_due_at else now
+            period_end = min(now, planned_end)
+            previous_period_end = None
+            if run.trigger == "scheduled":
+                previous_period_end = await session.scalar(
+                    select(Report.period_end)
+                    .join(AnalysisRun, AnalysisRun.id == Report.analysis_run_id)
+                    .where(
+                        Report.tenant_id == run.tenant_id,
+                        AnalysisRun.trigger == "scheduled",
+                        Report.analysis_run_id != run.id,
+                        Report.period_end < period_end,
+                    )
+                    .order_by(Report.period_end.desc())
+                    .limit(1)
+                )
+            period_start = (
+                self._aware(previous_period_end)
+                if previous_period_end is not None
+                else period_end - timedelta(days=report_window_days)
+            )
             monitored_dialog_ids = select(TelegramDialog.id).where(
                 TelegramDialog.tenant_id == run.tenant_id,
                 TelegramDialog.selected.is_(True),
@@ -915,7 +957,11 @@ class AnalysisPipelineService:
                 await session.scalars(
                     select(OperationalProblem).where(
                         OperationalProblem.tenant_id == run.tenant_id,
-                        OperationalProblem.occurred_at >= period_start,
+                        OperationalProblem.occurred_at < period_end,
+                        or_(
+                            OperationalProblem.occurred_at >= period_start,
+                            OperationalProblem.status.not_in(TERMINAL_PROBLEM_STATUSES),
+                        ),
                         OperationalProblem.dialog_id.in_(monitored_dialog_ids),
                         OperationalProblem.status != "false_positive",
                     )
@@ -926,6 +972,7 @@ class AnalysisPipelineService:
                     select(Signal).where(
                         Signal.tenant_id == run.tenant_id,
                         Signal.detected_at >= period_start,
+                        Signal.detected_at < period_end,
                         Signal.dialog_id.in_(monitored_dialog_ids),
                         Signal.status != "suppressed",
                     )
@@ -936,6 +983,7 @@ class AnalysisPipelineService:
                     select(Commitment).where(
                         Commitment.tenant_id == run.tenant_id,
                         (Commitment.created_at >= period_start) | (Commitment.status == "open"),
+                        Commitment.created_at < period_end,
                         Commitment.dialog_id.in_(monitored_dialog_ids),
                     )
                 )
@@ -974,11 +1022,12 @@ class AnalysisPipelineService:
                     select(func.count(TelegramMessage.id)).where(
                         TelegramMessage.tenant_id == run.tenant_id,
                         TelegramMessage.dialog_id.in_(monitored_dialog_ids),
+                        TelegramMessage.deleted_at.is_(None),
                         TelegramMessage.sent_at >= period_start,
+                        TelegramMessage.sent_at < period_end,
                     )
                 )
             )
-            period_end = datetime.now(UTC)
             period_span = period_end - period_start
             previous_period_start = period_start - period_span
             current_messages = list(
@@ -988,7 +1037,7 @@ class AnalysisPipelineService:
                         TelegramMessage.dialog_id.in_(monitored_dialog_ids),
                         TelegramMessage.deleted_at.is_(None),
                         TelegramMessage.sent_at >= period_start,
-                        TelegramMessage.sent_at <= period_end,
+                        TelegramMessage.sent_at < period_end,
                     )
                 )
             )
@@ -1043,15 +1092,64 @@ class AnalysisPipelineService:
         for row in employee_report["employees"]:
             row.update(performance_by_employee.get(row["employee_id"], {}))
         client_report = self._client_report(dialogs, commitments, problems)
+        active_problems = [
+            item for item in problems if item.status not in TERMINAL_PROBLEM_STATUSES
+        ]
+        new_problems = [
+            item for item in problems if self._aware(item.occurred_at) >= period_start
+        ]
         dialog_by_id = {item.id: item for item in dialogs}
         employee_by_id = {item.id: item for item in employees}
+        for row in employee_report["employees"]:
+            employee_id = row["employee_id"]
+            row["attention_items"] = [
+                {
+                    "problem_id": item.id,
+                    "priority": item.priority,
+                    "dialog": (
+                        f"@{dialog_by_id[item.dialog_id].username}"
+                        if item.dialog_id in dialog_by_id
+                        and dialog_by_id[item.dialog_id].username
+                        else dialog_by_id[item.dialog_id].title
+                        if item.dialog_id in dialog_by_id
+                        else "Диалог"
+                    ),
+                    "age_minutes": max(
+                        0,
+                        round(
+                            (period_end - self._aware(item.occurred_at)).total_seconds()
+                            / 60
+                        ),
+                    ),
+                    "evidence": item.evidence[:400],
+                    "recommended_action": item.recommended_action,
+                }
+                for item in sorted(
+                    (
+                        problem
+                        for problem in active_problems
+                        if problem.responsible_employee_id == employee_id
+                    ),
+                    key=lambda problem: self._aware(problem.occurred_at),
+                )[:8]
+            ]
         important_dialogs = {
             "rows": [
                 {
                     "problem_id": item.id,
+                    "employee_id": item.responsible_employee_id,
                     "priority": item.priority,
                     "title": item.explanation,
+                    "evidence": item.evidence[:400],
                     "recommended_action": item.recommended_action,
+                    "occurred_at": self._aware(item.occurred_at).isoformat(),
+                    "age_minutes": max(
+                        0,
+                        round(
+                            (period_end - self._aware(item.occurred_at)).total_seconds()
+                            / 60
+                        ),
+                    ),
                     "dialog_title": dialog_by_id[item.dialog_id].title
                     if item.dialog_id in dialog_by_id
                     else "Диалог",
@@ -1063,7 +1161,7 @@ class AnalysisPipelineService:
                     else None,
                 }
                 for item in sorted(
-                    problems,
+                    active_problems,
                     key=lambda problem: (
                         {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(problem.priority, 0),
                         problem.occurred_at,
@@ -1080,7 +1178,7 @@ class AnalysisPipelineService:
             "clients": sum(item.dialog_type in {"personal", "group"} for item in dialogs),
             "active_groups": sum(item.status == "active" for item in groups),
             "resolved_problems": sum(item.status == "resolved" for item in problems),
-            "unresolved_problems": sum(item.status != "resolved" for item in problems),
+            "unresolved_problems": len(active_problems),
             "open_commitments": sum(item.status == "open" for item in commitments),
         }
         metrics = {
@@ -1088,14 +1186,21 @@ class AnalysisPipelineService:
             "patterns": sum(
                 len((batch.result_json or {}).get("dialog_results", [])) for batch in batches
             ),
-            "problems": len(problems),
-            "high": sum(item.priority in {"high", "critical"} for item in problems),
-            "medium": sum(item.priority == "medium" for item in problems),
-            "low": sum(item.priority in {"low", "informational"} for item in problems),
+            "problems": len(new_problems),
+            "open_problems": len(active_problems),
+            "carried_open_problems": sum(
+                self._aware(item.occurred_at) < period_start for item in active_problems
+            ),
+            "high": sum(item.priority in {"high", "critical"} for item in new_problems),
+            "medium": sum(item.priority == "medium" for item in new_problems),
+            "low": sum(
+                item.priority in {"low", "informational"} for item in new_problems
+            ),
             "analysis_partial": int(run.failed_batches > 0),
             "failed_analysis_batches": int(run.failed_batches),
         }
         narrative, narrative_usage, narrative_duration_ms = await self._report_narrative(
+            tenant_id=run.tenant_id,
             trigger=run.trigger,
             history_window_days=report_window_days,
             period_start=period_start,
@@ -1150,6 +1255,9 @@ class AnalysisPipelineService:
                 if (
                     recent_metrics.get("messages") == metrics["messages"]
                     and recent_metrics.get("problems") == metrics["problems"]
+                    and recent_metrics.get("open_problems") == metrics["open_problems"]
+                    and recent_metrics.get("carried_open_problems")
+                    == metrics["carried_open_problems"]
                 ):
                     duplicate = recent_report
                     break
@@ -1162,8 +1270,8 @@ class AnalysisPipelineService:
                         tenant_id=current.tenant_id,
                         analysis_run_id=current.id,
                         status="ready",
-                        period_start=current.started_at - timedelta(days=report_window_days),
-                        period_end=now,
+                        period_start=period_start,
+                        period_end=period_end,
                         due_at=current.report_due_at,
                         ready_at=now,
                         delivery_status="pending",
@@ -1180,7 +1288,7 @@ class AnalysisPipelineService:
                     "important_dialogs": important_dialogs,
                     "ai_narrative": narrative,
                     "recommendations": {
-                        "items": [item.recommended_action for item in problems[:20]]
+                        "items": [item.recommended_action for item in active_problems[:20]]
                     },
                 }
                 for position, (key, data) in enumerate(sections.items()) if report else ():
@@ -1317,6 +1425,7 @@ class AnalysisPipelineService:
     async def _report_narrative(
         self,
         *,
+        tenant_id: str,
         trigger: str,
         history_window_days: int,
         period_start: datetime,
@@ -1369,21 +1478,21 @@ class AnalysisPipelineService:
                 system_prompt=prompt,
                 payload=payload,
                 max_tokens=1800,
+                user_id=tenant_id,
             )
             normalized = raw.strip()
             if normalized.startswith("```"):
                 normalized = re.sub(
                     r"^```(?:json)?\s*|\s*```$", "", normalized, flags=re.IGNORECASE
                 )
-            parsed = json.loads(normalized)
-            if (
-                not isinstance(parsed, dict)
-                or not str(parsed.get("executive_summary") or "").strip()
-            ):
-                raise ValueError("invalid report narrative")
+            parsed = ReportNarrative.model_validate(json.loads(normalized)).model_dump()
             narrative = {
                 **fallback,
-                **{key: parsed.get(key, fallback[key]) for key in fallback if key != "period_kind"},
+                **{
+                    key: parsed.get(key, fallback[key])
+                    for key in fallback
+                    if key != "period_kind"
+                },
             }
             narrative["period_kind"] = period_kind
             return narrative, usage, int((time.perf_counter() - started) * 1000)
@@ -1433,7 +1542,7 @@ class AnalysisPipelineService:
                     ),
                     "resolved": sum(item.status == "resolved" for item in employee_problems),
                     "clients_waiting": sum(
-                        item.status != "resolved"
+                        item.status not in TERMINAL_PROBLEM_STATUSES
                         and item.problem_type in {"waiting_customer", "client_without_answer"}
                         for item in employee_problems
                     ),
@@ -1458,16 +1567,19 @@ class AnalysisPipelineService:
                     "dialog_id": dialog.id,
                     "title": dialog.title,
                     "open_questions": sum(
-                        item.status != "resolved" and item.problem_type == "customer_question"
+                        item.status not in TERMINAL_PROBLEM_STATUSES
+                        and item.problem_type == "customer_question"
                         for item in dialog_problems
                     ),
                     "open_commitments": sum(item.status == "open" for item in dialog_commitments),
                     "response_delays": sum(
-                        item.problem_type in {"waiting_customer", "client_without_answer"}
+                        item.status not in TERMINAL_PROBLEM_STATUSES
+                        and item.problem_type in {"waiting_customer", "client_without_answer"}
                         for item in dialog_problems
                     ),
                     "unresolved_problems": sum(
-                        item.status != "resolved" for item in dialog_problems
+                        item.status not in TERMINAL_PROBLEM_STATUSES
+                        for item in dialog_problems
                     ),
                 }
             )

@@ -209,22 +209,41 @@ def build_report_pdf(
     employee_rows = list(sections.get("employee_report", {}).get("employees") or [])
     if employee_rows:
         story.append(Paragraph("Команда и клиентская работа", heading))
-        data: list[list[Any]] = [["Сотрудник", "Диалоги", "Ответ", "Созвоны", "Продажи", "Задачи"]]
+        data: list[list[Any]] = [
+            [
+                "Сотрудник",
+                "Диалоги",
+                "Ответили / время",
+                "Интерес / созвон",
+                "Продажи",
+                "Задачи",
+            ]
+        ]
         for row in employee_rows:
             response = row.get("average_response_minutes")
+            contacted = int(row.get("response_rate_denominator", 0))
+            responded = int(row.get("responded_dialogs", 0))
+            response_rate = _number(row.get("response_rate_percent", 0))
+            response_value = (
+                f"{responded}/{contacted} · {response_rate}%"
+                if contacted
+                else "Нет контактов"
+            )
+            if response is not None:
+                response_value += f"<br/>{_number(response)} мин."
             data.append(
                 [
                     Paragraph(_text(row.get("name") or "Сотрудник"), body),
                     int(row.get("active_dialogs", 0)),
-                    f"{_number(response)} мин." if response is not None else "—",
-                    int(row.get("calls_scheduled", 0)),
+                    Paragraph(response_value, small),
+                    f"{int(row.get('interests_confirmed', 0))} / {int(row.get('calls_scheduled', 0))}",
                     int(row.get("sales_confirmed", 0)),
                     int(row.get("open_promises", 0)) + int(row.get("clients_waiting", 0)),
                 ]
             )
         employee_table = Table(
             data,
-            colWidths=[55 * mm, 22 * mm, 27 * mm, 22 * mm, 21 * mm, 21 * mm],
+            colWidths=[50 * mm, 18 * mm, 34 * mm, 28 * mm, 18 * mm, 20 * mm],
             repeatRows=1,
         )
         employee_table.setStyle(
@@ -248,6 +267,20 @@ def build_report_pdf(
                 f"Исходящих сообщений: <b>{int(row.get('messages_sent', 0))}</b>",
                 f"Активных дней: <b>{int(row.get('active_days', 0))}</b>",
             ]
+            contacted = int(row.get("response_rate_denominator", 0))
+            if contacted:
+                details.append(
+                    "Ответили: "
+                    f"<b>{int(row.get('responded_dialogs', 0))} из {contacted} "
+                    f"({_number(row.get('response_rate_percent', 0))}%)</b>"
+                )
+            details.extend(
+                [
+                    f"Подтверждённый интерес: <b>{int(row.get('interests_confirmed', 0))}</b>",
+                    f"Подтверждённых созвонов: <b>{int(row.get('calls_scheduled', 0))}</b>",
+                    f"Подтверждённых продаж: <b>{int(row.get('sales_confirmed', 0))}</b>",
+                ]
+            )
             window = row.get("average_daily_activity_window_minutes")
             if window is not None:
                 details.append(

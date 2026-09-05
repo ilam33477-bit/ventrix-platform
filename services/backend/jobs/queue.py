@@ -26,6 +26,19 @@ HEAVY_JOB_TYPES = {
     "report.client",
     "report.company",
 }
+AI_PROVIDER_COST_CLASSES = frozenset({"ai_fast", "ai_heavy"})
+AI_PROVIDER_JOB_TYPES = frozenset({
+    "signal.ai_triage",
+    "ai_batch_analysis",
+    "feedback.synthesize",
+    "problem.evaluate",
+    "analysis.hourly",
+    "report_generation",
+    "report.employee",
+    "report.client",
+    "report.company",
+    "ai.interactive",
+})
 
 JOB_PRIORITY = {
     "P0": 0,
@@ -69,6 +82,8 @@ class SQLiteJobQueue:
         max_active_tenant_jobs: int = 2,
         tenant_max_active_heavy_jobs: int = 1,
         category_limits: dict[str, int] | None = None,
+        resource_limits: dict[str, tuple[frozenset[str], int]] | None = None,
+        resource_job_types: dict[str, frozenset[str]] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.transactions = SQLiteTransactionManager(session_factory)
@@ -80,6 +95,8 @@ class SQLiteJobQueue:
             "sync": 1,
             "report": 1,
         }
+        self.resource_limits = resource_limits or {}
+        self.resource_job_types = resource_job_types or {}
 
     async def enqueue(
         self,
@@ -209,12 +226,41 @@ class SQLiteJobQueue:
                     ),
                 )
             )
+            tenant_lane = func.coalesce(BackgroundJob.tenant_id, BackgroundJob.id)
+            ranked = (
+                select(
+                    BackgroundJob.id.label("job_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            tenant_lane,
+                            BackgroundJob.category,
+                            BackgroundJob.is_heavy,
+                            BackgroundJob.cost_class,
+                        ),
+                        order_by=(
+                            BackgroundJob.priority.asc(),
+                            BackgroundJob.scheduled_at.asc(),
+                            BackgroundJob.created_at.asc(),
+                        ),
+                    )
+                    .label("lane_rank"),
+                )
+                .where(*filters)
+                .subquery()
+            )
             candidates = list(
                 await session.scalars(
                     select(BackgroundJob)
-                    .where(*filters)
+                    .join(ranked, ranked.c.job_id == BackgroundJob.id)
+                    .outerjoin(
+                        TenantQueueState,
+                        TenantQueueState.tenant_id == BackgroundJob.tenant_id,
+                    )
+                    .where(ranked.c.lane_rank == 1)
                     .order_by(
                         BackgroundJob.priority.asc(),
+                        TenantQueueState.last_claimed_at.asc().nulls_first(),
                         BackgroundJob.scheduled_at.asc(),
                         BackgroundJob.created_at.asc(),
                     )
@@ -264,6 +310,23 @@ class SQLiteJobQueue:
                     )
                 ).all()
             )
+            resource_counts = {
+                name: int(
+                    await session.scalar(
+                        select(func.count(BackgroundJob.id)).where(
+                            BackgroundJob.status == "running",
+                            or_(
+                                BackgroundJob.cost_class.in_(cost_classes),
+                                BackgroundJob.job_type.in_(
+                                    self.resource_job_types.get(name, frozenset())
+                                ),
+                            ),
+                        )
+                    )
+                    or 0
+                )
+                for name, (cost_classes, _limit) in self.resource_limits.items()
+            }
             eligible = []
             for candidate in candidates:
                 if candidate.tenant_id:
@@ -283,6 +346,15 @@ class SQLiteJobQueue:
                 if (
                     category_limit is not None
                     and category_counts.get(candidate.category, 0) >= category_limit
+                ):
+                    continue
+                if any(
+                    (
+                        candidate.cost_class in cost_classes
+                        or candidate.job_type in self.resource_job_types.get(name, frozenset())
+                    )
+                    and resource_counts[name] >= limit
+                    for name, (cost_classes, limit) in self.resource_limits.items()
                 ):
                     continue
                 eligible.append(candidate)
@@ -397,7 +469,8 @@ class SQLiteJobQueue:
             job.last_error = f"{type(error).__name__}: execution failed"
             job.locked_by = None
             job.locked_at = None
-            if job.attempts >= job.max_attempts:
+            retryable = bool(getattr(error, "retryable", True))
+            if not retryable or job.attempts >= job.max_attempts:
                 job.status = "failed"
                 job.finished_at = datetime.now(UTC)
             else:
@@ -432,7 +505,7 @@ class SQLiteJobQueue:
                 job.last_error = "WorkerRestart: stale lease recovered"
                 job.locked_by = None
                 job.locked_at = None
-                if job.attempts >= job.max_attempts:
+                if job.job_type == "ai.interactive" or job.attempts >= job.max_attempts:
                     job.status = "failed"
                     job.finished_at = now
                 else:

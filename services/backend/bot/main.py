@@ -11,6 +11,8 @@ from aiogram.fsm.storage.memory import SimpleEventIsolation
 
 from ..config import get_settings
 from ..database import get_session_factory
+from ..observability import configure_structured_logging
+from ..services.runtime_monitoring import runtime_heartbeat_loop
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..services.telegram import TelegramBotVerifier
 from .auth import OwnerOnlyMiddleware
@@ -23,9 +25,7 @@ async def run() -> None:
     settings = get_settings()
     session_factory = get_session_factory()
     settings = await load_runtime_secret_overrides(session_factory, settings)
-    logging.basicConfig(
-        level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    configure_structured_logging(settings.log_level)
     # Telegram embeds bot tokens in request URLs. Never allow HTTP client URL logs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -39,13 +39,26 @@ async def run() -> None:
     dispatcher.update.outer_middleware(OwnerOnlyMiddleware(settings.platform_owner_telegram_id))
     dispatcher.callback_query.outer_middleware(ActiveFlowGuardMiddleware())
     dispatcher.include_router(router)
-    await dispatcher.start_polling(
-        bot,
-        settings=settings,
-        session_factory=session_factory,
-        telegram_verifier=TelegramBotVerifier(settings.telegram_api_base_url),
-        allowed_updates=dispatcher.resolve_used_update_types(),
+    heartbeat = asyncio.create_task(
+        runtime_heartbeat_loop(
+            session_factory,
+            "owner_bot",
+            interval_seconds=settings.worker_heartbeat_seconds,
+            details={"release_revision": settings.release_revision},
+        ),
+        name="owner-bot-runtime-heartbeat",
     )
+    try:
+        await dispatcher.start_polling(
+            bot,
+            settings=settings,
+            session_factory=session_factory,
+            telegram_verifier=TelegramBotVerifier(settings.telegram_api_base_url),
+            allowed_updates=dispatcher.resolve_used_update_types(),
+        )
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 def main() -> None:

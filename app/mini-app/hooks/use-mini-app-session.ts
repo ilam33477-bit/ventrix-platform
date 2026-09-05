@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ClientApiError, VentrixClientApi } from "../api/client";
 import { initializeTelegramMiniApp } from "../telegram/bridge";
@@ -13,14 +13,20 @@ export function useMiniAppSession() {
   const [error, setError] = useState("");
   const [api, setApi] = useState<VentrixClientApi | null>(null);
   const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+  const loadGeneration = useRef(0);
 
   const load = useCallback(async (client: VentrixClientApi) => {
+    const generation = ++loadGeneration.current;
     setLaunchState("authenticating");
+    setSession(null);
     setError("");
     try {
-      setSession(await client.loadSession());
+      const nextSession = await client.loadSession();
+      if (generation !== loadGeneration.current) return;
+      setSession(nextSession);
       setLaunchState("authenticated");
     } catch (reason) {
+      if (generation !== loadGeneration.current) return;
       if (reason instanceof ClientApiError && [401, 403].includes(reason.status)) {
         setLaunchState("denied");
       } else {
@@ -45,6 +51,7 @@ export function useMiniAppSession() {
       void load(client);
     }, 0);
     return () => {
+      loadGeneration.current += 1;
       window.clearTimeout(timer);
       cleanup?.();
     };

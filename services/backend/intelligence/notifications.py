@@ -24,14 +24,17 @@ from ..models import (
     NotificationLog,
     OperationalProblem,
     Report,
+    ReportSection,
     Signal,
     TelegramConnection,
     TelegramDialog,
     TelegramMessage,
     Tenant,
+    TenantMembership,
     TenantSettings,
 )
 from ..services.encryption import EncryptionService
+from ..services.group_access import group_is_approved
 from ..timezones import timezone_info
 
 
@@ -74,6 +77,7 @@ class NotificationPolicyService:
         manager_allowed = criticality >= settings.manager_notification_threshold
         group_allowed = bool(
             group
+            and group_is_approved(group)
             and group.status == "active"
             and group.notifications_enabled
             # Group controls are managed per integration. Do not let the
@@ -132,12 +136,22 @@ class TelegramBotNotificationSender:
         reply_markup: dict | None = None,
     ) -> None:
         async with self.session_factory() as session:
+            group = None
+            if int(chat_id) < 0:
+                group = await session.scalar(select(GroupIntegration).where(
+                    GroupIntegration.tenant_id == tenant_id,
+                    GroupIntegration.telegram_chat_id == int(chat_id),
+                ))
+                if group is None or not group_is_approved(group) or group.status != "active" or not group.notifications_enabled:
+                    raise TelegramRecipientUnavailable("group_not_approved")
             bot = await session.scalar(
                 select(BotInstance)
                 .where(
                     BotInstance.tenant_id == tenant_id,
                     BotInstance.enabled.is_(True),
+                    BotInstance.is_active.is_(True),
                     BotInstance.deleted_at.is_(None),
+                    *((BotInstance.id == group.bot_instance_id,) if group is not None else ()),
                 )
                 .order_by(BotInstance.created_at.desc())
                 .limit(1)
@@ -145,6 +159,8 @@ class TelegramBotNotificationSender:
             if bot is None:
                 raise RuntimeError("active client bot is unavailable")
             secret = await session.get(EncryptedSecret, bot.secret_id)
+            if secret is None or secret.deleted_at is not None:
+                raise TelegramRecipientUnavailable("bot_secret_unavailable")
             token = self.encryption.decrypt(secret.ciphertext)
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -158,9 +174,34 @@ class TelegramBotNotificationSender:
                         **({"reply_markup": reply_markup} if reply_markup else {}),
                     },
                 )
-                response.raise_for_status()
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = {}
+                code = data.get("error_code", response.status_code)
+                if code == 429:
+                    delay = max(1, int((data.get("parameters") or {}).get("retry_after", 30)))
+                    raise JobDeferred(delay, "telegram_delivery_flood_wait")
+                migrated = (data.get("parameters") or {}).get("migrate_to_chat_id")
+                if code == 403 or migrated:
+                    if group is not None:
+                        async with self.session_factory() as session:
+                            current = await session.get(GroupIntegration, group.id)
+                            if current and current.bot_instance_id == bot.id:
+                                current.status = "revoked"
+                                current.approved_at = None
+                                current.approved_by_telegram_user_id = None
+                                await session.commit()
+                    raise TelegramRecipientUnavailable("group_migrated_reconnect" if migrated else "telegram_recipient_unavailable")
+                if response.is_error or data.get("ok") is not True:
+                    # HTTPStatusError includes the token-bearing request URL.
+                    raise RuntimeError(f"telegram_delivery_failed_{code}")
         finally:
             token = ""
+
+
+class TelegramRecipientUnavailable(RuntimeError):
+    pass
 
 
 class NotificationOrchestrator:
@@ -229,6 +270,7 @@ class NotificationOrchestrator:
                         GroupIntegration.tenant_id == signal.tenant_id,
                         GroupIntegration.status == "active",
                         GroupIntegration.notifications_enabled.is_(True),
+                        GroupIntegration.approved_at.is_not(None),
                     )
                 )
             )
@@ -452,7 +494,7 @@ class NotificationOrchestrator:
                     f"<i>{event_time:%d.%m.%Y %H:%M}</i>"
                 )
             rows: list[list[dict[str, str]]] = []
-            if current_problem:
+            if current_problem and not is_group:
                 rows.append(
                     [
                         {"text": "Решено", "callback_data": f"np:close:{current_problem.id}"},
@@ -638,6 +680,116 @@ class NotificationDispatcher:
         self.sender = sender
         self.transactions = SQLiteTransactionManager(session_factory)
 
+    async def _recipient_error(self, session: AsyncSession, log: NotificationLog) -> str | None:
+        """Revalidate queued recipients; the original decision may now be stale."""
+        tenant = await session.get(Tenant, log.tenant_id)
+        if tenant is None or tenant.deleted_at is not None or tenant.status != "active":
+            return "tenant_inactive"
+        if log.destination_type == "group":
+            group = (
+                await session.get(GroupIntegration, log.group_integration_id)
+                if log.group_integration_id
+                else None
+            )
+            if (
+                group is None
+                or group.tenant_id != log.tenant_id
+                or group.status != "active"
+                or not group.notifications_enabled
+                or not group_is_approved(group)
+                or str(group.telegram_chat_id) != log.destination_id
+            ):
+                return "group_access_revoked"
+            bot = await session.scalar(select(BotInstance).where(
+                BotInstance.id == group.bot_instance_id, BotInstance.tenant_id == log.tenant_id,
+                BotInstance.enabled.is_(True), BotInstance.is_active.is_(True),
+                BotInstance.deleted_at.is_(None),
+            ))
+            return None if bot else "group_bot_unavailable"
+        if log.destination_type == "manager":
+            if str(tenant.owner_telegram_user_id) == log.destination_id:
+                return None
+            member = await session.scalar(
+                select(TenantMembership).where(
+                    TenantMembership.tenant_id == log.tenant_id,
+                    TenantMembership.telegram_user_id == log.destination_id,
+                    TenantMembership.status == "active",
+                    TenantMembership.role.in_(("owner", "manager")),
+                )
+            )
+            return None if member else "manager_access_revoked"
+        if log.destination_type != "employee":
+            return "unknown_destination_type"
+        employee = await session.get(Employee, log.employee_id) if log.employee_id else None
+        if (
+            employee is None
+            or employee.tenant_id != log.tenant_id
+            or employee.status != "active"
+            or not employee.notifications_enabled
+            or str(employee.telegram_user_id) != log.destination_id
+        ):
+            return "employee_access_revoked"
+        member = await session.scalar(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == log.tenant_id,
+                TenantMembership.employee_id == employee.id,
+                TenantMembership.telegram_user_id == employee.telegram_user_id,
+                TenantMembership.status == "active",
+                TenantMembership.role.in_(("employee", "manager", "owner")),
+            )
+        )
+        if member is None:
+            return "membership_revoked"
+        if log.problem_id:
+            problem = await session.get(OperationalProblem, log.problem_id)
+            if (
+                problem is None
+                or problem.tenant_id != log.tenant_id
+                or problem.responsible_employee_id != employee.id
+            ):
+                return "problem_reassigned"
+        elif log.signal_id:
+            signal = await session.get(Signal, log.signal_id)
+            if (
+                signal is None
+                or signal.tenant_id != log.tenant_id
+                or signal.employee_id != employee.id
+            ):
+                return "signal_reassigned"
+        elif log.commitment_id:
+            commitment = await session.get(Commitment, log.commitment_id)
+            if (
+                commitment is None
+                or commitment.tenant_id != log.tenant_id
+                or commitment.responsible_employee_id != employee.id
+            ):
+                return "commitment_reassigned"
+        elif report_id := str((log.payload_json or {}).get("report_id") or ""):
+            report = await session.scalar(
+                select(Report).where(
+                    Report.id == report_id,
+                    Report.tenant_id == log.tenant_id,
+                    Report.status == "ready",
+                )
+            )
+            section = await session.scalar(
+                select(ReportSection).where(
+                    ReportSection.report_id == report_id,
+                    ReportSection.tenant_id == log.tenant_id,
+                    ReportSection.section_key == "employee_report",
+                )
+            )
+            rows = (section.data_json if section else {}).get("employees") or []
+            if report is None or not any(
+                isinstance(row, dict) and row.get("employee_id") == employee.id
+                for row in rows
+            ):
+                return "report_access_revoked"
+        else:
+            # A deleted source must not leave a deliverable snapshot of private data.
+            return "employee_source_missing"
+        return None
+
     async def dispatch(self, job: JobLease) -> dict[str, str]:
         notification_id = str(job.payload["notification_id"])
         async with self.session_factory() as session:
@@ -649,14 +801,40 @@ class NotificationDispatcher:
             )
             if log is None:
                 raise LookupError("notification not found in tenant")
-            if log.status == "sent":
-                return {"notification_id": log.id, "status": "sent"}
+            if log.status in {"sent", "cancelled", "delivery_uncertain"}:
+                return {"notification_id": log.id, "status": log.status}
+            recipient_error = await self._recipient_error(session, log)
             tenant_id = log.tenant_id
             destination_id = log.destination_id
             text = str(log.payload_json["text"])
+        if recipient_error:
+            await self._mark(notification_id, "cancelled", recipient_error)
+            return {"notification_id": notification_id, "status": "cancelled"}
         try:
             reply_markup = log.payload_json.get("reply_markup")
+            if log.destination_type == "group":
+                # Rebuild old queued cards too: no shared callbacks, quotes or personal reports.
+                async with self.session_factory() as session:
+                    group = await session.get(GroupIntegration, log.group_integration_id)
+                    bot = await session.get(BotInstance, group.bot_instance_id)
+                    parameter = "group_connected"
+                    text = "⚠️ <b>Рабочая ситуация требует внимания</b>\n\nОткройте личный чат с ботом, чтобы посмотреть доступную вам карточку."
+                    if log.problem_id:
+                        parameter = f"problem_{log.problem_id}"
+                    elif log.payload_json.get("report_id"):
+                        parameter = f"report_{log.payload_json['report_id']}"
+                        text = "📊 <b>Сводка проекта готова</b>\n\nОткройте личный чат с ботом. Он покажет только доступные вам данные."
+                    if log.payload_json.get("correction"):
+                        text = "ℹ️ Предварительный сигнал проверен: критическая ситуация не подтверждена."
+                    reply_markup = {"inline_keyboard": [[{
+                        "text": "Открыть в Ventrix AI", "url": private_bot_link(bot.username, parameter)
+                    }]]}
             await self.sender.send(tenant_id, destination_id, text, reply_markup)
+        except JobDeferred:
+            raise
+        except TelegramRecipientUnavailable as exc:
+            await self._mark(notification_id, "cancelled", str(exc))
+            return {"notification_id": notification_id, "status": "cancelled"}
         except httpx.RequestError:
             # Telegram may have accepted the request before the response was
             # lost. Avoid an ambiguous retry that would duplicate the alert.
@@ -797,23 +975,26 @@ class NotificationDispatcher:
             log.last_error_code = error
             if status == "sent":
                 log.sent_at = datetime.now(UTC)
+            if status in {"sent", "cancelled"}:
                 report_id = str((log.payload_json or {}).get("report_id") or "")
                 if report_id:
                     await session.flush()
-                    unsent = int(
-                        await session.scalar(
-                            select(func.count(NotificationLog.id)).where(
+                    delivery_states = list(
+                        await session.scalars(
+                            select(NotificationLog.status).where(
                                 NotificationLog.tenant_id == log.tenant_id,
                                 NotificationLog.deduplication_key.like(f"report:{report_id}:%"),
-                                NotificationLog.status != "sent",
                             )
                         )
-                        or 0
                     )
-                    if unsent == 0:
+                    if delivery_states and set(delivery_states) <= {"sent", "cancelled"}:
                         report = await session.get(Report, report_id)
                         if report is not None and report.tenant_id == log.tenant_id:
-                            report.delivery_status = "sent"
-                            report.delivered_at = log.sent_at
+                            report.delivery_status = (
+                                "sent" if "cancelled" not in delivery_states
+                                else "partial" if "sent" in delivery_states else "cancelled"
+                            )
+                            if "sent" in delivery_states:
+                                report.delivered_at = datetime.now(UTC)
 
         await self.transactions.run(write)

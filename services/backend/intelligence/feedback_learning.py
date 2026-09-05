@@ -108,6 +108,7 @@ class TenantFeedbackLearningService:
                 "false_positive_examples": examples,
             },
             max_tokens=1200,
+            user_id=tenant_id,
         )
         learned = LearnedFeedback.model_validate_json(repair_json(raw))
         duration_ms = int((time.perf_counter() - started) * 1000)

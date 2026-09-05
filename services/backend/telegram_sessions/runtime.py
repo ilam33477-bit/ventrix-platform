@@ -30,6 +30,11 @@ from ..models import (
     TenantSettings,
 )
 from ..observability import configure_structured_logging, log_event
+from ..services.employee_activation import (
+    ACTIVATION_JOB,
+    enqueue_employee_activation,
+    start_employee_bot,
+)
 from ..services.encryption import EncryptionService
 from ..services.system_secrets import load_runtime_secret_overrides
 from .gateway import MessageBatch, RemoteMessage, TelegramFloodWait, TelethonGateway
@@ -110,6 +115,12 @@ class TelegramSessionActor:
             try:
                 await self.client.connect()
                 await self._health("running", reconnects=reconnects)
+                async def schedule_activation(session: AsyncSession) -> None:
+                    current = await session.get(TelegramConnection, self.connection.id)
+                    if current is not None:
+                        await enqueue_employee_activation(session, current)
+
+                await self.transactions.run(schedule_activation)
                 if not await self.queue.has_unfinished(
                     "telegram.catch_up", telegram_account_id=self.connection.id
                 ):
@@ -167,6 +178,7 @@ class TelegramSessionActor:
                 "telegram.refresh_catalog": self._refresh_catalog_job,
                 "telegram.prepare_connection": self._prepare_connection_job,
                 "telegram.send_message": self._send_message_job,
+                ACTIVATION_JOB: self._start_employee_bot_job,
             },
             allowed_categories=frozenset({"telegram_rpc"}),
             telegram_account_id=self.connection.id,
@@ -249,6 +261,9 @@ class TelegramSessionActor:
             await self.client.log_out()
         self._stopping.set()
         return {"logged_out": True}
+
+    async def _start_employee_bot_job(self, job: JobLease) -> dict[str, Any]:
+        return await start_employee_bot(self, job)
 
     async def _send_message_job(self, job: JobLease) -> dict[str, Any]:
         command_id = str(job.payload["outbound_message_id"])

@@ -463,6 +463,19 @@ def test_invoice_fast_lane_needs_invoice_metadata() -> None:
     assert "invoice_received" in {item.signal_type for item in engine.scan(invoice, [])}
 
 
+def test_voice_without_transcript_is_not_an_actionable_problem() -> None:
+    message = TelegramMessage(
+        telegram_message_id=2,
+        sent_at=datetime.now(UTC),
+        outgoing=False,
+        body_text=None,
+        sender_role="customer",
+        attachments_json=[{"kind": "voice", "mime_type": "audio/ogg"}],
+    )
+
+    assert LocalSignalEngine().scan(message, []) == []
+
+
 class FakeDraftProvider:
     async def generate_json(self, **kwargs):
         current = kwargs["payload"].get("current_draft")

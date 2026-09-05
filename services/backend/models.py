@@ -1387,6 +1387,8 @@ class GroupIntegration(StringPrimaryKeyMixin, TimestampMixin, Base):
         Integer, default=120, server_default="120", nullable=False
     )
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by_telegram_user_id: Mapped[int | None] = mapped_column(BigInteger)
     __table_args__ = (
         UniqueConstraint("tenant_id", "telegram_chat_id", name="uq_group_integration_chat"),
         CheckConstraint(

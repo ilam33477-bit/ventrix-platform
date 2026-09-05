@@ -583,7 +583,7 @@ def test_triage_json_is_strict_and_supports_one_controlled_repair() -> None:
 
 @pytest.mark.asyncio
 async def test_critical_triage_records_usage_problem_and_privacy_safe_notifications(
-    session_factory, make_service, tenant_payload, encryption_key, monkeypatch
+    session_factory, make_service, tenant_payload, encryption_key, monkeypatch, make_group_bot
 ) -> None:
     monkeypatch.setattr(
         "services.backend.intelligence.notifications.get_settings",
@@ -596,6 +596,7 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     queue = SQLiteJobQueue(session_factory)
     now = datetime.now(UTC)
     async with session_factory() as session:
+        bot = await make_group_bot(session, tenant)
         managed_connection = await session.get(TelegramConnection, connection.id)
         managed_connection.username = "employee_account"
         employee = Employee(
@@ -606,6 +607,8 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
         )
         group = GroupIntegration(
             tenant_id=tenant.id,
+            bot_instance_id=bot.id, approved_at=now,
+            approved_by_telegram_user_id=tenant.owner_telegram_user_id,
             telegram_chat_id=dialog.telegram_dialog_id,
             title="Продажи",
             status="active",
@@ -684,7 +687,8 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     group_system_button = next(
         button for button in group_buttons if button["text"] == "Открыть в Ventrix AI"
     )
-    assert group_system_button["url"].startswith("https://mini.example")
+    assert group_system_button["url"].startswith(f"https://t.me/{bot.username}?start=problem_")
+    assert all("callback_data" not in button and "web_app" not in button for button in group_buttons)
     manager_payload = next(item.payload_json for item in logs if item.destination_type == "manager")
     assert "Рабочий аккаунт:</b> @employee_account" in manager_payload["text"]
     assert "Контекст диалога" in manager_payload["text"]
@@ -832,7 +836,17 @@ async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
     assert len(first) == 1
     assert len(different_problem) == 1
     assert equivalent == []
-    assert len(critical) == 1
+    # Shared login now creates the employee for this working account too.
+    # A critical signal reaches both the owner and that responsible employee.
+    assert len(critical) == 2
+    async with session_factory() as session:
+        logs = list(
+            await session.scalars(select(NotificationLog).where(NotificationLog.id.in_(critical)))
+        )
+        assert {log.destination_type for log in logs} == {"manager", "employee"}
+        personal = next(log for log in logs if log.destination_type == "employee")
+        assert personal.employee_id == connection.assigned_employee_id
+        assert personal.destination_id == str(connection.telegram_user_id)
 
 
 @pytest.mark.asyncio

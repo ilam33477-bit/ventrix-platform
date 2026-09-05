@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -26,6 +27,7 @@ from services.api.deepseek import DeepSeekProvider
 from ..client_bots.menu import ensure_mini_app_menu_button
 from ..config import Settings
 from ..jobs.queue import SQLiteJobQueue
+from ..metrics import collect_runtime_metrics
 from ..models import (
     AIUsageCall,
     AIUsageMetric,
@@ -47,10 +49,12 @@ from ..models import (
 )
 from ..scheduler.service import TenantAnalysisScheduler
 from ..schemas import AIProfileUpdate, BotCreate, TenantCreate, TenantUpdate
+from ..services.ai_provider_gate import SharedAIProvider
 from ..services.client_drafts import ClientDraftData, OwnerClientDraftService
 from ..services.encryption import EncryptionService
 from ..services.foundation import BotAlreadyExistsError, FoundationService
 from ..services.onboarding_welcome import ensure_onboarding_welcome
+from ..services.owner_monitoring import build_operational_log_export
 from ..services.product_events import ProductEventService
 from ..services.system_secrets import SystemSecretService, mask_secret
 from ..services.telegram import BotTokenVerificationError, TelegramBotVerifier
@@ -73,6 +77,7 @@ from .keyboards import (
     optional_access_end,
     optional_username,
     owner_main_menu,
+    system_monitoring_menu,
     system_secret_actions,
     system_secret_confirmation,
     system_settings_menu,
@@ -106,10 +111,15 @@ async def precompute_onboarding_welcome(
     try:
         async with session_factory() as session:
             tenant = await service_for(session, settings, telegram_verifier).get_tenant(tenant_id)
-            provider = DeepSeekProvider(
-                base_url=settings.deepseek_base_url,
-                timeout_seconds=min(30, settings.ai_request_timeout_seconds),
-                api_key_value=settings.deepseek_api_key.get_secret_value(),
+            provider = SharedAIProvider(
+                session_factory,
+                DeepSeekProvider(
+                    base_url=settings.deepseek_base_url,
+                    timeout_seconds=min(30, settings.ai_request_timeout_seconds),
+                    api_key_value=settings.deepseek_api_key.get_secret_value(),
+                ),
+                max_active_requests=settings.max_active_ai_requests,
+                heartbeat_seconds=settings.worker_heartbeat_seconds,
             )
             await ensure_onboarding_welcome(
                 session,
@@ -607,12 +617,18 @@ def ai_draft_text(data: ClientDraftData, version: int) -> str:
 def ai_draft_service(session: AsyncSession, settings: Settings) -> OwnerClientDraftService:
     if not settings.deepseek_api_key:
         raise RuntimeError("DeepSeek API is not configured")
+    factory = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
     return OwnerClientDraftService(
         session,
-        DeepSeekProvider(
-            base_url=settings.deepseek_base_url,
-            timeout_seconds=settings.ai_request_timeout_seconds,
-            api_key_value=settings.deepseek_api_key.get_secret_value(),
+        SharedAIProvider(
+            factory,
+            DeepSeekProvider(
+                base_url=settings.deepseek_base_url,
+                timeout_seconds=settings.ai_request_timeout_seconds,
+                api_key_value=settings.deepseek_api_key.get_secret_value(),
+            ),
+            max_active_requests=settings.max_active_ai_requests,
+            heartbeat_seconds=settings.worker_heartbeat_seconds,
         ),
         EncryptionService(settings.app_encryption_key.get_secret_value()),
         settings.deepseek_fast_model,
@@ -1917,20 +1933,172 @@ async def system_status(
     query: CallbackQuery,
     bot: Bot,
     session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
 ) -> None:
     db_status = "ошибка"
+    metrics: dict[str, Any] = {}
     try:
         async with session_factory() as session:
             await session.execute(text("SELECT 1"))
+            metrics = await collect_runtime_metrics(session)
         db_status = "готова"
     except Exception:  # noqa: BLE001 - status screen degrades safely
         logger.warning("Owner status database probe failed")
-    me = await bot.get_me()
+    try:
+        me = await bot.get_me()
+        bot_status = f"@{escape(me.username or '—')}"
+    except Exception:  # noqa: BLE001 - status screen must remain available on Telegram failure
+        bot_status = "нет ответа"
+    queue = metrics.get("queue", {})
+    runtime = metrics.get("runtime", {})
+    runtime_rows = list(runtime.get("components") or [])
+    component_lines = "\n".join(
+        f"{_runtime_icon(str(item.get('status')))} {_runtime_label(str(item.get('component')))}: "
+        f"{_duration(int(item.get('heartbeat_age_seconds') or 0))} назад"
+        for item in sorted(runtime_rows, key=lambda row: str(row.get("component")))
+    ) or "— процессы ещё не зарегистрировали heartbeat"
+    host = metrics.get("host", {})
+    disk_free = host.get("disk_free_percent")
+    memory_available = host.get("memory_available_bytes")
+    memory_total = host.get("memory_total_bytes")
+    ai = metrics.get("ai", {})
+    notifications = metrics.get("notifications", {})
+    reports = metrics.get("reports", {})
+    sqlite = metrics.get("sqlite", {})
     await render(
         query,
-        f"<b>Состояние системы</b>\n\nSQLite: {db_status}\n"
-        f"Административный бот: @{escape(me.username or '—')}\nPolling: активен",
-        back_to_owner_menu(),
+        f"<b>Состояние Ventrix</b>\n"
+        f"Ревизия: <code>{escape(settings.release_revision)}</code>\n\n"
+        f"SQLite: <b>{db_status}</b>\n"
+        f"Административный бот: <b>{bot_status}</b>\n\n"
+        f"<b>Процессы</b>\n{component_lines}\n\n"
+        f"<b>Очередь</b>\n"
+        f"Задач: <b>{int(queue.get('depth') or 0)}</b>\n"
+        f"Самая старая: <b>{_duration(int(queue.get('oldest_job_age_seconds') or 0))}</b>\n\n"
+        f"<b>Ошибки</b>\n"
+        f"AI за час: <b>{int(ai.get('errors_last_hour') or 0)}</b>\n"
+        f"AI p95: <b>{_duration_ms((ai.get('latency_ms') or {}).get('p95'))}</b>\n"
+        f"Доставка за час: <b>{int(notifications.get('failures_last_hour') or 0)}</b>\n"
+        f"Просроченные отчёты: <b>{int(reports.get('overdue') or 0)}</b>\n"
+        f"SQLite locks за час: <b>{int(sqlite.get('lock_failures_last_hour') or 0)}</b>\n\n"
+        + (
+            f"Свободно на диске: <b>{float(disk_free):.1f}%</b>"
+            if disk_free is not None
+            else "Свободное место на диске: <b>недоступно</b>"
+        )
+        + "\n"
+        + (
+            f"Доступно памяти: <b>{_size(memory_available)} / {_size(memory_total)}</b>"
+            if memory_available is not None and memory_total is not None
+            else f"Пиковая память процесса: <b>{_size(host.get('process_max_rss_bytes'))}</b>"
+        ),
+        system_monitoring_menu(),
+    )
+
+
+def _duration(seconds: int) -> str:
+    if seconds >= 86_400:
+        return f"{seconds // 86_400} дн."
+    if seconds >= 3600:
+        return f"{seconds // 3600} ч"
+    if seconds >= 60:
+        return f"{seconds // 60} мин."
+    return f"{seconds} сек."
+
+
+def _duration_ms(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return "нет данных"
+    if value >= 1000:
+        return f"{value / 1000:.1f} сек."
+    return f"{value:.0f} мс"
+
+
+def _size(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return "нет данных"
+    size = float(value)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if abs(size) < 1024 or unit == "ТБ":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return "нет данных"
+
+
+def _runtime_label(component: str) -> str:
+    if component.startswith("worker:"):
+        return "Worker"
+    return {
+        "api": "Backend API",
+        "scheduler": "Scheduler",
+        "owner_bot": "Owner bot",
+        "client_bots": "Client bots",
+        "platform_monitor": "Мониторинг",
+    }.get(component, component)
+
+
+def _runtime_icon(status: str) -> str:
+    return "🟢" if status == "healthy" else "🟠" if status == "stopped" else "🔴"
+
+
+@router.callback_query(F.data == "owner:system:errors")
+async def system_errors(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        metrics = await collect_runtime_metrics(session)
+    codes = metrics["ai"].get("error_codes_last_hour") or {}
+    code_lines = "\n".join(
+        f"• <code>{escape(str(code))}</code>: {int(count)}"
+        for code, count in sorted(codes.items())
+    ) or "• ошибок AI за последний час нет"
+    category_lines = "\n".join(
+        f"• {escape(str(category))}: {int(count)}"
+        for category, count in sorted(metrics["queue"]["depth_by_category"].items())
+    ) or "• очередь пуста"
+    await render(
+        query,
+        "<b>Ошибки и задержки</b>\n\n"
+        f"Завершившиеся ошибкой задачи за час: <b>{metrics['jobs']['failures_last_hour']}</b>\n"
+        f"Ошибки доставки за час: <b>{metrics['notifications']['failures_last_hour']}</b>\n"
+        f"Просроченные отчёты: <b>{metrics['reports']['overdue']}</b>\n"
+        f"Конфликты SQLite за час: <b>{metrics['sqlite']['lock_failures_last_hour']}</b>\n\n"
+        f"<b>AI-коды за час</b>\n{code_lines}\n\n"
+        f"<b>Очередь по категориям</b>\n{category_lines}",
+        system_monitoring_menu(),
+    )
+
+
+@router.callback_query(F.data.startswith("owner:system:logs:"))
+async def system_logs(
+    query: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    if query.from_user.id != settings.platform_owner_telegram_id:
+        await query.answer("Недоступно", show_alert=True)
+        return
+    try:
+        hours = int(query.data.rsplit(":", 1)[1])
+    except (AttributeError, ValueError):
+        await query.answer("Некорректный период", show_alert=True)
+        return
+    if hours not in {1, 2}:
+        await query.answer("Доступны только последние 1–2 часа", show_alert=True)
+        return
+    await query.answer("Формирую безопасную выгрузку…")
+    async with session_factory() as session:
+        content = await build_operational_log_export(session, hours=hours)
+    if query.message is None:
+        return
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    await query.message.answer_document(
+        BufferedInputFile(content, filename=f"ventrix-logs-{hours}h-{timestamp}.jsonl"),
+        caption=(
+            f"Системные события Ventrix за {hours} ч. "
+            "Без токенов, кодов входа и текстов переписок."
+        ),
     )
 
 

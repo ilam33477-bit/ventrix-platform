@@ -98,7 +98,9 @@ class OwnerClientDraftService:
     ) -> OwnerClientDraft:
         self._reject_secrets(prompt)
         owner = await self._owner(owner_telegram_id)
-        data, latency_ms = await self._generate(prompt=prompt, identity=identity)
+        data, latency_ms = await self._generate(
+            prompt=prompt, identity=identity, user_id=f"platform-owner-{owner.id}"
+        )
         if identity:
             data = data.model_copy(
                 update={
@@ -130,7 +132,11 @@ class OwnerClientDraftService:
         self._reject_secrets(correction)
         draft = await self._draft(owner_telegram_id, draft_id)
         before = dict(draft.draft_json)
-        data, latency_ms = await self._generate(correction=correction, current=before)
+        data, latency_ms = await self._generate(
+            correction=correction,
+            current=before,
+            user_id=f"platform-owner-{draft.owner_id}",
+        )
         data = data.model_copy(
             update={
                 key: before.get(key)
@@ -169,6 +175,7 @@ class OwnerClientDraftService:
         correction: str | None = None,
         current: dict[str, Any] | None = None,
         identity: dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> tuple[ClientDraftData, int]:
         started = monotonic_time.perf_counter()
         content, _usage = await self.provider.generate_json(
@@ -182,6 +189,7 @@ class OwnerClientDraftService:
                 "correction": correction,
             },
             max_tokens=3000,
+            user_id=user_id,
         )
         try:
             raw = json.loads(content)

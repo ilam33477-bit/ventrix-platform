@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from services.backend.api.app import create_app
 from services.backend.api.client_router import (
@@ -21,7 +22,14 @@ from services.backend.api.client_router import (
 from services.backend.api.dependencies import get_foundation_service
 from services.backend.config import get_settings
 from services.backend.database import get_session
-from services.backend.models import AnalysisRun, Report, ReportMetric, ReportSection
+from services.backend.models import (
+    AIUsageCall,
+    AnalysisRun,
+    Report,
+    ReportMetric,
+    ReportSection,
+    TenantMembership,
+)
 
 
 def signed_init_data(token: str, user_id: int, auth_date: int, username: str | None = None) -> str:
@@ -145,6 +153,7 @@ async def test_owner_api_endpoints(
                 display_name="Рабочий аккаунт",
                 phone_masked="+7••••••0011",
                 username="work_account",
+                assigned_employee_id="verified-employee",
             )
 
         async def refresh_catalog(self, tenant_id, connection_id):
@@ -189,7 +198,9 @@ async def test_owner_api_endpoints(
         assert ready.status_code == 200
         assert ready.json() == {"status": "ready"}
         assert (await client.get("/health/ready")).json() == {"status": "ready"}
-        runtime_metrics = (await client.get("/metrics")).json()
+        assert (await client.get("/metrics")).status_code == 401
+        assert (await client.get("/health/details")).status_code == 401
+        runtime_metrics = (await client.get("/metrics", headers=headers)).json()
         assert runtime_metrics["queue"]["depth"] == 0
         assert set(runtime_metrics["jobs"]["duration_ms"]) == {"p50", "p95", "p99"}
         unauthorized = await client.get("/api/v1/owner/tenants")
@@ -202,6 +213,33 @@ async def test_owner_api_endpoints(
         )
         assert created.status_code == 201, created.text
         tenant_id = created.json()["id"]
+
+        async with session_factory() as session:
+            session.add_all([
+                AIUsageCall(
+                    tenant_id=tenant_id,
+                    model="deepseek-test",
+                    job_type="ai_batch_analysis",
+                    duration_ms=10,
+                    status="completed",
+                ),
+                AIUsageCall(
+                    tenant_id=tenant_id,
+                    model="deepseek-test",
+                    job_type="ai_batch_analysis",
+                    duration_ms=20,
+                    status="failed",
+                    error_code="deepseek_http_429",
+                ),
+            ])
+            await session.commit()
+        ai_metrics = (await client.get("/metrics", headers=headers)).json()["ai"]
+        assert ai_metrics["errors"] == 1
+        assert ai_metrics["by_job_type"]["ai_batch_analysis"] == {
+            "calls": 2,
+            "duration_ms": 30,
+            "errors": 1,
+        }
 
         listed = await client.get("/api/v1/owner/tenants", headers=headers)
         assert listed.status_code == 200
@@ -268,6 +306,12 @@ async def test_owner_api_endpoints(
             headers={"Authorization": f"tma {init_data}"},
         )
         assert mini_app_auth.status_code == 200, mini_app_auth.text
+        async with session_factory() as session:
+            membership = await session.scalar(select(TenantMembership).where(
+                TenantMembership.tenant_id == tenant_id,
+                TenantMembership.telegram_user_id == tenant_payload.owner_telegram_user_id,
+            ))
+            assert membership.bot_started_at is None
         assert mini_app_auth.json()["tenant_id"] == tenant_id
         assert mini_app_auth.json()["tenant_id"] != second_tenant_id
         assert mini_app_auth.json()["user"]["telegram_user_id"] == (
@@ -275,7 +319,7 @@ async def test_owner_api_endpoints(
         )
         assert mini_app_auth.json()["permissions"] == ["*"]
         assert "dashboard_summary" in mini_app_auth.json()
-        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {"calls_today": 0}
+        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {"calls_today": 2}
         assert "tokens_today" not in mini_app_auth.json()["dashboard_summary"]["ai_usage"]
         assert mini_app_auth.json()["project_context"]["onboarding"] == {
             "step": "welcome",
@@ -393,7 +437,7 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees",
             headers={"Authorization": f"tma {username_init_data}"},
         )
-        assert len(username_employee_rows.json()) == 3
+        assert len(username_employee_rows.json()) == 1
         assert [
             row["telegram_user_id"]
             for row in username_employee_rows.json()
@@ -412,7 +456,7 @@ async def test_owner_api_endpoints(
             "/api/v1/client/employees",
             headers={"Authorization": f"tma {employee_init_data}"},
         )
-        assert len(employee_visible_staff.json()) == 3
+        assert len(employee_visible_staff.json()) == 1
         assert [
             item["telegram_user_id"]
             for item in employee_visible_staff.json()
@@ -497,6 +541,8 @@ async def test_owner_api_endpoints(
             headers={"Authorization": f"tma {employee_init_data}"},
         )
         assert employee_reports.status_code == 200
+        assert employee_reports.headers["cache-control"] == "private, no-store"
+        assert "Authorization" in employee_reports.headers["vary"]
         assert employee_reports.json()[0]["summary"] == "Персональная сводка за период готова."
         employee_report = await client.get(
             f"/api/v1/client/reports/{report_id}",
@@ -517,6 +563,28 @@ async def test_owner_api_endpoints(
             }
         ]
 
+        # A project report without this employee's row is not a personal report.
+        async with session_factory() as session:
+
+            personal_section = await session.scalar(select(ReportSection).where(
+                ReportSection.report_id == report_id,
+                ReportSection.section_key == "employee_report",
+            ))
+            personal_section.data_json = {"employees": [{
+                "employee_id": second_employee.json()["id"], "name": "Иван", "resolved": 100,
+            }]}
+            await session.commit()
+        assert (await client.get(
+            "/api/v1/client/reports", headers={"Authorization": f"tma {employee_init_data}"}
+        )).json() == []
+        assert (await client.get(
+            f"/api/v1/client/reports/{report_id}",
+            headers={"Authorization": f"tma {employee_init_data}"},
+        )).status_code == 404
+        assert (await client.get(
+            f"/api/v1/client/reports/{report_id}", headers={"Authorization": f"tma {init_data}"}
+        )).status_code == 200
+
         group = await client.post(
             "/api/v1/client/group-integrations",
             headers={"Authorization": f"tma {init_data}"},
@@ -529,6 +597,19 @@ async def test_owner_api_endpoints(
                 headers={"Authorization": f"tma {init_data}"},
             )
         ).json()[0]["title"] == "Продажи"
+        assert (
+            await client.get(
+                "/api/v1/client/group-integrations",
+                headers={"Authorization": f"tma {employee_init_data}"},
+            )
+        ).status_code == 403
+        assert (
+            await client.patch(
+                f"/api/v1/client/group-integrations/{group.json()['id']}",
+                headers={"Authorization": f"tma {init_data}"},
+                json={"status": "active"},
+            )
+        ).status_code == 409
         updated_group = await client.patch(
             f"/api/v1/client/group-integrations/{group.json()['id']}",
             headers={"Authorization": f"tma {init_data}"},

@@ -163,6 +163,7 @@ class AITriageService:
                 system_prompt=TRIAGE_SYSTEM_PROMPT,
                 payload=payload,
                 max_tokens=900,
+                user_id=signal.tenant_id,
             )
             try:
                 result, repaired = parse_triage_result(raw)
@@ -182,6 +183,7 @@ class AITriageService:
                     + "\nPrevious response was invalid. Return complete valid JSON only.",
                     payload=payload,
                     max_tokens=900,
+                    user_id=signal.tenant_id,
                 )
                 result, repaired = parse_triage_result(raw)
         except Exception as exc:
@@ -191,7 +193,7 @@ class AITriageService:
                 usage,
                 int((time.perf_counter() - started) * 1000),
                 "failed",
-                type(exc).__name__,
+                str(getattr(exc, "error_code", type(exc).__name__)),
             )
             raise
         await self._record_usage(

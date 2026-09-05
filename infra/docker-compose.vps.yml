@@ -1,7 +1,17 @@
+x-ventrix-image: &ventrix-image ${VENTRIX_IMAGE:-ventrix-app:local}
+x-runtime-environment: &runtime-environment
+  RELEASE_REVISION: ${RELEASE_REVISION:-unknown}
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   backend:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["api"]
     volumes: &ventrix-volumes
       # Paths are resolved relative to this compose file in /opt/ventrix/infra.
@@ -16,45 +26,56 @@ services:
     ports:
       - "127.0.0.1:8010:8000"
     restart: unless-stopped
+    logging: *default-logging
 
   background-worker:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["worker"]
     volumes: *ventrix-volumes
     depends_on: &healthy-backend
       backend:
         condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
 
   telegram-session-runtime:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["python", "-m", "services.backend.telegram_sessions.runtime"]
     volumes: *ventrix-volumes
     depends_on: *healthy-backend
     restart: unless-stopped
+    logging: *default-logging
 
   client-bots:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["client-bots"]
     volumes: *ventrix-volumes
     depends_on: *healthy-backend
     restart: unless-stopped
+    logging: *default-logging
 
   owner-bot:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["bot"]
     volumes: *ventrix-volumes
     depends_on: *healthy-backend
     restart: unless-stopped
+    logging: *default-logging
 
   scheduler:
-    image: ventrix-app:20260814-dialog1
-    env_file: .env
+    image: *ventrix-image
+    env_file: ../.env
+    environment: *runtime-environment
     command: ["scheduler"]
     volumes: *ventrix-volumes
     depends_on: *healthy-backend
     restart: unless-stopped
+    logging: *default-logging
