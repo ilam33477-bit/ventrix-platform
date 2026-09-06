@@ -31,14 +31,17 @@ PATTERNS = {
 
 
 def candidate_files() -> list[Path]:
-    completed = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode == 0:
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        completed = None
+    if completed is not None and completed.returncode == 0:
         names = completed.stdout.splitlines()
     else:
         names = [
