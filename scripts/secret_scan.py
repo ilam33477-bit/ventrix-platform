@@ -45,7 +45,7 @@ def candidate_files() -> list[Path]:
             path.relative_to(ROOT).as_posix()
             for path in ROOT.rglob("*")
             if path.is_file()
-            and path != ROOT / ".env"
+            and not path.name.startswith(".env")
             and not any(part in FORBIDDEN_PARTS for part in path.relative_to(ROOT).parts)
         ]
     paths: list[Path] = []
