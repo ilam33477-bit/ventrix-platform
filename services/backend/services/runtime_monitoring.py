@@ -66,11 +66,25 @@ async def runtime_heartbeat_loop(
 
     try:
         while True:
-            await record_runtime_heartbeat(
-                session_factory,
-                component,
-                details=current_details(),
-            )
+            try:
+                await record_runtime_heartbeat(
+                    session_factory,
+                    component,
+                    details=current_details(),
+                )
+            except asyncio.CancelledError:
+                raise
+            # Health reporting must never terminate the process it observes.
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "runtime_heartbeat_failed",
+                    extra={
+                        "safe_context": {
+                            "component": normalized_component(component),
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                )
             await asyncio.sleep(interval_seconds)
     finally:
         try:

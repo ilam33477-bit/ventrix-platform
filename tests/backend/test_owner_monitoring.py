@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ from services.backend.models import (
     RuntimeHealth,
 )
 from services.backend.observability import StructuredJSONFormatter
+from services.backend.services import runtime_monitoring
 from services.backend.services.owner_monitoring import (
     PlatformAlertMonitor,
     PlatformOwnerAlertDispatcher,
@@ -195,6 +197,34 @@ async def test_runtime_heartbeat_upserts_one_bounded_component(session_factory) 
     assert len(rows) == 1
     assert len(rows[0].component) <= 64
     assert rows[0].details_json == {"pool": "notification"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_heartbeat_loop_survives_transient_database_error(
+    monkeypatch,
+) -> None:
+    calls = 0
+    recovered = asyncio.Event()
+
+    async def transient_heartbeat(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary database contention")
+        recovered.set()
+
+    monkeypatch.setattr(runtime_monitoring, "record_runtime_heartbeat", transient_heartbeat)
+    task = asyncio.create_task(
+        runtime_monitoring.runtime_heartbeat_loop(
+            object(),
+            "worker:test",
+            interval_seconds=0.001,
+        )
+    )
+    await asyncio.wait_for(recovered.wait(), timeout=1)
+    assert not task.done()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
