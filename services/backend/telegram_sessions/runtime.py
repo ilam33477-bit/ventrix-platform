@@ -36,6 +36,7 @@ from ..services.employee_activation import (
     start_employee_bot,
 )
 from ..services.encryption import EncryptionService
+from ..services.runtime_monitoring import runtime_heartbeat_loop
 from ..services.system_secrets import load_runtime_secret_overrides
 from .gateway import MessageBatch, RemoteMessage, TelegramFloodWait, TelethonGateway
 from .leases import RuntimeOwnership, TelegramRuntimeLeaseStore
@@ -1321,7 +1322,23 @@ async def run() -> None:
         f"{socket.gethostname()}:{uuid4()}",
     )
     log_event(logger, logging.INFO, "telegram_session_runtime_started")
-    await runtime.run()
+    heartbeat = asyncio.create_task(
+        runtime_heartbeat_loop(
+            session_factory,
+            "telegram_runtime",
+            interval_seconds=settings.worker_heartbeat_seconds,
+            details=lambda: {
+                "release_revision": settings.release_revision,
+                "active_actors": len(runtime.actors),
+            },
+        ),
+        name="telegram-runtime-heartbeat",
+    )
+    try:
+        await runtime.run()
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 def main() -> None:

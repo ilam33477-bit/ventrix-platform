@@ -13,6 +13,7 @@ case "$revision" in
 esac
 
 compose_file="infra/docker-compose.vps.yml"
+compose_project="ventrix"
 release_dir=".release"
 current_file="$release_dir/current.env"
 previous_file="$release_dir/previous.env"
@@ -24,7 +25,8 @@ chmod 700 "$release_dir"
 if [ -f "$current_file" ]; then
   cp "$current_file" "$previous_file"
 else
-  backend_container=$(docker compose -f "$compose_file" ps -q backend 2>/dev/null || true)
+  backend_container=$(docker compose -p "$compose_project" -f "$compose_file" \
+    ps -q backend 2>/dev/null || true)
   if [ -n "$backend_container" ]; then
     previous_image=$(docker inspect --format '{{.Config.Image}}' "$backend_container")
     printf 'VENTRIX_IMAGE=%s\nRELEASE_REVISION=previous\n' "$previous_image" >"$previous_file"
@@ -35,7 +37,8 @@ fi
 printf 'VENTRIX_IMAGE=%s\nRELEASE_REVISION=%s\n' "$image" "$revision" >"$candidate_file"
 chmod 600 "$candidate_file"
 
-docker compose --env-file "$candidate_file" -f "$compose_file" config --quiet
+docker compose -p "$compose_project" --env-file "$candidate_file" \
+  -f "$compose_file" config --quiet
 docker build --label "org.opencontainers.image.revision=$revision" -t "$image" .
 
 if [ -f "data/app.db" ]; then
@@ -48,24 +51,36 @@ fi
 
 cp "$candidate_file" "$current_file"
 chmod 600 "$current_file"
-docker compose --env-file "$current_file" -f "$compose_file" up -d --remove-orphans
+docker compose -p "$compose_project" --env-file "$current_file" \
+  -f "$compose_file" up -d --no-deps backend
 
 attempt=0
 until curl --fail --silent --show-error http://127.0.0.1:8010/health/ready >/dev/null; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 30 ]; then
-    docker compose --env-file "$current_file" -f "$compose_file" ps
+    docker compose -p "$compose_project" --env-file "$current_file" \
+      -f "$compose_file" ps
     echo "Ventrix readiness check failed" >&2
     exit 1
   fi
   sleep 2
 done
 
+for service in telegram-session-runtime background-worker client-bots owner-bot scheduler; do
+  docker compose -p "$compose_project" --env-file "$current_file" \
+    -f "$compose_file" up -d --no-deps "$service"
+done
+
+docker compose -p "$compose_project" --env-file "$current_file" \
+  -f "$compose_file" exec -T backend python \
+  -m services.backend.scripts.verify_production --expected-revision "$revision"
+
 expected_services=6
-running_services=$(docker compose --env-file "$current_file" -f "$compose_file" ps \
-  --status running --services | wc -l | tr -d ' ')
+running_services=$(docker compose -p "$compose_project" --env-file "$current_file" \
+  -f "$compose_file" ps --status running --services | wc -l | tr -d ' ')
 if [ "$running_services" -ne "$expected_services" ]; then
-  docker compose --env-file "$current_file" -f "$compose_file" ps
+  docker compose -p "$compose_project" --env-file "$current_file" \
+    -f "$compose_file" ps
   echo "Only $running_services of $expected_services Ventrix services are running" >&2
   exit 1
 fi

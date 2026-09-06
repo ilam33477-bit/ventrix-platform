@@ -2033,6 +2033,7 @@ def _runtime_label(component: str) -> str:
         "scheduler": "Scheduler",
         "owner_bot": "Owner bot",
         "client_bots": "Client bots",
+        "telegram_runtime": "Telegram runtime",
         "platform_monitor": "Мониторинг",
     }.get(component, component)
 

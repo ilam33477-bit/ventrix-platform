@@ -1,3 +1,5 @@
+name: ventrix
+
 x-ventrix-image: &ventrix-image ${VENTRIX_IMAGE:-ventrix-app:local}
 x-runtime-environment: &runtime-environment
   RELEASE_REVISION: ${RELEASE_REVISION:-unknown}
