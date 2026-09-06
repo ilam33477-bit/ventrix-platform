@@ -331,7 +331,17 @@ class NotificationOrchestrator:
         *,
         bypass_cooldown: bool,
     ) -> str | None:
-        dedup_key = f"signal:{signal.id}:{destination_type}:{destination_id}"
+        # A single open problem can be re-evaluated by several signals while a
+        # conversation is rescanned. Notify once per lifecycle state/severity
+        # band instead of once per transient signal; a real escalation or a
+        # reopened lifecycle still produces a new notification.
+        severity_floor = (signal.criticality // 10) * 10
+        dedup_subject = (
+            f"problem:{problem.id}:{problem.status}:{severity_floor}"
+            if problem is not None
+            else f"signal:{signal.id}"
+        )
+        dedup_key = f"{dedup_subject}:{destination_type}:{destination_id}"
 
         async def write(session: AsyncSession) -> str | None:
             now = datetime.now(UTC)
@@ -339,7 +349,6 @@ class NotificationOrchestrator:
                 select(NotificationLog.id).where(NotificationLog.deduplication_key == dedup_key)
             ):
                 return None
-            severity_floor = (signal.criticality // 10) * 10
             if not bypass_cooldown:
                 recent_equivalent = await session.scalar(
                     select(NotificationLog.id)

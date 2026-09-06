@@ -794,7 +794,7 @@ async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
         settings.notification_immediate_threshold = 95
         signals: list[Signal] = []
         for index, (signal_type, criticality) in enumerate(
-            (("complaint", 80), ("contract_question", 80), ("complaint", 82), ("complaint", 99)),
+            (("complaint", 80), ("contract_question", 80), ("complaint", 82), ("complaint", 99), ("complaint", 99)),
             start=1,
         ):
             message = TelegramMessage(
@@ -825,13 +825,35 @@ async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
             )
             session.add(signal)
             signals.append(signal)
+        await session.flush()
+        critical_problem = OperationalProblem(
+            tenant_id=tenant.id,
+            connection_id=connection.id,
+            dialog_id=dialog.id,
+            source_message_id=signals[3].source_message_id,
+            signal_id=signals[3].id,
+            responsible_employee_id=connection.assigned_employee_id,
+            fingerprint="critical-cooldown-problem",
+            problem_type="complaint",
+            issue_family="PRODUCT_DISSATISFACTION",
+            status="assigned",
+            priority="critical",
+            confidence=0.99,
+            evidence="Критическая ситуация",
+            explanation="Проверка дедупликации жизненного цикла",
+            recommended_action="Проверить диалог",
+            occurred_at=now,
+        )
+        session.add(critical_problem)
         await session.commit()
+        critical_problem_id = critical_problem.id
 
     orchestrator = NotificationOrchestrator(session_factory, SQLiteJobQueue(session_factory))
     first = await orchestrator.plan_for_signal(signals[0].id)
     different_problem = await orchestrator.plan_for_signal(signals[1].id)
     equivalent = await orchestrator.plan_for_signal(signals[2].id)
-    critical = await orchestrator.plan_for_signal(signals[3].id)
+    critical = await orchestrator.plan_for_signal(signals[3].id, critical_problem_id)
+    repeated_critical = await orchestrator.plan_for_signal(signals[4].id, critical_problem_id)
 
     assert len(first) == 1
     assert len(different_problem) == 1
@@ -839,6 +861,7 @@ async def test_notification_cooldown_is_problem_scoped_and_critical_bypasses_it(
     # Shared login now creates the employee for this working account too.
     # A critical signal reaches both the owner and that responsible employee.
     assert len(critical) == 2
+    assert repeated_critical == []
     async with session_factory() as session:
         logs = list(
             await session.scalars(select(NotificationLog).where(NotificationLog.id.in_(critical)))
