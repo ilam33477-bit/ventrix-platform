@@ -11,11 +11,14 @@ TEXT_SUFFIXES = {
 FORBIDDEN_PARTS = {
     ".git",
     ".next",
+    ".release",
     ".venv",
     "backups",
     "data",
+    "dist",
     "logs",
     "node_modules",
+    "tmp",
     "__pycache__",
 }
 FORBIDDEN_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".session", ".log"}
@@ -31,12 +34,22 @@ def candidate_files() -> list[Path]:
     completed = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if completed.returncode == 0:
+        names = completed.stdout.splitlines()
+    else:
+        names = [
+            path.relative_to(ROOT).as_posix()
+            for path in ROOT.rglob("*")
+            if path.is_file()
+            and path != ROOT / ".env"
+            and not any(part in FORBIDDEN_PARTS for part in path.relative_to(ROOT).parts)
+        ]
     paths: list[Path] = []
-    for name in completed.stdout.splitlines():
+    for name in names:
         path = ROOT / name
         if path.is_file() and (
             path.suffix.lower() in TEXT_SUFFIXES
