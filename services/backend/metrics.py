@@ -122,11 +122,21 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
             )
         ).all()
     )
-    jobs = list(
-        await session.scalars(
-            select(BackgroundJob).order_by(BackgroundJob.created_at.desc()).limit(2000)
+    jobs = (
+        await session.execute(
+            select(
+                BackgroundJob.started_at,
+                BackgroundJob.finished_at,
+                BackgroundJob.category,
+                BackgroundJob.attempts,
+                BackgroundJob.status,
+                BackgroundJob.updated_at,
+                BackgroundJob.last_error,
+            )
+            .order_by(BackgroundJob.created_at.desc())
+            .limit(2000)
         )
-    )
+    ).all()
     completed = [item for item in jobs if item.started_at and item.finished_at]
     job_durations = [
         value
@@ -141,14 +151,20 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
     ]
     attempted = [item for item in jobs if item.attempts > 0]
 
-    ai_calls = list(
-        await session.scalars(
-            select(AIUsageCall)
+    ai_calls = (
+        await session.execute(
+            select(
+                AIUsageCall.status,
+                AIUsageCall.error_code,
+                AIUsageCall.occurred_at,
+                AIUsageCall.job_type,
+                AIUsageCall.duration_ms,
+            )
             .where(AIUsageCall.occurred_at >= one_day_ago)
             .order_by(AIUsageCall.occurred_at.desc())
             .limit(2000)
         )
-    )
+    ).all()
     message_signal_pairs = (
         await session.execute(
             select(TelegramMessage.sent_at, Signal.detected_at)
@@ -221,12 +237,27 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
         for item in recent_operational_errors
         if "database is locked" in (item.last_error or "").lower()
     ]
-    connections = list(
-        await session.scalars(
-            select(TelegramConnection).where(TelegramConnection.deleted_at.is_(None))
+    connections = (
+        await session.execute(
+            select(
+                TelegramConnection.runtime_status,
+                TelegramConnection.updates_received,
+                TelegramConnection.duplicate_events,
+                TelegramConnection.catchup_events,
+                TelegramConnection.runtime_heartbeat_at,
+            ).where(TelegramConnection.deleted_at.is_(None))
         )
-    )
-    runtime_rows = list(await session.scalars(select(RuntimeHealth)))
+    ).all()
+    runtime_rows = (
+        await session.execute(
+            select(
+                RuntimeHealth.component,
+                RuntimeHealth.status,
+                RuntimeHealth.heartbeat_at,
+                RuntimeHealth.details_json,
+            )
+        )
+    ).all()
     runtime_components = [
         {
             "component": item.component,

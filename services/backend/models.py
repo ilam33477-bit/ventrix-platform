@@ -1113,6 +1113,8 @@ class BackgroundJob(StringPrimaryKeyMixin, TimestampMixin, Base):
         ),
         CheckConstraint("attempts >= 0 AND max_attempts > 0", name="ck_background_jobs_attempts"),
         Index("ix_background_jobs_available", "status", "scheduled_at", "priority"),
+        Index("ix_background_jobs_created_at", "created_at"),
+        Index("ix_background_jobs_status_updated_at", "status", "updated_at"),
         Index("ix_background_jobs_tenant_type", "tenant_id", "job_type"),
         Index("ix_background_jobs_fair_claim", "status", "priority", "scheduled_at", "tenant_id"),
         Index(
