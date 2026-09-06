@@ -362,7 +362,7 @@ async def run() -> None:
         tasks.create_task(
             runtime_heartbeat_loop(
                 session_factory,
-                f"worker:{socket.gethostname()}",
+                "worker",
                 interval_seconds=settings.worker_heartbeat_seconds,
                 details={
                     "release_revision": settings.release_revision,

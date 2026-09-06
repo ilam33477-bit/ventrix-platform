@@ -8,7 +8,20 @@ from services.backend.scripts.verify_production import validate_production_state
 def runtime_metrics(*, worker_status: str = "healthy") -> dict[str, object]:
     names = ["api", "scheduler", "owner_bot", "client_bots", "telegram_runtime"]
     components = [{"component": name, "status": "healthy"} for name in names]
-    components.append({"component": "worker:test:1", "status": worker_status})
+    components.extend(
+        [
+            {
+                "component": "worker:retired",
+                "status": "stale",
+                "heartbeat_age_seconds": 900,
+            },
+            {
+                "component": "worker",
+                "status": worker_status,
+                "heartbeat_age_seconds": 1,
+            },
+        ]
+    )
     return {
         "runtime": {"components": components},
         "queue": {"depth": 2},
@@ -26,7 +39,7 @@ def test_production_state_requires_protected_metrics_and_all_heartbeats() -> Non
     )
     assert summary == {
         "release_revision": "abc123",
-        "runtime_components": 6,
+        "runtime_components": 7,
         "queue_depth": 2,
         "overdue_reports": 1,
         "disk_free_percent": 25.0,

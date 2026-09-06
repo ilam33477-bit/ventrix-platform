@@ -33,14 +33,25 @@ def validate_production_state(
     components = list((metrics.get("runtime") or {}).get("components") or [])
     by_name = {str(item.get("component")): item for item in components}
     missing = sorted(REQUIRED_COMPONENTS - set(by_name))
-    if not any(name.startswith("worker:") for name in by_name):
+    worker_names = [
+        name for name in by_name if name == "worker" or name.startswith("worker:")
+    ]
+    if not worker_names:
         missing.append("worker:*")
     if missing:
         raise RuntimeError("runtime heartbeat is missing for: " + ", ".join(missing))
+    checked_names = set(REQUIRED_COMPONENTS)
+    if worker_names:
+        checked_names.add(
+            min(
+                worker_names,
+                key=lambda name: float(
+                    by_name[name].get("heartbeat_age_seconds", float("inf"))
+                ),
+            )
+        )
     unhealthy = sorted(
-        name
-        for name, item in by_name.items()
-        if name != "platform_monitor" and item.get("status") != "healthy"
+        name for name in checked_names if by_name.get(name, {}).get("status") != "healthy"
     )
     if unhealthy:
         raise RuntimeError("runtime heartbeat is unhealthy for: " + ", ".join(unhealthy))

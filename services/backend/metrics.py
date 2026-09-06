@@ -258,6 +258,19 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
             )
         )
     ).all()
+    worker_rows = [
+        item
+        for item in runtime_rows
+        if item.component == "worker" or item.component.startswith("worker:")
+    ]
+    if worker_rows:
+        current_worker = max(worker_rows, key=lambda item: _utc(item.heartbeat_at))
+        runtime_rows = [
+            item
+            for item in runtime_rows
+            if item.component != "worker" and not item.component.startswith("worker:")
+        ]
+        runtime_rows.append(current_worker)
     runtime_components = [
         {
             "component": item.component,
