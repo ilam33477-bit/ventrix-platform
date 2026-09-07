@@ -34,13 +34,23 @@ def system_monitoring_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⚠️ Ошибки", callback_data="owner:system:errors"),
             ],
             [
-                InlineKeyboardButton(
-                    text="Логи за 1 час", callback_data="owner:system:logs:1"
-                ),
-                InlineKeyboardButton(
-                    text="Логи за 2 часа", callback_data="owner:system:logs:2"
-                ),
+                InlineKeyboardButton(text="Логи за 1 час", callback_data="owner:system:logs:1"),
+                InlineKeyboardButton(text="Логи за 2 часа", callback_data="owner:system:logs:2"),
             ],
+            [InlineKeyboardButton(text="← К статистике", callback_data="owner:activity")],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="owner:menu")],
+        ]
+    )
+
+
+def platform_statistics_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="↻ Обновить", callback_data="owner:activity"),
+                InlineKeyboardButton(text="⚠️ Ошибки", callback_data="owner:system:errors"),
+            ],
+            [InlineKeyboardButton(text="🟢 Состояние системы", callback_data="owner:system")],
             [InlineKeyboardButton(text="← Главное меню", callback_data="owner:menu")],
         ]
     )
@@ -451,11 +461,7 @@ def client_main_menu(
             ]
         )
         rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Как работать", callback_data="client:employee-guide:1"
-                )
-            ]
+            [InlineKeyboardButton(text="Как работать", callback_data="client:employee-guide:1")]
         )
     elif role == "observer":
         rows = [[panel], [InlineKeyboardButton(text="Отчёты", callback_data="client:reports")]]

@@ -65,12 +65,18 @@ class TenantAnalysisScheduler:
         queue: SQLiteJobQueue | None = None,
         incremental_interval_seconds: int = 30,
         reconciliation_interval_seconds: int = 3600,
+        platform_summary_enabled: bool = True,
+        platform_summary_hour: int = 9,
+        platform_summary_timezone: str = "Europe/Moscow",
     ) -> None:
         self.session_factory = session_factory
         self.transactions = SQLiteTransactionManager(session_factory)
         self.queue = queue or SQLiteJobQueue(session_factory)
         self.incremental_interval_seconds = incremental_interval_seconds
         self.reconciliation_interval_seconds = reconciliation_interval_seconds
+        self.platform_summary_enabled = platform_summary_enabled
+        self.platform_summary_hour = platform_summary_hour
+        self.platform_summary_timezone = normalize_timezone(platform_summary_timezone)
 
     async def ensure_schedules(self, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)
@@ -162,6 +168,7 @@ class TenantAnalysisScheduler:
         current = now or datetime.now(UTC)
         await self.ensure_schedules(current)
         operational_jobs = await self._schedule_operational_jobs(current)
+        summary_jobs = await self._schedule_platform_summary(current)
         async with self.session_factory() as session:
             schedules = list(
                 await session.scalars(
@@ -172,7 +179,7 @@ class TenantAnalysisScheduler:
                     )
                 )
             )
-        job_ids: list[str] = list(operational_jobs)
+        job_ids: list[str] = [*operational_jobs, *summary_jobs]
         for schedule in schedules:
             try:
                 normalize_timezone(schedule.timezone)
@@ -213,6 +220,26 @@ class TenantAnalysisScheduler:
                 )
         await self._heartbeat(current, len(job_ids))
         return job_ids
+
+    async def _schedule_platform_summary(self, now: datetime) -> list[str]:
+        if not self.platform_summary_enabled:
+            return []
+        local_now = now.astimezone(timezone_info(self.platform_summary_timezone))
+        if local_now.hour < self.platform_summary_hour:
+            return []
+        period = local_now.date().isoformat()
+        return [
+            await self.queue.enqueue(
+                "platform.summary",
+                {"period": period},
+                priority=JOB_PRIORITY["P3"],
+                idempotency_key=f"platform-summary:{period}",
+                is_heavy=False,
+                category="notification",
+                cost_class="light",
+                max_attempts=5,
+            )
+        ]
 
     async def _schedule_operational_jobs(self, now: datetime) -> list[str]:
         async with self.session_factory() as session:

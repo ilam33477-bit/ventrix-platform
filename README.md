@@ -190,13 +190,21 @@ VPS-релиз выполняется из checkout `/opt/ventrix` только 
 пропущенные updates через те же event jobs. Все tenants и sessions обслуживаются общей priority queue.
 Внутри одного `background-worker` работают небольшие изолированные pools: долгий AI/report job не
 удерживает Telegram ingestion или critical notification. Это bounded concurrency для single-host
-SQLite, а не попытка запустить десятки конкурирующих writer-процессов.
+SQLite, а не попытка запустить десятки конкурирующих writer-процессов. Все ресурсоёмкие AI,
+analysis и report jobs дополнительно делят один глобальный лимит `MAX_ACTIVE_RESOURCE_JOBS=2`;
+лимит действует на всю установку, а tenant-fair claim по очереди обслуживает любое число проектов
+без выделения отдельных воркеров каждому проекту.
 
 Приоритетные типы: `telegram.ingest_event`, `telegram.catch_up`, `telegram.history_sync`, `signal.scan_batch`,
 `signal.ai_triage`, `commitment.reconcile`, `problem.evaluate`, `analysis.hourly`, `analysis.deep`,
 `notification.employee`, `notification.manager`, `notification.group`, `report.employee`,
 `report.client`, `report.company`, `maintenance.session_health`. Классы ресурсов — `light`,
 `ai_fast`, `heavy`; лимиты AI и heavy jobs задаются через `.env`.
+
+Админ-бот ежедневно в `PLATFORM_SUMMARY_HOUR` по `PLATFORM_SUMMARY_TIMEZONE` присылает владельцу
+SaaS сводку за 24 часа: токены, AI-запросы, обработанные сигналы, созданные ситуации и ошибки по
+всем активным проектам. Системные алерты и безопасный JSONL-экспорт логов содержат три обязательных
+пояснения: что произошло, что затронуто и что должен сделать администратор.
 
 Создать тестовую задачу из контейнера:
 

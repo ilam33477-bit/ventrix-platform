@@ -26,7 +26,10 @@ from ..intelligence.reconciliation import ReconciliationService
 from ..intelligence.signals import SignalService
 from ..observability import configure_structured_logging, log_event
 from ..services.encryption import EncryptionService
-from ..services.owner_monitoring import PlatformOwnerAlertDispatcher
+from ..services.owner_monitoring import (
+    PlatformOwnerAlertDispatcher,
+    PlatformOwnerSummaryDispatcher,
+)
 from ..services.runtime_monitoring import runtime_heartbeat_loop
 from ..services.system_secrets import load_runtime_secret_overrides
 from ..telegram_sessions.event_ingestion import TelegramEventIngestion
@@ -36,6 +39,8 @@ from .maintenance import MaintenanceJobHandlers
 from .queue import (
     AI_PROVIDER_COST_CLASSES,
     AI_PROVIDER_JOB_TYPES,
+    RESOURCE_INTENSIVE_COST_CLASSES,
+    RESOURCE_INTENSIVE_JOB_TYPES,
     JobDeferred,
     JobLease,
     SQLiteJobQueue,
@@ -171,13 +176,18 @@ async def run() -> None:
             "notification": settings.max_active_notification_jobs,
         },
         resource_limits={
+            "resource_intensive": (
+                RESOURCE_INTENSIVE_COST_CLASSES,
+                settings.max_active_resource_jobs,
+            ),
             "ai": (
                 AI_PROVIDER_COST_CLASSES,
                 settings.max_active_ai_requests,
-            )
+            ),
         },
         resource_job_types={
-            "ai": AI_PROVIDER_JOB_TYPES
+            "resource_intensive": RESOURCE_INTENSIVE_JOB_TYPES,
+            "ai": AI_PROVIDER_JOB_TYPES,
         },
     )
     worker_id = f"{settings.worker_id}:{socket.gethostname()}:{os.getpid()}"
@@ -259,6 +269,13 @@ async def run() -> None:
         owner_telegram_id=settings.platform_owner_telegram_id,
         timeout_seconds=min(30, settings.telegram_request_timeout_seconds),
     )
+    platform_summary_dispatcher = PlatformOwnerSummaryDispatcher(
+        session_factory,
+        api_base_url=settings.telegram_api_base_url,
+        bot_token=settings.telegram_owner_bot_token.get_secret_value(),
+        owner_telegram_id=settings.platform_owner_telegram_id,
+        timeout_seconds=min(30, settings.telegram_request_timeout_seconds),
+    )
     handlers.update(
         {
             "analysis.pipeline": analysis.pipeline,
@@ -295,6 +312,7 @@ async def run() -> None:
             "notification.group": notification_dispatcher.dispatch,
             "notification.initial_summary": notification_dispatcher.initial_summary,
             "platform.alert": platform_alert_dispatcher.dispatch,
+            "platform.summary": platform_summary_dispatcher.dispatch,
             "maintenance.session_health": maintenance.session_health_check,
         }
     )

@@ -26,6 +26,7 @@ from services.backend.services.owner_monitoring import (
     PlatformAlertMonitor,
     PlatformOwnerAlertDispatcher,
     build_operational_log_export,
+    build_platform_summary_text,
 )
 from services.backend.services.runtime_monitoring import record_runtime_heartbeat
 
@@ -59,15 +60,14 @@ def test_structured_formatter_redacts_safe_context_values_too() -> None:
 
 def test_system_monitoring_keyboard_exposes_only_fixed_safe_actions() -> None:
     callbacks = [
-        button.callback_data
-        for row in system_monitoring_menu().inline_keyboard
-        for button in row
+        button.callback_data for row in system_monitoring_menu().inline_keyboard for button in row
     ]
     assert callbacks == [
         "owner:system",
         "owner:system:errors",
         "owner:system:logs:1",
         "owner:system:logs:2",
+        "owner:activity",
         "owner:menu",
     ]
 
@@ -140,7 +140,19 @@ async def test_platform_alert_dispatcher_uses_allowlisted_message(monkeypatch) -
     result = await dispatcher.dispatch(_alert_job({"code": "disk_low", "state": "active"}))
     assert result == {"status": "sent", "code": "disk_low", "state": "active"}
     assert calls[0][1]["chat_id"] == 42
-    assert "На диске сервера" in str(calls[0][1]["text"])
+    rendered = str(calls[0][1]["text"])
+    assert "Заканчивается место на сервере" in rendered
+    assert "Что это значит" in rendered
+    assert "Что затронуто" in rendered
+    assert "Что сделать" in rendered
+    assert calls[0][1]["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {"text": "⚠️ Ошибки", "callback_data": "owner:system:errors"},
+                {"text": "🟢 Состояние", "callback_data": "owner:system"},
+            ]
+        ]
+    }
     assert "arbitrary" not in str(calls[0][1]["text"])
 
 
@@ -337,6 +349,59 @@ async def test_operational_export_is_bounded_and_omits_payloads(
         "ai_call_failed",
         "notification_state",
     }
+    assert all({"meaning", "impact", "admin_action"} <= item.keys() for item in events)
+
+
+@pytest.mark.asyncio
+async def test_platform_summary_aggregates_all_active_projects_for_last_24_hours(
+    session_factory, make_service, tenant_payload
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        first = await make_service(session).create_tenant(tenant_payload)
+        second = await make_service(session).create_tenant(
+            tenant_payload.model_copy(
+                update={
+                    "name": "Второй проект",
+                    "owner_telegram_username": "second_owner",
+                    "owner_telegram_user_id": tenant_payload.owner_telegram_user_id + 1,
+                }
+            )
+        )
+        session.add_all(
+            [
+                AIUsageCall(
+                    tenant_id=first.id,
+                    model="deepseek-test",
+                    job_type="signal.ai_triage",
+                    input_tokens=100,
+                    output_tokens=20,
+                    estimated_cost=0.01,
+                    duration_ms=10,
+                    status="success",
+                    occurred_at=now,
+                ),
+                AIUsageCall(
+                    tenant_id=second.id,
+                    model="deepseek-test",
+                    job_type="signal.ai_triage",
+                    input_tokens=50,
+                    output_tokens=10,
+                    estimated_cost=0.02,
+                    duration_ms=10,
+                    status="failed",
+                    error_code="deepseek_http_429",
+                    occurred_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+        rendered = await build_platform_summary_text(session, now=now)
+
+    assert "Активных проектов: <b>2</b>" in rendered
+    assert "Токенов: <b>180</b>" in rendered
+    assert "AI: <b>1</b>" in rendered
+    assert "Второй проект" in rendered
 
 
 @pytest.mark.asyncio
@@ -368,12 +433,14 @@ async def test_platform_alerts_are_transition_based_and_report_recovery(
                 .order_by(BackgroundJob.created_at)
             )
         )
-        assert await session.scalar(
-            select(func.count(RuntimeHealth.id)).where(
-                RuntimeHealth.component == "platform_monitor"
+        assert (
+            await session.scalar(
+                select(func.count(RuntimeHealth.id)).where(
+                    RuntimeHealth.component == "platform_monitor"
+                )
             )
-        ) == 1
-    assert [item.payload_json for item in jobs] == [
-        {"code": "disk_low", "state": "active"},
-        {"code": "disk_low", "state": "recovered"},
-    ]
+            == 1
+        )
+    assert [item.payload_json["code"] for item in jobs] == ["disk_low", "disk_low"]
+    assert [item.payload_json["state"] for item in jobs] == ["active", "recovered"]
+    assert all(isinstance(item.payload_json["free_percent"], float) for item in jobs)

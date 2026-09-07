@@ -35,6 +35,9 @@ async def run() -> None:
         queue,
         incremental_interval_seconds=int(settings.incremental_sync_interval_seconds),
         reconciliation_interval_seconds=settings.hourly_reconciliation_interval_seconds,
+        platform_summary_enabled=settings.platform_summary_enabled,
+        platform_summary_hour=settings.platform_summary_hour,
+        platform_summary_timezone=settings.platform_summary_timezone,
     )
     alert_monitor = PlatformAlertMonitor(
         session_factory,

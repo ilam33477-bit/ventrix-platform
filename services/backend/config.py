@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     telegram_sync_batch_pause_seconds: float = Field(default=1.0, ge=0.1, le=30)
     telegram_sync_max_messages_per_chat: int = Field(default=2000, ge=100, le=50_000)
     max_active_tenant_jobs: int = Field(default=2, ge=1, le=20)
+    # One global budget shared by AI calls, analysis pipelines and report generation.
+    # It is intentionally capped at two for the current single-core production host.
+    max_active_resource_jobs: int = Field(default=2, ge=1, le=2)
     max_active_ai_requests: int = Field(default=2, ge=1, le=20)
     max_active_ai_fast_requests: int = Field(default=2, ge=1, le=20)
     max_active_ai_heavy_requests: int = Field(default=1, ge=1, le=10)
@@ -86,6 +89,9 @@ class Settings(BaseSettings):
     platform_delivery_failure_alert_count: int = Field(default=5, ge=1, le=10_000)
     platform_sqlite_lock_alert_count: int = Field(default=3, ge=1, le=10_000)
     platform_disk_free_alert_percent: float = Field(default=10.0, ge=1, le=50)
+    platform_summary_enabled: bool = True
+    platform_summary_hour: int = Field(default=9, ge=0, le=23)
+    platform_summary_timezone: str = "Europe/Moscow"
     log_level: str = "INFO"
 
     @field_validator("signal_immediate_threshold")

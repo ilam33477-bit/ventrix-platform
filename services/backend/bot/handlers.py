@@ -29,19 +29,14 @@ from ..config import Settings
 from ..jobs.queue import SQLiteJobQueue
 from ..metrics import collect_runtime_metrics
 from ..models import (
-    AIUsageCall,
     AIUsageMetric,
     AnalysisRun,
     BackgroundJob,
-    Employee,
-    GroupIntegration,
-    NotificationLog,
     OperationalProblem,
     OwnerClientDraft,
     ProductEvent,
     Report,
     TelegramConnection,
-    TelegramDialog,
     TelegramMessage,
     Tenant,
     TenantAnalysisSchedule,
@@ -54,7 +49,7 @@ from ..services.client_drafts import ClientDraftData, OwnerClientDraftService
 from ..services.encryption import EncryptionService
 from ..services.foundation import BotAlreadyExistsError, FoundationService
 from ..services.onboarding_welcome import ensure_onboarding_welcome
-from ..services.owner_monitoring import build_operational_log_export
+from ..services.owner_monitoring import build_operational_log_export, build_platform_summary_text
 from ..services.product_events import ProductEventService
 from ..services.system_secrets import SystemSecretService, mask_secret
 from ..services.telegram import BotTokenVerificationError, TelegramBotVerifier
@@ -77,6 +72,7 @@ from .keyboards import (
     optional_access_end,
     optional_username,
     owner_main_menu,
+    platform_statistics_menu,
     system_monitoring_menu,
     system_secret_actions,
     system_secret_confirmation,
@@ -1837,95 +1833,8 @@ async def owner_activity(
     query: CallbackQuery, session_factory: async_sessionmaker[AsyncSession]
 ) -> None:
     async with session_factory() as session:
-        clients = int(await session.scalar(select(func.count(Tenant.id))) or 0)
-        connections = int(
-            await session.scalar(
-                select(func.count(TelegramConnection.id)).where(
-                    TelegramConnection.status.in_(("connected", "ready", "syncing")),
-                    TelegramConnection.deleted_at.is_(None),
-                )
-            )
-            or 0
-        )
-        employees = int(await session.scalar(select(func.count(Employee.id))) or 0)
-        dialogs = int(
-            await session.scalar(
-                select(func.count(TelegramDialog.id)).where(TelegramDialog.selected.is_(True))
-            )
-            or 0
-        )
-        groups = int(await session.scalar(select(func.count(GroupIntegration.id))) or 0)
-        messages = int(await session.scalar(select(func.count(TelegramMessage.id))) or 0)
-        queue_size = int(
-            await session.scalar(
-                select(func.count(BackgroundJob.id)).where(
-                    BackgroundJob.status.in_(
-                        ("pending", "scheduled", "waiting", "retry_scheduled", "running")
-                    )
-                )
-            )
-            or 0
-        )
-        fast_calls = int(
-            await session.scalar(
-                select(func.count(AIUsageCall.id)).where(AIUsageCall.job_type == "signal.ai_triage")
-            )
-            or 0
-        )
-        deep_calls = int(
-            await session.scalar(
-                select(func.count(AIUsageCall.id)).where(
-                    AIUsageCall.job_type == "ai_batch_analysis"
-                )
-            )
-            or 0
-        )
-        notifications = int(await session.scalar(select(func.count(NotificationLog.id))) or 0)
-        notification_errors = int(
-            await session.scalar(
-                select(func.count(NotificationLog.id)).where(NotificationLog.status == "failed")
-            )
-            or 0
-        )
-        tokens, cost = (
-            await session.execute(
-                select(
-                    func.coalesce(
-                        func.sum(AIUsageCall.input_tokens + AIUsageCall.output_tokens), 0
-                    ),
-                    func.coalesce(func.sum(AIUsageCall.estimated_cost), 0.0),
-                )
-            )
-        ).one()
-        reconnects = int(
-            await session.scalar(
-                select(func.count(ProductEvent.id)).where(
-                    ProductEvent.event_name.in_(
-                        ("telegram_reconnected", "telegram_connection_completed")
-                    )
-                )
-            )
-            or 0
-        )
-    await render(
-        query,
-        "<b>Статистика Ventrix</b>\n\n"
-        f"Клиенты: <b>{clients}</b>\n"
-        f"Активные Telegram connections: <b>{connections}</b>\n"
-        f"Сотрудники: <b>{employees}</b>\n"
-        f"Отслеживаемые диалоги: <b>{dialogs}</b>\n"
-        f"Рабочие группы: <b>{groups}</b>\n"
-        f"Сообщения обработаны: <b>{messages}</b>\n"
-        f"Очередь: <b>{queue_size}</b>\n\n"
-        f"AI fast calls: <b>{fast_calls}</b>\n"
-        f"AI deep calls: <b>{deep_calls}</b>\n"
-        f"Tokens: <b>{int(tokens or 0)}</b>\n"
-        f"Оценочная стоимость: <b>{float(cost or 0):.4f}</b>\n\n"
-        f"Уведомления: <b>{notifications}</b>\n"
-        f"Ошибки доставки: <b>{notification_errors}</b>\n"
-        f"Reconnects: <b>{reconnects}</b>",
-        back_to_owner_menu(),
-    )
+        summary = await build_platform_summary_text(session)
+    await render(query, summary, platform_statistics_menu())
 
 
 @router.callback_query(F.data == "owner:system")
@@ -1952,11 +1861,14 @@ async def system_status(
     queue = metrics.get("queue", {})
     runtime = metrics.get("runtime", {})
     runtime_rows = list(runtime.get("components") or [])
-    component_lines = "\n".join(
-        f"{_runtime_icon(str(item.get('status')))} {_runtime_label(str(item.get('component')))}: "
-        f"{_duration(int(item.get('heartbeat_age_seconds') or 0))} назад"
-        for item in sorted(runtime_rows, key=lambda row: str(row.get("component")))
-    ) or "— процессы ещё не зарегистрировали heartbeat"
+    component_lines = (
+        "\n".join(
+            f"{_runtime_icon(str(item.get('status')))} {_runtime_label(str(item.get('component')))}: "
+            f"{_duration(int(item.get('heartbeat_age_seconds') or 0))} назад"
+            for item in sorted(runtime_rows, key=lambda row: str(row.get("component")))
+        )
+        or "— процессы ещё не зарегистрировали heartbeat"
+    )
     host = metrics.get("host", {})
     disk_free = host.get("disk_free_percent")
     memory_available = host.get("memory_available_bytes")
@@ -1972,6 +1884,8 @@ async def system_status(
         f"SQLite: <b>{db_status}</b>\n"
         f"Административный бот: <b>{bot_status}</b>\n\n"
         f"<b>Процессы</b>\n{component_lines}\n\n"
+        "Heartbeat — служебная отметка «процесс жив». Зелёный статус означает, что отметка "
+        "пришла менее двух минут назад.\n\n"
         f"<b>Очередь</b>\n"
         f"Задач: <b>{int(queue.get('depth') or 0)}</b>\n"
         f"Самая старая: <b>{_duration(int(queue.get('oldest_job_age_seconds') or 0))}</b>\n\n"
@@ -2027,19 +1941,20 @@ def _size(value: object) -> str:
 
 def _runtime_label(component: str) -> str:
     if component.startswith("worker:"):
-        return "Worker"
+        return "Фоновый обработчик"
     return {
-        "api": "Backend API",
-        "scheduler": "Scheduler",
-        "owner_bot": "Owner bot",
-        "client_bots": "Client bots",
-        "telegram_runtime": "Telegram runtime",
+        "api": "API приложения",
+        "scheduler": "Планировщик",
+        "owner_bot": "Админ-бот",
+        "client_bots": "Клиентские боты",
+        "telegram_runtime": "Telegram-сессии",
+        "worker": "Фоновый обработчик (2 тяжёлых слота)",
         "platform_monitor": "Мониторинг",
     }.get(component, component)
 
 
 def _runtime_icon(status: str) -> str:
-    return "🟢" if status == "healthy" else "🟠" if status == "stopped" else "🔴"
+    return "🟢" if status == "healthy" else "🟠" if status in {"attention", "stopped"} else "🔴"
 
 
 @router.callback_query(F.data == "owner:system:errors")
@@ -2050,14 +1965,20 @@ async def system_errors(
     async with session_factory() as session:
         metrics = await collect_runtime_metrics(session)
     codes = metrics["ai"].get("error_codes_last_hour") or {}
-    code_lines = "\n".join(
-        f"• <code>{escape(str(code))}</code>: {int(count)}"
-        for code, count in sorted(codes.items())
-    ) or "• ошибок AI за последний час нет"
-    category_lines = "\n".join(
-        f"• {escape(str(category))}: {int(count)}"
-        for category, count in sorted(metrics["queue"]["depth_by_category"].items())
-    ) or "• очередь пуста"
+    code_lines = (
+        "\n".join(
+            f"• <code>{escape(str(code))}</code>: {int(count)}"
+            for code, count in sorted(codes.items())
+        )
+        or "• ошибок AI за последний час нет"
+    )
+    category_lines = (
+        "\n".join(
+            f"• {escape(str(category))}: {int(count)}"
+            for category, count in sorted(metrics["queue"]["depth_by_category"].items())
+        )
+        or "• очередь пуста"
+    )
     await render(
         query,
         "<b>Ошибки и задержки</b>\n\n"
@@ -2066,7 +1987,15 @@ async def system_errors(
         f"Просроченные отчёты: <b>{metrics['reports']['overdue']}</b>\n"
         f"Конфликты SQLite за час: <b>{metrics['sqlite']['lock_failures_last_hour']}</b>\n\n"
         f"<b>AI-коды за час</b>\n{code_lines}\n\n"
-        f"<b>Очередь по категориям</b>\n{category_lines}",
+        f"<b>Очередь по категориям</b>\n{category_lines}\n\n"
+        "<b>Как читать этот экран</b>\n"
+        "• Ошибка задачи — конкретный этап исчерпал автоповторы; остальные проекты продолжают работать.\n"
+        "• Ошибка доставки — ситуация сохранена, но Telegram мог не показать карточку адресату.\n"
+        "• Просроченный отчёт — мониторинг работает, задержалась только сводка.\n"
+        "• SQLite lock — краткий конфликт записи; система повторяет такую операцию автоматически.\n\n"
+        "<b>Что делать</b>\n"
+        "Если значения равны нулю — действий не требуется. Если счётчик растёт два обновления подряд, "
+        "скачайте логи за 1 час и проверьте указанный error_code.",
         system_monitoring_menu(),
     )
 
@@ -2097,8 +2026,7 @@ async def system_logs(
     await query.message.answer_document(
         BufferedInputFile(content, filename=f"ventrix-logs-{hours}h-{timestamp}.jsonl"),
         caption=(
-            f"Системные события Ventrix за {hours} ч. "
-            "Без токенов, кодов входа и текстов переписок."
+            f"Системные события Ventrix за {hours} ч. Без токенов, кодов входа и текстов переписок."
         ),
     )
 

@@ -90,6 +90,34 @@ def test_next_analysis_time_respects_timezone_days_and_advance() -> None:
 
 
 @pytest.mark.asyncio
+async def test_platform_summary_is_scheduled_once_per_local_day(session_factory) -> None:
+    queue = SQLiteJobQueue(session_factory)
+    scheduler = TenantAnalysisScheduler(
+        session_factory,
+        queue=queue,
+        platform_summary_hour=9,
+        platform_summary_timezone="Europe/Moscow",
+    )
+    before = datetime(2026, 9, 7, 5, 59, tzinfo=UTC)
+    due = datetime(2026, 9, 7, 6, 0, tzinfo=UTC)
+
+    assert await scheduler._schedule_platform_summary(before) == []
+    first = await scheduler._schedule_platform_summary(due)
+    repeated = await scheduler._schedule_platform_summary(due + timedelta(hours=1))
+
+    assert first == repeated
+    async with session_factory() as session:
+        jobs = list(
+            await session.scalars(
+                select(BackgroundJob).where(BackgroundJob.job_type == "platform.summary")
+            )
+        )
+    assert len(jobs) == 1
+    assert jobs[0].tenant_id is None
+    assert jobs[0].category == "notification"
+
+
+@pytest.mark.asyncio
 async def test_weekly_schedule_passes_seven_day_report_window(
     session_factory, make_service, tenant_payload
 ) -> None:

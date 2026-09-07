@@ -27,18 +27,22 @@ HEAVY_JOB_TYPES = {
     "report.company",
 }
 AI_PROVIDER_COST_CLASSES = frozenset({"ai_fast", "ai_heavy"})
-AI_PROVIDER_JOB_TYPES = frozenset({
-    "signal.ai_triage",
-    "ai_batch_analysis",
-    "feedback.synthesize",
-    "problem.evaluate",
-    "analysis.hourly",
-    "report_generation",
-    "report.employee",
-    "report.client",
-    "report.company",
-    "ai.interactive",
-})
+AI_PROVIDER_JOB_TYPES = frozenset(
+    {
+        "signal.ai_triage",
+        "ai_batch_analysis",
+        "feedback.synthesize",
+        "problem.evaluate",
+        "analysis.hourly",
+        "report_generation",
+        "report.employee",
+        "report.client",
+        "report.company",
+        "ai.interactive",
+    }
+)
+RESOURCE_INTENSIVE_COST_CLASSES = frozenset({"ai_fast", "ai_heavy", "heavy"})
+RESOURCE_INTENSIVE_JOB_TYPES = frozenset(HEAVY_JOB_TYPES) | AI_PROVIDER_JOB_TYPES
 
 JOB_PRIORITY = {
     "P0": 0,
