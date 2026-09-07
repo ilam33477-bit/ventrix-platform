@@ -28,7 +28,7 @@ from .conversation_state import assess_conversation
 from .message_relevance import classify_message_relevance, dialogue_is_explicitly_closed
 from .notifications import NotificationOrchestrator
 from .problem_lifecycle import initialize_problem_lifecycle
-from .triage import TriageResult, parse_triage_result
+from .triage import TriageResult, parse_triage_result, parse_triage_result_lenient
 
 TRIAGE_SYSTEM_PROMPT = """You classify and triage one Telegram event. Return JSON only.
 Required keys: criticality (0-100), category, requires_immediate_attention,
@@ -185,7 +185,11 @@ class AITriageService:
                     max_tokens=900,
                     user_id=signal.tenant_id,
                 )
-                result, repaired = parse_triage_result(raw)
+                try:
+                    result, repaired = parse_triage_result(raw)
+                except ValidationError:
+                    result = parse_triage_result_lenient(raw)
+                    repaired = True
         except Exception as exc:
             await self._record_usage(
                 job,

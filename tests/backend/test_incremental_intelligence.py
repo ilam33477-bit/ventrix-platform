@@ -14,7 +14,11 @@ from services.backend.intelligence.message_relevance import dialogue_is_explicit
 from services.backend.intelligence.notifications import NotificationOrchestrator
 from services.backend.intelligence.reconciliation import ReconciliationService
 from services.backend.intelligence.signals import SignalService
-from services.backend.intelligence.triage import TriageResult, parse_triage_result
+from services.backend.intelligence.triage import (
+    TriageResult,
+    parse_triage_result,
+    parse_triage_result_lenient,
+)
 from services.backend.jobs.queue import JOB_PRIORITY, JobLease, SQLiteJobQueue
 from services.backend.models import (
     AIUsageCall,
@@ -579,6 +583,39 @@ def test_triage_json_is_strict_and_supports_one_controlled_repair() -> None:
     assert repaired is True and result.criticality == 72
     with pytest.raises(ValidationError):
         parse_triage_result("AI says this is probably important")
+
+
+def test_triage_json_lenient_fallback_normalizes_provider_schema_drift() -> None:
+    raw = """{
+        "criticality": "105",
+        "category": "payment_question",
+        "requires_manager_notification": "yes",
+        "reason": "Клиент уточняет оплату.",
+        "recommended_action": "Ответить по условиям.",
+        "recommended_deadline_minutes": "30",
+        "message_class": "business",
+        "business_relevance": "true",
+        "conversation_state": "waiting-for-employee",
+        "response_required": "true",
+        "action_required": "true",
+        "issue_family": "payment-question",
+        "confidence": "0.9",
+        "evidence_message_ids": null,
+        "close_existing_issue_families": ["unanswered-request", null],
+        "unexpected_provider_field": "ignored"
+    }"""
+
+    result = parse_triage_result_lenient(raw)
+
+    assert result.criticality == 100
+    assert result.requires_immediate_attention is False
+    assert result.requires_manager_notification is True
+    assert result.recommended_deadline_minutes == 30
+    assert result.conversation_state == "WAITING_FOR_EMPLOYEE"
+    assert result.issue_family == "PAYMENT_QUESTION"
+    assert result.evidence_message_ids == []
+    assert result.close_existing_issue_families == ["UNANSWERED_REQUEST"]
+    assert result.confidence == 0.9
 
 
 @pytest.mark.asyncio
