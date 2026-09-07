@@ -375,6 +375,7 @@ async def run() -> None:
         "background_worker_pools_started",
         worker_id=worker_id,
         pools={name: concurrency for name, _, concurrency in pool_specs},
+        resource_intensive_limit=settings.max_active_resource_jobs,
     )
     async with asyncio.TaskGroup() as tasks:
         tasks.create_task(
@@ -385,6 +386,7 @@ async def run() -> None:
                 details={
                     "release_revision": settings.release_revision,
                     "pools": {name: concurrency for name, _, concurrency in pool_specs},
+                    "resource_intensive_limit": settings.max_active_resource_jobs,
                 },
             ),
             name="worker-runtime-heartbeat",
