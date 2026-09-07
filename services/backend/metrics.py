@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -79,13 +79,12 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
     now = datetime.now(UTC)
     one_hour_ago = now - timedelta(hours=1)
     one_day_ago = now - timedelta(days=1)
-    active_statuses = (
+    ready_statuses = (
         "pending",
         "scheduled",
         "waiting",
         "retry",
         "retry_scheduled",
-        "running",
     )
     active_by_category_rows = (
         await session.execute(
@@ -94,7 +93,15 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
                 func.count(BackgroundJob.id),
                 func.min(BackgroundJob.created_at),
             )
-            .where(BackgroundJob.status.in_(active_statuses))
+            .where(
+                or_(
+                    BackgroundJob.status == "running",
+                    (
+                        BackgroundJob.status.in_(ready_statuses)
+                        & (BackgroundJob.scheduled_at <= now)
+                    ),
+                )
+            )
             .group_by(BackgroundJob.category)
         )
     ).all()

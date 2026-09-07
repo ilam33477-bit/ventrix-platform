@@ -266,6 +266,27 @@ async def test_queue_depth_is_exact_beyond_recent_metrics_window(session_factory
 
 
 @pytest.mark.asyncio
+async def test_future_scheduled_job_is_not_reported_as_backlog(session_factory) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            BackgroundJob(
+                job_type="dialog.sla_check",
+                payload_json={},
+                status="scheduled",
+                scheduled_at=now + timedelta(hours=2),
+                category="reconciliation",
+                cost_class="light",
+            )
+        )
+        await session.commit()
+        metrics = await collect_runtime_metrics(session)
+
+    assert metrics["queue"]["depth"] == 0
+    assert metrics["queue"]["oldest_job_age_seconds"] == 0
+
+
+@pytest.mark.asyncio
 async def test_lock_and_flood_alert_counters_only_cover_last_hour(session_factory) -> None:
     now = datetime.now(UTC)
     async with session_factory() as session:
