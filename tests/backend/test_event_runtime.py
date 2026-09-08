@@ -386,6 +386,36 @@ async def test_employee_reply_seconds_before_deadline_makes_sla_job_a_noop(
 
 
 @pytest.mark.asyncio
+async def test_employee_reply_after_deadline_still_makes_delayed_sla_job_a_noop(
+    session_factory, make_service, tenant_payload
+) -> None:
+    tenant, connection, dialog, message = await _sla_fixture(
+        session_factory, make_service, tenant_payload, minutes_ago=120
+    )
+    async with session_factory() as session:
+        session.add(
+            TelegramMessage(
+                tenant_id=tenant.id,
+                connection_id=connection.id,
+                dialog_id=dialog.id,
+                telegram_message_id=2,
+                sender_role="account_owner",
+                sent_at=message.sent_at + timedelta(minutes=90),
+                outgoing=True,
+                body_text="Конечно, отвечаю на ваш вопрос.",
+                attachments_json=[],
+            )
+        )
+        await session.commit()
+    result = await ReconciliationService(session_factory, SQLiteJobQueue(session_factory)).sla_check(
+        _sla_lease(tenant, connection, dialog, message)
+    )
+    assert result == {"created": False, "problem_id": None}
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(OperationalProblem.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_historical_bot_message_is_not_scanned_even_if_previously_selected(
     session_factory, make_service, tenant_payload
 ) -> None:

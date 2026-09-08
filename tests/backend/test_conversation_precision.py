@@ -127,6 +127,26 @@ def test_farewell_reply_closes_the_conversation() -> None:
     assert not result.response_required
 
 
+def test_reciprocal_farewell_with_name_closes_the_conversation() -> None:
+    result = assess_conversation(
+        dialog(
+            ("Понял вас, спасибо за уделённое время, хорошего вечера", True),
+            ("И тебе, Илья", False),
+        )
+    )
+    assert result.conversation_state == "CLOSED_SUCCESS"
+    assert not result.response_required
+    assert not result.action_required
+
+
+def test_reciprocal_phrase_does_not_hide_a_substantive_request() -> None:
+    result = assess_conversation(
+        dialog(("Могу прислать материалы", True), ("И тебе отправить файл", False))
+    )
+    assert result.conversation_state == "WAITING_FOR_EMPLOYEE"
+    assert result.action_required
+
+
 def test_declarative_reply_in_active_conversation_starts_expectation() -> None:
     result = assess_conversation(
         dialog(
