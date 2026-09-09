@@ -115,6 +115,50 @@ def actor_for(connection, client, queue, session_factory) -> TelegramSessionActo
 
 
 @pytest.mark.asyncio
+async def test_counter_flush_refreshes_idle_heartbeat_and_recovers_expired_flood_wait(
+    session_factory, make_service, tenant_payload
+) -> None:
+    old_heartbeat = datetime.now(UTC) - timedelta(minutes=5)
+    async with session_factory() as session:
+        tenant = await make_service(session).create_tenant(tenant_payload)
+        connection = TelegramConnection(
+            tenant_id=tenant.id,
+            status="ready",
+            runtime_status="rate_limited",
+            health_status="healthy",
+            runtime_heartbeat_at=old_heartbeat,
+            rate_limited_until=datetime.now(UTC) - timedelta(seconds=1),
+            last_error_code="flood_wait",
+        )
+        session.add(connection)
+        await session.commit()
+        connection_id = connection.id
+
+    actor = actor_for(connection, object(), SQLiteJobQueue(session_factory), session_factory)
+    actor._updates_received = 0
+    actor._edited_received = 0
+
+    async def owns_runtime() -> bool:
+        return True
+
+    actor._owns_runtime = owns_runtime
+    await actor._flush_counters()
+
+    async with session_factory() as session:
+        refreshed = await session.get(TelegramConnection, connection_id)
+        assert refreshed is not None
+        assert refreshed.runtime_status == "running"
+        assert refreshed.health_status == "healthy"
+        assert refreshed.rate_limited_until is None
+        assert refreshed.last_error_code is None
+        assert refreshed.runtime_heartbeat_at is not None
+        heartbeat = refreshed.runtime_heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=UTC)
+        assert heartbeat > old_heartbeat
+
+
+@pytest.mark.asyncio
 async def test_live_group_filter_uses_only_explicit_monitored_sources(
     session_factory, make_service, tenant_payload
 ) -> None:

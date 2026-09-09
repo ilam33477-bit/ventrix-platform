@@ -1144,21 +1144,33 @@ class TelegramSessionActor:
 
     async def _flush_counters(self) -> None:
         updates, edited = self._updates_received, self._edited_received
-        if not updates and not edited:
-            return
         if not await self._owns_runtime():
             return
-        self._updates_received = 0
-        self._edited_received = 0
 
         async def write(session: AsyncSession) -> None:
             connection = await session.get(TelegramConnection, self.connection.id)
             if connection:
                 connection.updates_received += updates
                 connection.edited_updates_received += edited
-                connection.runtime_heartbeat_at = datetime.now(UTC)
+                now = datetime.now(UTC)
+                connection.runtime_heartbeat_at = now
+                rate_limited_until = connection.rate_limited_until
+                if rate_limited_until is not None and rate_limited_until.tzinfo is None:
+                    rate_limited_until = rate_limited_until.replace(tzinfo=UTC)
+                if connection.runtime_status == "rate_limited" and (
+                    rate_limited_until is None or rate_limited_until <= now
+                ):
+                    connection.runtime_status = "running"
+                    connection.health_status = "healthy"
+                    connection.rate_limited_until = None
+                    if connection.last_error_code == "flood_wait":
+                        connection.last_error_code = None
 
         await self.transactions.run(write)
+        # Events may arrive while ownership and the database write are awaited.
+        # Subtract only the persisted snapshot so those new events remain queued.
+        self._updates_received = max(0, self._updates_received - updates)
+        self._edited_received = max(0, self._edited_received - edited)
 
     async def _rate_limited(self, seconds: int) -> None:
         if not await self._owns_runtime():
