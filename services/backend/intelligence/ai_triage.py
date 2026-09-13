@@ -156,6 +156,7 @@ class AITriageService:
         started = time.perf_counter()
         raw = ""
         usage: dict[str, int] = {}
+        usage_status = "completed"
         call_started = time.perf_counter()
         try:
             raw, usage = await self.provider.generate_json(
@@ -168,28 +169,37 @@ class AITriageService:
             try:
                 result, repaired = parse_triage_result(raw)
             except ValidationError:
-                await self._record_usage(
-                    job,
-                    signal,
-                    usage,
-                    int((time.perf_counter() - call_started) * 1000),
-                    "invalid_json",
-                    "ValidationError",
-                )
-                call_started = time.perf_counter()
-                raw, usage = await self.provider.generate_json(
-                    model=self.model,
-                    system_prompt=TRIAGE_SYSTEM_PROMPT
-                    + "\nPrevious response was invalid. Return complete valid JSON only.",
-                    payload=payload,
-                    max_tokens=900,
-                    user_id=signal.tenant_id,
-                )
                 try:
-                    result, repaired = parse_triage_result(raw)
-                except ValidationError:
                     result = parse_triage_result_lenient(raw)
                     repaired = True
+                    usage_status = "format_recovered"
+                except (TypeError, ValueError):
+                    # A syntactically unusable response still gets one bounded retry.
+                    # Schema drift in a valid object is repaired locally above and does
+                    # not consume a second provider request.
+                    await self._record_usage(
+                        job,
+                        signal,
+                        usage,
+                        int((time.perf_counter() - call_started) * 1000),
+                        "format_retry",
+                        "invalid_json",
+                    )
+                    call_started = time.perf_counter()
+                    raw, usage = await self.provider.generate_json(
+                        model=self.model,
+                        system_prompt=TRIAGE_SYSTEM_PROMPT
+                        + "\nPrevious response was invalid. Return complete valid JSON only.",
+                        payload=payload,
+                        max_tokens=900,
+                        user_id=signal.tenant_id,
+                    )
+                    try:
+                        result, repaired = parse_triage_result(raw)
+                    except ValidationError:
+                        result = parse_triage_result_lenient(raw)
+                        repaired = True
+                        usage_status = "format_recovered"
         except Exception as exc:
             await self._record_usage(
                 job,
@@ -205,7 +215,7 @@ class AITriageService:
             signal,
             usage,
             int((time.perf_counter() - call_started) * 1000),
-            "completed",
+            usage_status,
             None,
         )
         problem_id = await self._apply_result(

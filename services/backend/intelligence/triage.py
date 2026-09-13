@@ -89,7 +89,7 @@ def parse_triage_result(raw: str) -> tuple[TriageResult, bool]:
 
 
 def parse_triage_result_lenient(raw: str) -> TriageResult:
-    """Normalize a JSON object after two strict provider responses failed validation.
+    """Normalize a provider JSON object after strict schema validation fails.
 
     This deliberately uses conservative defaults: an omitted action/response flag does not
     create a client problem. Non-JSON output still fails so the queue can retry it normally.

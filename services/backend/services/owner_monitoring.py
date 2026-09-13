@@ -27,6 +27,13 @@ from ..observability import redact_log_text
 MAX_EXPORT_ROWS = 5000
 MAX_EXPORT_BYTES = 1_500_000
 SAFE_CODE_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+AI_NON_ERROR_STATUSES = (
+    "success",
+    "completed",
+    "invalid_json",  # legacy intermediate retry, not a terminal failure
+    "format_retry",
+    "format_recovered",
+)
 
 
 LOG_GUIDANCE = {
@@ -157,7 +164,7 @@ async def build_operational_log_export(
             select(AIUsageCall)
             .where(
                 AIUsageCall.occurred_at >= since,
-                AIUsageCall.status.not_in(("success", "completed")),
+                AIUsageCall.status.not_in(AI_NON_ERROR_STATUSES),
             )
             .order_by(AIUsageCall.occurred_at.desc())
             .limit(1000)
@@ -448,7 +455,21 @@ async def build_platform_summary_text(
                 func.coalesce(
                     func.sum(
                         case(
-                            (AIUsageCall.status.not_in(("success", "completed")), 1),
+                            (AIUsageCall.status.not_in(AI_NON_ERROR_STATUSES), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                AIUsageCall.status.in_(
+                                    ("invalid_json", "format_retry", "format_recovered")
+                                ),
+                                1,
+                            ),
                             else_=0,
                         )
                     ),
@@ -497,8 +518,9 @@ async def build_platform_summary_text(
             "cost": float(cost or 0),
             "calls": int(calls or 0),
             "errors": int(errors or 0),
+            "format_corrections": int(format_corrections or 0),
         }
-        for tenant_id, tokens, cost, calls, errors in ai_rows
+        for tenant_id, tokens, cost, calls, errors, format_corrections in ai_rows
     }
     problems_by_tenant = {tenant_id: int(count) for tenant_id, count in problem_rows}
     signals_by_tenant = {tenant_id: int(count) for tenant_id, count in signal_rows}
@@ -510,6 +532,7 @@ async def build_platform_summary_text(
     total_cost = sum(row["cost"] for row in ai_by_tenant.values())
     total_calls = sum(row["calls"] for row in ai_by_tenant.values())
     total_ai_errors = sum(row["errors"] for row in ai_by_tenant.values())
+    total_format_corrections = sum(row["format_corrections"] for row in ai_by_tenant.values())
     total_problems = sum(problems_by_tenant.values())
     total_signals = sum(signals_by_tenant.values())
     total_job_errors = sum(jobs_by_tenant.values())
@@ -552,6 +575,7 @@ async def build_platform_summary_text(
         f"Запросов: <b>{total_calls}</b>\n"
         f"Токенов: <b>{total_tokens:,}</b>\n"
         f"Оценочная стоимость: <b>{total_cost:.4f}</b>\n\n"
+        f"Автокоррекций формата AI: <b>{total_format_corrections}</b>\n\n"
         f"<b>Ошибки за период</b>\n"
         f"AI: <b>{total_ai_errors}</b> · задачи: <b>{total_job_errors}</b> · "
         f"доставка: <b>{total_delivery_errors}</b>\n\n"

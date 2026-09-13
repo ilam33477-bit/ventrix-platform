@@ -1891,6 +1891,7 @@ async def system_status(
         f"Самая старая: <b>{_duration(int(queue.get('oldest_job_age_seconds') or 0))}</b>\n\n"
         f"<b>Ошибки</b>\n"
         f"AI за час: <b>{int(ai.get('errors_last_hour') or 0)}</b>\n"
+        f"Автокоррекции формата AI: <b>{int(ai.get('format_corrections_last_hour') or 0)}</b>\n"
         f"AI p95: <b>{_duration_ms((ai.get('latency_ms') or {}).get('p95'))}</b>\n"
         f"Доставка за час: <b>{int(notifications.get('failures_last_hour') or 0)}</b>\n"
         f"Просроченные отчёты: <b>{int(reports.get('overdue') or 0)}</b>\n"

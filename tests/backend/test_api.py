@@ -231,13 +231,22 @@ async def test_owner_api_endpoints(
                     status="failed",
                     error_code="deepseek_http_429",
                 ),
+                AIUsageCall(
+                    tenant_id=tenant_id,
+                    model="deepseek-test",
+                    job_type="ai_batch_analysis",
+                    duration_ms=15,
+                    status="invalid_json",
+                    error_code="ValidationError",
+                ),
             ])
             await session.commit()
         ai_metrics = (await client.get("/metrics", headers=headers)).json()["ai"]
         assert ai_metrics["errors"] == 1
+        assert ai_metrics["invalid_json"] == 1
         assert ai_metrics["by_job_type"]["ai_batch_analysis"] == {
-            "calls": 2,
-            "duration_ms": 30,
+            "calls": 3,
+            "duration_ms": 45,
             "errors": 1,
         }
 
@@ -319,7 +328,7 @@ async def test_owner_api_endpoints(
         )
         assert mini_app_auth.json()["permissions"] == ["*"]
         assert "dashboard_summary" in mini_app_auth.json()
-        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {"calls_today": 2}
+        assert mini_app_auth.json()["dashboard_summary"]["ai_usage"] == {"calls_today": 3}
         assert "tokens_today" not in mini_app_auth.json()["dashboard_summary"]["ai_usage"]
         assert mini_app_auth.json()["project_context"]["onboarding"] == {
             "step": "welcome",

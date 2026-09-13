@@ -412,6 +412,15 @@ def test_preprocessing_and_controlled_json_repair() -> None:
     assert repaired is True
     assert parsed.batch_id == "b1"
 
+    provider_extension = """{
+      "schema_version":"1.0","tenant_id":"t1","batch_id":"b1",
+      "dialog_results":[],"usage":{"input_tokens":1,"output_tokens":2},
+      "provider_reasoning":"not part of the contract"
+    }"""
+    parsed, repaired = parse_analysis_response(provider_extension)
+    assert repaired is False
+    assert parsed.batch_id == "b1"
+
 
 def test_compaction_keeps_fresh_tail_and_relevant_historical_evidence() -> None:
     now = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)

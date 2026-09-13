@@ -8,7 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class DetectedProblem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Provider-added explanatory keys are harmless; rejecting the entire batch
+    # for them caused expensive retries and occasional terminal failures.
+    model_config = ConfigDict(extra="ignore")
 
     event_type: str = Field(min_length=1, max_length=64)
     is_problem: bool
@@ -28,7 +30,7 @@ class DetectedProblem(BaseModel):
 
 
 class BusinessOutcome(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     outcome_type: Literal[
         "interest_confirmed",
@@ -45,7 +47,7 @@ class BusinessOutcome(BaseModel):
 
 
 class DialogAnalysisResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     chat_id: str
     dialog_type: str
@@ -57,14 +59,14 @@ class DialogAnalysisResult(BaseModel):
 
 
 class AIUsage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
 
 
 class AnalysisResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     schema_version: Literal["1.0"]
     tenant_id: str
@@ -74,7 +76,7 @@ class AnalysisResponse(BaseModel):
 
 
 class ReportEmployeeNote(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     employee_id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=256)
@@ -82,7 +84,7 @@ class ReportEmployeeNote(BaseModel):
 
 
 class ReportDialogNote(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     dialog: str = Field(min_length=1, max_length=256)
     summary: str = Field(min_length=1, max_length=1200)
@@ -91,7 +93,7 @@ class ReportDialogNote(BaseModel):
 class ReportNarrative(BaseModel):
     """Strict client-visible report copy returned by the optional AI provider."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     executive_summary: str = Field(min_length=1, max_length=2400)
     highlights: list[str] = Field(default_factory=list, max_length=12)

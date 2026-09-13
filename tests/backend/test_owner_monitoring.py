@@ -414,6 +414,15 @@ async def test_platform_summary_aggregates_all_active_projects_for_last_24_hours
                     error_code="deepseek_http_429",
                     occurred_at=now,
                 ),
+                AIUsageCall(
+                    tenant_id=first.id,
+                    model="deepseek-test",
+                    job_type="signal.ai_triage",
+                    duration_ms=5,
+                    status="invalid_json",
+                    error_code="ValidationError",
+                    occurred_at=now,
+                ),
             ]
         )
         await session.commit()
@@ -422,6 +431,7 @@ async def test_platform_summary_aggregates_all_active_projects_for_last_24_hours
     assert "Активных проектов: <b>2</b>" in rendered
     assert "Токенов: <b>180</b>" in rendered
     assert "AI: <b>1</b>" in rendered
+    assert "Автокоррекций формата AI: <b>1</b>" in rendered
     assert "Второй проект" in rendered
 
 

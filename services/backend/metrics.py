@@ -223,12 +223,27 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
         )
         or 0
     )
-    successful_ai_statuses = {"success", "completed"}
+    # Provider format corrections are recovered attempts, not operational failures.
+    successful_ai_statuses = {
+        "success",
+        "completed",
+        "invalid_json",  # legacy name for a retry that subsequently completed
+        "format_retry",
+        "format_recovered",
+    }
     ai_errors = [item for item in ai_calls if item.status not in successful_ai_statuses]
     recent_ai_errors = [
         item for item in ai_errors if _utc(item.occurred_at) >= one_hour_ago
     ]
-    invalid_json = [item for item in ai_errors if item.error_code == "invalid_json"]
+    format_corrections = [
+        item
+        for item in ai_calls
+        if item.status in {"invalid_json", "format_retry", "format_recovered"}
+        or item.error_code == "invalid_json"
+    ]
+    recent_format_corrections = [
+        item for item in format_corrections if _utc(item.occurred_at) >= one_hour_ago
+    ]
     recent_operational_errors = [
         item
         for item in jobs
@@ -362,7 +377,8 @@ async def collect_runtime_metrics(session: AsyncSession) -> dict[str, Any]:
             "error_codes_last_hour": dict(
                 Counter(item.error_code or "unknown" for item in recent_ai_errors)
             ),
-            "invalid_json": len(invalid_json),
+            "invalid_json": len(format_corrections),
+            "format_corrections_last_hour": len(recent_format_corrections),
             "by_job_type": ai_by_job_type,
         },
         "sqlite": {"lock_failures_last_hour": len(sqlite_locks)},

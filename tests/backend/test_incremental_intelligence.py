@@ -122,27 +122,47 @@ class IncrementalGateway:
 
 
 class FakeTriageProvider:
-    def __init__(self, criticality: int = 92, *, manager_notification: bool = True) -> None:
+    def __init__(
+        self,
+        criticality: int = 92,
+        *,
+        manager_notification: bool = True,
+        schema_drift: bool = False,
+    ) -> None:
         self.calls = 0
         self.criticality = criticality
         self.manager_notification = manager_notification
+        self.schema_drift = schema_drift
 
     async def generate_json(self, **kwargs):
         self.calls += 1
-        return (
-            json.dumps(
+        payload = {
+            "criticality": self.criticality,
+            "category": "contract_question",
+            "requires_immediate_attention": True,
+            "requires_employee_notification": True,
+            "requires_manager_notification": self.manager_notification,
+            "reason": "Клиент готов начать и запросил договор.",
+            "recommended_action": "Ответить клиенту и отправить договор.",
+            "recommended_deadline_minutes": 15,
+            "needs_deep_analysis": False,
+        }
+        if self.schema_drift:
+            payload.update(
                 {
-                    "criticality": self.criticality,
-                    "category": "contract_question",
-                    "requires_immediate_attention": True,
-                    "requires_employee_notification": True,
-                    "requires_manager_notification": self.manager_notification,
-                    "reason": "Клиент готов начать и запросил договор.",
-                    "recommended_action": "Ответить клиенту и отправить договор.",
-                    "recommended_deadline_minutes": 15,
-                    "needs_deep_analysis": False,
+                    "criticality": str(self.criticality),
+                    "message_class": "business",
+                    "business_relevance": "true",
+                    "conversation_state": "waiting-for-employee",
+                    "response_required": "true",
+                    "action_required": "true",
+                    "issue_family": "commercial-opportunity",
+                    "confidence": "0.95",
+                    "unexpected_provider_field": "ignored",
                 }
-            ),
+            )
+        return (
+            json.dumps(payload),
             {"input_tokens": 120, "output_tokens": 40},
         )
 
@@ -702,7 +722,7 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
     )
     lease = await queue.claim_next("triage-test")
     assert lease is not None and lease.id == job_id
-    provider = FakeTriageProvider(manager_notification=False)
+    provider = FakeTriageProvider(manager_notification=False, schema_drift=True)
     result = await AITriageService(session_factory, queue, provider, model="deepseek-test").triage(
         lease
     )
@@ -714,6 +734,7 @@ async def test_critical_triage_records_usage_problem_and_privacy_safe_notificati
         logs = list(await session.scalars(select(NotificationLog)))
     assert provider.calls == 1
     assert usage.input_tokens == 120 and usage.output_tokens == 40
+    assert usage.status == "format_recovered"
     assert {item.destination_type for item in logs} == {"employee", "manager", "group"}
     group_payload = next(item.payload_json for item in logs if item.destination_type == "group")
     assert group_payload["privacy_safe"] is True

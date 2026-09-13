@@ -1228,12 +1228,14 @@ class TelegramSessionRuntime:
         gateway: TelethonGateway,
         queue: SQLiteJobQueue,
         instance_id: str,
+        reconcile_interval_seconds: float = 15.0,
     ) -> None:
         self.session_factory = session_factory
         self.encryption = encryption
         self.gateway = gateway
         self.queue = queue
         self.instance_id = instance_id
+        self.reconcile_interval_seconds = reconcile_interval_seconds
         self.leases = TelegramRuntimeLeaseStore(session_factory)
         self.actors: dict[str, tuple[TelegramSessionActor, asyncio.Task[None]]] = {}
 
@@ -1303,7 +1305,7 @@ class TelegramSessionRuntime:
         try:
             while True:
                 await self.reconcile()
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.reconcile_interval_seconds)
         finally:
             await self.close()
 
@@ -1332,6 +1334,7 @@ async def run() -> None:
         ),
         SQLiteJobQueue(session_factory),
         f"{socket.gethostname()}:{uuid4()}",
+        reconcile_interval_seconds=settings.telegram_runtime_reconcile_interval_seconds,
     )
     log_event(logger, logging.INFO, "telegram_session_runtime_started")
     heartbeat = asyncio.create_task(
