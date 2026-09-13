@@ -14,7 +14,11 @@ from services.backend.analysis.preprocessing import (
     local_features,
     pack_dialog_payloads,
 )
-from services.backend.analysis.schema import ReportNarrative, parse_analysis_response
+from services.backend.analysis.schema import (
+    ReportNarrative,
+    normalize_analysis_response,
+    parse_analysis_response,
+)
 from services.backend.analysis.service import AnalysisPipelineService, canonical_problem_type
 from services.backend.jobs.queue import SQLiteJobQueue
 from services.backend.models import (
@@ -420,6 +424,26 @@ def test_preprocessing_and_controlled_json_repair() -> None:
     parsed, repaired = parse_analysis_response(provider_extension)
     assert repaired is False
     assert parsed.batch_id == "b1"
+
+    normalized = normalize_analysis_response(
+        """{
+          "dialog_results":[
+            {"chat_id":"chat-1","summary":"ok","problems":[
+              {"event_type":"waiting","is_problem":true,"priority":"impossible"}
+            ]},
+            {"chat_id":"foreign","summary":"must be ignored"}
+          ],
+          "usage":{"input_tokens":-1}
+        }""",
+        tenant_id="t1",
+        batch_id="b1",
+        expected_chat_ids={"chat-1", "chat-2"},
+    )
+    assert normalized.tenant_id == "t1"
+    assert [item.chat_id for item in normalized.dialog_results] == ["chat-1", "chat-2"]
+    assert normalized.dialog_results[0].problems == []
+    assert normalized.dialog_results[1].summary == ""
+    assert normalized.usage.input_tokens == 0
 
 
 def test_compaction_keeps_fresh_tail_and_relevant_historical_evidence() -> None:

@@ -49,7 +49,12 @@ from ..services.product_events import add_system_event
 from ..telegram_sessions.service import TelegramConnectionService
 from .budget import ConservativeTokenEstimator, ModelInputBudget
 from .preprocessing import AnalysisBatchBuilder
-from .schema import AnalysisResponse, ReportNarrative, parse_analysis_response
+from .schema import (
+    AnalysisResponse,
+    ReportNarrative,
+    normalize_analysis_response,
+    parse_analysis_response,
+)
 
 
 class JSONAIProvider(Protocol):
@@ -331,22 +336,45 @@ class AnalysisPipelineService:
             user_id=batch.tenant_id,
         )
         repaired = False
+        expected_chat_ids = {
+            str(item["id"]) for item in (batch.payload_json or {}).get("dialogs", [])
+        }
         try:
             parsed, repaired = parse_analysis_response(raw)
             self._validate_identity(parsed, batch)
-        except Exception:  # noqa: BLE001 - one controlled retry for invalid provider JSON
-            raw, usage = await self.provider.generate_json(
-                model=model,
-                system_prompt=SYSTEM_PROMPT
-                + "\nPrevious output was invalid. Return complete valid json.",
-                payload=payload,
-                thinking=deep,
-                reasoning_effort="high" if deep else None,
-                max_tokens=self.model_budget.max_output_tokens,
-                user_id=batch.tenant_id,
-            )
-            parsed, repaired = parse_analysis_response(raw)
-            self._validate_identity(parsed, batch)
+        except Exception:  # noqa: BLE001 - normalize drift before one provider retry
+            try:
+                parsed = normalize_analysis_response(
+                    raw,
+                    tenant_id=batch.tenant_id,
+                    batch_id=batch.id,
+                    expected_chat_ids=expected_chat_ids,
+                )
+                repaired = True
+                self._validate_identity(parsed, batch)
+            except Exception:  # noqa: BLE001 - malformed JSON gets one controlled retry
+                raw, usage = await self.provider.generate_json(
+                    model=model,
+                    system_prompt=SYSTEM_PROMPT
+                    + "\nPrevious output was invalid. Return complete valid json.",
+                    payload=payload,
+                    thinking=deep,
+                    reasoning_effort="high" if deep else None,
+                    max_tokens=self.model_budget.max_output_tokens,
+                    user_id=batch.tenant_id,
+                )
+                try:
+                    parsed, repaired = parse_analysis_response(raw)
+                    self._validate_identity(parsed, batch)
+                except Exception:  # noqa: BLE001 - final safe recovery for schema drift
+                    parsed = normalize_analysis_response(
+                        raw,
+                        tenant_id=batch.tenant_id,
+                        batch_id=batch.id,
+                        expected_chat_ids=expected_chat_ids,
+                    )
+                    repaired = True
+                    self._validate_identity(parsed, batch)
         await self._store_batch_result(
             batch_id,
             parsed,

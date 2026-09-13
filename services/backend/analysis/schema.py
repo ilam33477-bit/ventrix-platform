@@ -125,3 +125,78 @@ def parse_analysis_response(
             raise
     repaired = repair_json(raw)
     return AnalysisResponse.model_validate_json(repaired), repaired != raw
+
+
+def normalize_analysis_response(
+    raw: str,
+    *,
+    tenant_id: str,
+    batch_id: str,
+    expected_chat_ids: set[str],
+) -> AnalysisResponse:
+    """Recover a syntactically valid provider response without inventing issues.
+
+    Provider schema drift in one candidate must not discard every valid dialog in
+    the batch. Invalid problem/outcome candidates are omitted; missing expected
+    dialogs become neutral results so identity validation still protects scope.
+    """
+
+    payload = json.loads(repair_json(raw))
+    if not isinstance(payload, dict):
+        raise TypeError("AI response must be a JSON object")
+
+    raw_results = payload.get("dialog_results")
+    if not isinstance(raw_results, list):
+        raw_results = []
+    results_by_chat: dict[str, DialogAnalysisResult] = {}
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        chat_id = str(item.get("chat_id", ""))
+        if chat_id not in expected_chat_ids or chat_id in results_by_chat:
+            continue
+        problems: list[DetectedProblem] = []
+        for candidate in item.get("problems", []):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                problems.append(DetectedProblem.model_validate(candidate))
+            except ValidationError:
+                continue
+        outcomes: list[BusinessOutcome] = []
+        for candidate in item.get("business_outcomes", []):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                outcomes.append(BusinessOutcome.model_validate(candidate))
+            except ValidationError:
+                continue
+        participants = item.get("participants", [])
+        patterns = item.get("detected_patterns", [])
+        results_by_chat[chat_id] = DialogAnalysisResult(
+            chat_id=chat_id,
+            dialog_type=str(item.get("dialog_type") or "unknown"),
+            summary=str(item.get("summary") or ""),
+            participants=participants if isinstance(participants, list) else [],
+            detected_patterns=patterns if isinstance(patterns, list) else [],
+            problems=problems,
+            business_outcomes=outcomes,
+        )
+
+    dialog_results = [
+        results_by_chat.get(chat_id)
+        or DialogAnalysisResult(chat_id=chat_id, dialog_type="unknown", summary="")
+        for chat_id in sorted(expected_chat_ids)
+    ]
+    usage = payload.get("usage")
+    try:
+        normalized_usage = AIUsage.model_validate(usage if isinstance(usage, dict) else {})
+    except ValidationError:
+        normalized_usage = AIUsage()
+    return AnalysisResponse(
+        schema_version="1.0",
+        tenant_id=tenant_id,
+        batch_id=batch_id,
+        dialog_results=dialog_results,
+        usage=normalized_usage,
+    )
