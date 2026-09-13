@@ -207,7 +207,9 @@ class TelegramSessionActor:
 
     async def _counter_loop(self) -> None:
         while not self._stopping.is_set():
-            await asyncio.sleep(10)
+            # Counters and the human-facing runtime heartbeat tolerate a short
+            # delay; lease ownership still refreshes independently every 10s.
+            await asyncio.sleep(30)
             await self._flush_counters()
 
     async def _catch_up_job(self, _: JobLease) -> dict[str, int]:
